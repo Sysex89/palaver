@@ -1,35 +1,59 @@
 mod doc;
 mod text_input;
 
-use doc::{Doc, NODE_H, NODE_W, Node};
+use doc::{Doc, NODE_H, NODE_W, Node, PORT_R, in_port, out_port};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Path, PathBuilder, Pixels, Point, Render, Window, WindowBounds,
-    WindowOptions, actions, canvas, div, point, prelude::*, px, rgb, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, Rgba,
+    Window, WindowBounds, WindowOptions, actions, canvas, div, point, prelude::*, px, rgb, size,
 };
 use text_input::TextInput;
 
 actions!(papugai, [DeleteNode, Undo, FocusCanvas]);
 
+const EDGE_COLOR: Rgba = Rgba {
+    r: 0.49,
+    g: 0.49,
+    b: 0.55,
+    a: 1.0,
+};
+const ACCENT_COLOR: Rgba = Rgba {
+    r: 0.48,
+    g: 0.64,
+    b: 0.97,
+    a: 1.0,
+};
+
 struct Editor {
     doc: Doc,
     /// Canvas offset in pixels, applied to everything drawn.
     pan: (f32, f32),
-    selected: Option<u32>,
+    selected: Option<Selection>,
     drag: Option<Drag>,
     focus_handle: FocusHandle,
     speaker_input: Entity<TextInput>,
     text_input: Entity<TextInput>,
-    /// Node whose content is currently loaded into the fields.
-    edited: Option<u32>,
+    label_input: Entity<TextInput>,
+    /// What is currently loaded into the sidebar fields.
+    edited: Option<Selection>,
     /// Whether this editing session already pushed an undo checkpoint.
     text_dirty: bool,
+}
+
+/// Edge indices shift when edges are removed, so an edge selection is cleared
+/// on every structural change.
+#[derive(Clone, Copy, PartialEq)]
+enum Selection {
+    Node(u32),
+    Edge(usize),
 }
 
 #[derive(Clone, Copy)]
 enum Drag {
     /// `grab` is the cursor's offset inside the node, in document coordinates.
     Node { id: u32, grab: (f32, f32), moved: bool },
+    /// Rubber band from a node's out-port to the cursor.
+    Edge { from: u32, cursor: (f32, f32) },
     Pan { start_mouse: (f32, f32), start_pan: (f32, f32) },
 }
 
@@ -40,7 +64,8 @@ impl Editor {
 
         let speaker_input = cx.new(|cx| TextInput::new("Speaker", cx));
         let text_input = cx.new(|cx| TextInput::new("Line of dialog", cx));
-        for input in [&speaker_input, &text_input] {
+        let label_input = cx.new(|cx| TextInput::new("Choice", cx));
+        for input in [&speaker_input, &text_input, &label_input] {
             cx.observe(input, |this, _, cx| this.sync_fields(cx)).detach();
         }
 
@@ -52,47 +77,77 @@ impl Editor {
             focus_handle,
             speaker_input,
             text_input,
+            label_input,
             edited: None,
             text_dirty: false,
         }
     }
 
-    /// Loads a node's content into the sidebar fields, starting a fresh editing session.
-    fn load_fields(&mut self, id: Option<u32>, cx: &mut Context<Self>) {
-        let (speaker, text) = match id.and_then(|id| self.doc.node(id)) {
-            Some(node) => (node.speaker.clone(), node.text.clone()),
-            None => (String::new(), String::new()),
+    /// Loads the selection's content into the sidebar fields, starting a fresh editing session.
+    fn load_fields(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
+        let (speaker, text, label) = match selection {
+            Some(Selection::Node(id)) => match self.doc.node(id) {
+                Some(node) => (node.speaker.clone(), node.text.clone(), String::new()),
+                None => Default::default(),
+            },
+            Some(Selection::Edge(index)) => match self.doc.edges.get(index) {
+                Some(edge) => (String::new(), String::new(), edge.label.clone()),
+                None => Default::default(),
+            },
+            None => Default::default(),
         };
+
         self.speaker_input
             .update(cx, |input, cx| input.set_content(&speaker, cx));
         self.text_input
             .update(cx, |input, cx| input.set_content(&text, cx));
-        self.edited = id;
+        self.label_input
+            .update(cx, |input, cx| input.set_content(&label, cx));
+        self.edited = selection;
         self.text_dirty = false;
     }
 
-    /// Writes the fields back into the edited node. Runs on every input notification,
-    /// so it must be a no-op when nothing actually changed.
+    /// Writes the fields back into the edited node or edge. Runs on every input
+    /// notification, so it must be a no-op when nothing actually changed.
     fn sync_fields(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.edited else { return };
-        let speaker = self.speaker_input.read(cx).content().to_string();
-        let text = self.text_input.read(cx).content().to_string();
+        match self.edited {
+            Some(Selection::Node(id)) => {
+                let speaker = self.speaker_input.read(cx).content().to_string();
+                let text = self.text_input.read(cx).content().to_string();
 
-        let Some(node) = self.doc.node(id) else { return };
-        if node.speaker == speaker && node.text == text {
-            return;
+                let Some(node) = self.doc.node(id) else { return };
+                if node.speaker == speaker && node.text == text {
+                    return;
+                }
+                self.checkpoint_once();
+                if let Some(node) = self.doc.node_mut(id) {
+                    node.speaker = speaker;
+                    node.text = text;
+                }
+            }
+            Some(Selection::Edge(index)) => {
+                let label = self.label_input.read(cx).content().to_string();
+
+                let Some(edge) = self.doc.edges.get(index) else {
+                    return;
+                };
+                if edge.label == label {
+                    return;
+                }
+                self.checkpoint_once();
+                self.doc.edges[index].label = label;
+            }
+            None => return,
         }
+        cx.notify();
+    }
 
-        // ponytail: one undo checkpoint per node-editing session, not per keystroke.
+    // ponytail: one undo checkpoint per editing session, not per keystroke.
+    fn checkpoint_once(&mut self) {
         if !self.text_dirty {
             self.doc.checkpoint();
             self.text_dirty = true;
         }
-        if let Some(node) = self.doc.node_mut(id) {
-            node.speaker = speaker;
-            node.text = text;
-        }
-        cx.notify();
     }
 
     fn window_pos(pos: Point<Pixels>) -> (f32, f32) {
@@ -104,56 +159,103 @@ impl Editor {
         (x - self.pan.0, y - self.pan.1)
     }
 
-    /// Straight lines from the right edge of the source node to the left edge of the target.
-    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>)> {
-        let (pan_x, pan_y) = self.pan;
+    /// Screen position of a document point.
+    fn screen_pos(&self, (x, y): (f32, f32)) -> Point<Pixels> {
+        point(px(x + self.pan.0), px(y + self.pan.1))
+    }
+
+    /// One entry per edge: the line from the source's out-port to the target's in-port,
+    /// and whether it is the selected edge.
+    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, bool)> {
         self.doc
             .edges
             .iter()
-            .filter_map(|e| {
+            .enumerate()
+            .filter_map(|(index, e)| {
                 let from = self.doc.node(e.from)?;
                 let to = self.doc.node(e.to)?;
                 Some((
-                    point(px(from.x + NODE_W + pan_x), px(from.y + NODE_H / 2.0 + pan_y)),
-                    point(px(to.x + pan_x), px(to.y + NODE_H / 2.0 + pan_y)),
+                    self.screen_pos(out_port(from)),
+                    self.screen_pos(in_port(to)),
+                    self.selected == Some(Selection::Edge(index)),
                 ))
             })
             .collect()
+    }
+
+    /// The rubber band drawn while dragging a new edge out of a port.
+    fn pending_edge(&self) -> Option<(Point<Pixels>, Point<Pixels>)> {
+        let Some(Drag::Edge { from, cursor }) = self.drag else {
+            return None;
+        };
+        let node = self.doc.node(from)?;
+        Some((self.screen_pos(out_port(node)), self.screen_pos(cursor)))
+    }
+
+    fn select(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
+        self.selected = selection;
+        if self.edited != selection {
+            self.load_fields(selection, cx);
+        }
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         let (x, y) = self.doc_pos(ev.position);
 
-        if let Some(id) = self.doc.hit_test(x, y) {
+        // The port sits on top of the node box, so it is tested first.
+        if let Some(from) = self.doc.port_hit_test(x, y) {
+            self.drag = Some(Drag::Edge {
+                from,
+                cursor: (x, y),
+            });
+        } else if let Some(id) = self.doc.hit_test(x, y) {
             let node = self.doc.node(id).expect("hit_test returned a live node");
             let grab = (x - node.x, y - node.y);
-            self.selected = Some(id);
+            self.select(Some(Selection::Node(id)), cx);
             self.drag = Some(Drag::Node {
                 id,
                 grab,
                 moved: false,
             });
-            if self.edited != Some(id) {
-                self.load_fields(Some(id), cx);
-            }
             if ev.click_count == 2 {
                 window.focus(&self.text_input.read(cx).focus_handle(cx));
             }
+        } else if let Some(index) = self.doc.edge_at(x, y) {
+            self.select(Some(Selection::Edge(index)), cx);
+            self.drag = None;
         } else if ev.click_count == 2 {
             self.doc.checkpoint();
             let id = self.doc.add_node(x, y);
-            self.selected = Some(id);
+            self.select(Some(Selection::Node(id)), cx);
             self.drag = None;
-            self.load_fields(Some(id), cx);
             window.focus(&self.speaker_input.read(cx).focus_handle(cx));
         } else {
-            self.selected = None;
+            self.select(None, cx);
             self.drag = Some(Drag::Pan {
                 start_mouse: Self::window_pos(ev.position),
                 start_pan: self.pan,
             });
-            self.load_fields(None, cx);
+        }
+        cx.notify();
+    }
+
+    /// Completes an edge drag when released over a node; every other drag just ends.
+    fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let drag = self.drag.take();
+        let Some(Drag::Edge { from, .. }) = drag else {
+            return;
+        };
+
+        let (x, y) = self.doc_pos(ev.position);
+        let Some(to) = self.doc.hit_test(x, y) else {
+            cx.notify();
+            return;
+        };
+        if from != to && !self.doc.has_edge(from, to) {
+            self.doc.checkpoint();
+            self.doc.add_edge(from, to);
+            self.select(Some(Selection::Edge(self.doc.edges.len() - 1)), cx);
         }
         cx.notify();
     }
@@ -174,6 +276,12 @@ impl Editor {
                     node.y = y - grab.1;
                 }
             }
+            Drag::Edge { from, .. } => {
+                self.drag = Some(Drag::Edge {
+                    from,
+                    cursor: self.doc_pos(ev.position),
+                });
+            }
             Drag::Pan {
                 start_mouse,
                 start_pan,
@@ -186,21 +294,29 @@ impl Editor {
     }
 
     fn on_delete(&mut self, _: &DeleteNode, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.take() else {
+        let Some(selection) = self.selected else {
             return;
         };
         self.doc.checkpoint();
-        self.doc.remove_node(id);
-        self.load_fields(None, cx);
+        match selection {
+            Selection::Node(id) => self.doc.remove_node(id),
+            Selection::Edge(index) => self.doc.remove_edge(index),
+        }
+        self.select(None, cx);
         cx.notify();
     }
 
     fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if self.doc.undo() {
-            if self.selected.is_some_and(|id| self.doc.node(id).is_none()) {
-                self.selected = None;
-            }
-            self.load_fields(self.selected, cx);
+            // Undo can restore or drop whatever was selected, so the fields always reload.
+            let selection = match self.selected {
+                Some(Selection::Node(id)) if self.doc.node(id).is_some() => {
+                    Some(Selection::Node(id))
+                }
+                _ => None,
+            };
+            self.selected = selection;
+            self.load_fields(selection, cx);
             cx.notify();
         }
     }
@@ -213,6 +329,7 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let lines = self.edge_lines();
+        let pending = self.pending_edge();
         let (pan, selected) = (self.pan, self.selected);
 
         div()
@@ -220,7 +337,7 @@ impl Render for Editor {
             .flex_row()
             .size_full()
             .text_sm()
-            .child(self.canvas_pane(lines, pan, selected, cx))
+            .child(self.canvas_pane(lines, pending, pan, selected, cx))
             .child(self.sidebar(selected))
     }
 }
@@ -229,9 +346,10 @@ impl Editor {
     /// The graph itself. Owns the mouse and key handling, so sidebar clicks never reach it.
     fn canvas_pane(
         &self,
-        lines: Vec<(Point<Pixels>, Point<Pixels>)>,
+        lines: Vec<(Point<Pixels>, Point<Pixels>, bool)>,
+        pending: Option<(Point<Pixels>, Point<Pixels>)>,
         pan: (f32, f32),
-        selected: Option<u32>,
+        selected: Option<Selection>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -247,30 +365,31 @@ impl Editor {
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag = None),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag = None),
-            )
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
                         // Paint coordinates are window-absolute, canvas bounds are not at the origin.
-                        for (from, to) in lines {
+                        let mut draw = |from: Point<Pixels>, to: Point<Pixels>, color: Rgba| {
                             let (from, to) = (from + bounds.origin, to + bounds.origin);
                             let mut line = PathBuilder::stroke(px(1.5));
                             line.move_to(from);
                             line.line_to(to);
                             if let Ok(line) = line.build() {
-                                window.paint_path(line, rgb(0x7d7d8c));
+                                window.paint_path(line, color);
                             }
                             if let Some(head) = arrow_head(to, from) {
-                                window.paint_path(head, rgb(0x7d7d8c));
+                                window.paint_path(head, color);
                             }
+                        };
+
+                        for (from, to, selected) in lines {
+                            draw(from, to, if selected { ACCENT_COLOR } else { EDGE_COLOR });
+                        }
+                        if let Some((from, to)) = pending {
+                            draw(from, to, ACCENT_COLOR);
                         }
                     },
                 )
@@ -279,16 +398,52 @@ impl Editor {
                 .left(px(0.))
                 .size_full(),
             )
+            .children(self.edge_labels())
             .children(
                 self.doc
                     .nodes
                     .iter()
-                    .map(|node| node_box(node, pan, selected == Some(node.id))),
+                    .map(|node| node_box(node, pan, selected == Some(Selection::Node(node.id)))),
             )
+            .children(self.doc.nodes.iter().map(|node| port_dot(node, pan)))
     }
 
-    /// Inspector for the selected node.
-    fn sidebar(&self, selected: Option<u32>) -> impl IntoElement {
+    /// Choice text, centred on each labelled edge.
+    fn edge_labels(&self) -> Vec<impl IntoElement> {
+        const W: f32 = 120.0;
+
+        self.doc
+            .edges
+            .iter()
+            .filter(|edge| !edge.label.is_empty())
+            .filter_map(|edge| {
+                let from = out_port(self.doc.node(edge.from)?);
+                let to = in_port(self.doc.node(edge.to)?);
+                let mid = self.screen_pos(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
+                Some(
+                    // Fixed width and centred content, so the label centres without measuring it.
+                    div()
+                        .absolute()
+                        .left(mid.x - px(W / 2.0))
+                        .top(mid.y - px(18.))
+                        .w(px(W))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_1()
+                                .bg(rgb(0x1e1e22))
+                                .text_color(rgb(0x9a9aa6))
+                                .truncate()
+                                .child(edge.label.clone()),
+                        ),
+                )
+            })
+            .collect()
+    }
+
+    /// Inspector for the selected node or edge.
+    fn sidebar(&self, selected: Option<Selection>) -> impl IntoElement {
         let field = |label: &str, input: &Entity<TextInput>| {
             div()
                 .flex()
@@ -309,29 +464,52 @@ impl Editor {
             .border_l_1()
             .border_color(rgb(0x3a3a44))
             .text_color(rgb(0xd6d6dd))
-            .when_some(selected, |this, id| {
-                this.child(
+            .map(|this| match selected {
+                Some(Selection::Node(id)) => this
+                    .child(
+                        div()
+                            .text_color(rgb(0x9ecbff))
+                            .child(format!("Node {id}")),
+                    )
+                    .child(field("Speaker", &self.speaker_input))
+                    .child(field("Text", &self.text_input)),
+                Some(Selection::Edge(index)) => {
+                    let title = match self.doc.edges.get(index) {
+                        Some(edge) => format!("Node {} → Node {}", edge.from, edge.to),
+                        None => "Edge".into(),
+                    };
+                    this.child(div().text_color(rgb(0x9ecbff)).child(title))
+                        .child(field("Choice", &self.label_input))
+                }
+                None => this.child(
                     div()
-                        .text_color(rgb(0x9ecbff))
-                        .child(format!("Node {id}")),
-                )
-                .child(field("Speaker", &self.speaker_input))
-                .child(field("Text", &self.text_input))
-                .child(
+                        .text_color(rgb(0x6c6c78))
+                        .child("Select a node or an edge to edit it."),
+                ),
+            })
+            .when(selected.is_some(), |this| {
+                this.child(
                     div()
                         .mt_auto()
                         .text_color(rgb(0x6c6c78))
                         .child("Esc — back to canvas"),
                 )
             })
-            .when(selected.is_none(), |this| {
-                this.child(
-                    div()
-                        .text_color(rgb(0x6c6c78))
-                        .child("Select a node to edit it."),
-                )
-            })
     }
+}
+
+/// The handle an edge is dragged out of.
+fn port_dot(node: &Node, pan: (f32, f32)) -> impl IntoElement {
+    let (x, y) = out_port(node);
+    div()
+        .absolute()
+        .left(px(x + pan.0 - PORT_R))
+        .top(px(y + pan.1 - PORT_R))
+        .size(px(PORT_R * 2.0))
+        .rounded_full()
+        .bg(rgb(0x3a3a44))
+        .border_2()
+        .border_color(rgb(0x7d7d8c))
 }
 
 fn node_box(node: &Node, pan: (f32, f32), selected: bool) -> impl IntoElement {

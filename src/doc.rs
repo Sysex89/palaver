@@ -2,6 +2,20 @@
 
 pub const NODE_W: f32 = 200.0;
 pub const NODE_H: f32 = 90.0;
+/// Radius of the out-port drawn on a node's right edge.
+pub const PORT_R: f32 = 7.0;
+/// How close the cursor must be to an edge line to hit it.
+const EDGE_HIT_TOL: f32 = 6.0;
+
+/// Where an edge leaves a node.
+pub fn out_port(node: &Node) -> (f32, f32) {
+    (node.x + NODE_W, node.y + NODE_H / 2.0)
+}
+
+/// Where an edge arrives at a node.
+pub fn in_port(node: &Node) -> (f32, f32) {
+    (node.x, node.y + NODE_H / 2.0)
+}
 
 const UNDO_DEPTH: usize = 50;
 
@@ -30,8 +44,7 @@ pub struct Node {
 pub struct Edge {
     pub from: u32,
     pub to: u32,
-    /// The player-facing choice taken to follow this edge. Not drawn yet.
-    #[allow(dead_code)]
+    /// The player-facing choice taken to follow this edge.
     pub label: String,
 }
 
@@ -67,10 +80,56 @@ impl Doc {
             .map(|n| n.id)
     }
 
+    /// Topmost node whose out-port contains the point. Check this before [`Doc::hit_test`],
+    /// since the port overlaps the node box.
+    pub fn port_hit_test(&self, x: f32, y: f32) -> Option<u32> {
+        self.nodes
+            .iter()
+            .rev()
+            .find(|n| {
+                let (px, py) = out_port(n);
+                (x - px).hypot(y - py) <= PORT_R
+            })
+            .map(|n| n.id)
+    }
+
     /// Removes the node and every edge touching it.
     pub fn remove_node(&mut self, id: u32) {
         self.nodes.retain(|n| n.id != id);
         self.edges.retain(|e| e.from != id && e.to != id);
+    }
+
+    pub fn has_edge(&self, from: u32, to: u32) -> bool {
+        self.edges.iter().any(|e| e.from == from && e.to == to)
+    }
+
+    /// Connects two nodes. False when the edge would be a self-loop or a duplicate.
+    pub fn add_edge(&mut self, from: u32, to: u32) -> bool {
+        if from == to || self.has_edge(from, to) {
+            return false;
+        }
+        self.edges.push(Edge {
+            from,
+            to,
+            label: String::new(),
+        });
+        true
+    }
+
+    pub fn remove_edge(&mut self, index: usize) {
+        if index < self.edges.len() {
+            self.edges.remove(index);
+        }
+    }
+
+    /// Index of the first edge whose line passes near the point.
+    pub fn edge_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.edges.iter().position(|e| {
+            let (Some(from), Some(to)) = (self.node(e.from), self.node(e.to)) else {
+                return false;
+            };
+            distance_to_segment((x, y), out_port(from), in_port(to)) <= EDGE_HIT_TOL
+        })
     }
 
     /// Records the current state so the next mutation can be undone.
@@ -118,6 +177,18 @@ impl Doc {
         ];
         doc
     }
+}
+
+fn distance_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    // Projection of p onto the segment, clamped to its ends.
+    let t = if len_sq == 0.0 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0)
+    };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
 }
 
 #[cfg(test)]
@@ -182,6 +253,57 @@ mod tests {
             doc.add_node(0.0, 0.0);
         }
         assert_eq!(doc.undo.len(), UNDO_DEPTH);
+    }
+
+    #[test]
+    fn add_edge_rejects_self_loops_and_duplicates() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.add_node(400.0, 0.0);
+
+        assert!(doc.add_edge(a, b));
+        assert!(!doc.add_edge(a, b), "duplicate");
+        assert!(!doc.add_edge(a, a), "self-loop");
+        assert!(doc.add_edge(b, a), "opposite direction is a different edge");
+        assert_eq!(doc.edges.len(), 2);
+    }
+
+    #[test]
+    fn edge_at_finds_the_line() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.add_node(400.0, 0.0);
+        doc.add_edge(a, b);
+
+        // The line runs from a's right edge to b's left edge, both at NODE_H / 2.
+        let midpoint = ((NODE_W + 400.0) / 2.0, NODE_H / 2.0);
+        assert_eq!(doc.edge_at(midpoint.0, midpoint.1), Some(0));
+        assert_eq!(doc.edge_at(midpoint.0, midpoint.1 + 50.0), None);
+        assert_eq!(doc.edge_at(-100.0, NODE_H / 2.0), None, "before the start");
+    }
+
+    #[test]
+    fn remove_edge_keeps_the_others() {
+        let mut doc = Doc::sample();
+        let (first, count) = (doc.edges[0].to, doc.edges.len());
+
+        doc.remove_edge(0);
+
+        assert_eq!(doc.edges.len(), count - 1);
+        assert!(doc.edges.iter().all(|e| e.to != first || e.from != 0));
+        doc.remove_edge(99); // out of range is a no-op
+        assert_eq!(doc.edges.len(), count - 1);
+    }
+
+    #[test]
+    fn port_hit_test_covers_the_right_edge() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(10.0, 10.0);
+        let (px, py) = out_port(doc.node(a).unwrap());
+
+        assert_eq!(doc.port_hit_test(px, py), Some(a));
+        assert_eq!(doc.port_hit_test(px - PORT_R + 1.0, py), Some(a));
+        assert_eq!(doc.port_hit_test(px, py + PORT_R * 2.0), None);
     }
 
     #[test]
