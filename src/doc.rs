@@ -180,8 +180,6 @@ pub enum Problem {
     DanglingEdge(usize),
     /// Nodes exist but every one has an incoming edge, so nothing can start.
     NoStart,
-    /// Several nodes have no incoming edge, so which one starts is ambiguous.
-    ManyStarts(Vec<u32>),
     /// Not reachable from any start node.
     Unreachable(u32),
     /// No outgoing edges — the conversation stops here.
@@ -216,6 +214,38 @@ impl Problem {
 }
 
 impl Doc {
+    /// Where the conversation containing `from` begins: incoming edges walked back until a
+    /// node nothing links to. Returns `from` itself when it is already a top, or when the
+    /// walk meets a cycle. A start is relative to the node you are standing on rather than a
+    /// property of the document, which is what lets one document hold several independent
+    /// dialogues.
+    //
+    // ponytail: follows the first incoming edge in document order, so a node two branches
+    // rejoin at walks back through whichever was drawn first. Both lead to the same
+    // conversation; revisit if that stops being true.
+    pub fn start_of(&self, from: u32) -> u32 {
+        let mut current = from;
+        let mut seen = HashSet::from([current]);
+        while let Some(edge) = self.edges.iter().find(|e| e.to == current) {
+            if !seen.insert(edge.from) || self.node(edge.from).is_none() {
+                break;
+            }
+            current = edge.from;
+        }
+        current
+    }
+
+    /// The choices offered at a node: where each one leads and how it is labelled, in
+    /// document order. Edges pointing at a node that is gone are skipped — play must never
+    /// offer a dead link.
+    pub fn choices(&self, id: u32) -> Vec<(u32, &str)> {
+        self.edges
+            .iter()
+            .filter(|e| e.from == id && self.node(e.to).is_some())
+            .map(|e| (e.to, e.label.as_str()))
+            .collect()
+    }
+
     /// Every fault in the document, errors first. An empty document has none at all.
     // ponytail: rebuilt from scratch on every call, which is once per frame. A cache
     // would need invalidating on every edit, undo and load; revisit past a few thousand nodes.
@@ -231,17 +261,17 @@ impl Doc {
             }
         }
 
-        // A start node is one nothing links to.
+        // A start node is one nothing links to. Several of them is not a fault: a document
+        // holds as many independent conversations as the author draws, and play mode starts
+        // from the top of whichever one the selection is standing in.
         let roots: Vec<u32> = self
             .nodes
             .iter()
             .filter(|n| !self.edges.iter().any(|e| e.to == n.id))
             .map(|n| n.id)
             .collect();
-        match roots.len() {
-            0 => found.push(Problem::NoStart),
-            1 => {}
-            _ => found.push(Problem::ManyStarts(roots.clone())),
+        if roots.is_empty() {
+            found.push(Problem::NoStart);
         }
 
         // Walking from every root at once keeps this meaningful while the start is still
@@ -799,19 +829,68 @@ mod tests {
     }
 
     #[test]
-    fn many_starts_lists_them_all() {
+    fn start_of_walks_back_to_the_top() {
         let mut doc = Doc::default();
-        let first = spoken(&mut doc, 0.0, 0.0);
-        let second = spoken(&mut doc, 0.0, 200.0);
-        let shared = spoken(&mut doc, 300.0, 100.0);
-        doc.add_edge(first, shared);
-        doc.add_edge(second, shared);
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(a, b);
+        doc.add_edge(b, c);
+
+        assert_eq!(doc.start_of(c), a);
+        assert_eq!(doc.start_of(b), a);
+        assert_eq!(doc.start_of(a), a, "a top is its own start");
+    }
+
+    #[test]
+    fn two_conversations_keep_their_own_starts() {
+        let mut doc = Doc::default();
+        let (a, b) = (spoken(&mut doc, 0.0, 0.0), spoken(&mut doc, 300.0, 0.0));
+        let (x, y) = (spoken(&mut doc, 0.0, 400.0), spoken(&mut doc, 300.0, 400.0));
+        doc.add_edge(a, b);
+        doc.add_edge(x, y);
+
+        assert_eq!(doc.start_of(b), a);
+        assert_eq!(doc.start_of(y), x, "the other conversation has its own top");
+        // Several starts is the intended shape of a document, not a fault.
+        assert!(
+            !doc.problems()
+                .iter()
+                .any(|p| p.severity() == Severity::Error)
+        );
+    }
+
+    #[test]
+    fn start_of_terminates_in_a_cycle() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.add_edge(b, a);
 
         assert!(
-            doc.problems()
-                .contains(&Problem::ManyStarts(vec![first, second])),
-            "both roots, in document order"
+            [a, b].contains(&doc.start_of(b)),
+            "a cycle has no top to find"
         );
+    }
+
+    #[test]
+    fn choices_are_document_order_and_skip_dead_links() {
+        let mut doc = Doc::default();
+        let from = spoken(&mut doc, 0.0, 0.0);
+        let first = spoken(&mut doc, 300.0, 0.0);
+        let second = spoken(&mut doc, 300.0, 200.0);
+        let gone = spoken(&mut doc, 300.0, 400.0);
+        doc.add_edge(from, first);
+        doc.add_edge(from, second);
+        doc.add_edge(from, gone);
+        doc.edges[0].label = "Yes".into();
+        doc.edges[1].label = "No".into();
+        // Straight at the vec: `remove_node` would take the edge with it.
+        doc.nodes.retain(|n| n.id != gone);
+
+        assert_eq!(doc.choices(from), vec![(first, "Yes"), (second, "No")]);
+        assert!(doc.choices(first).is_empty());
     }
 
     #[test]

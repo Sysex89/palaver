@@ -30,7 +30,10 @@ actions!(
         New,
         Save,
         SaveAs,
-        Open
+        Open,
+        Play,
+        PlayFromHere,
+        StopPlay
     ]
 );
 
@@ -90,6 +93,18 @@ const MENUS: &[MenuSpec] = &[
             }),
         ],
     ),
+    (
+        "Play",
+        &[
+            ("Play conversation", "F5", |e, w, cx| {
+                e.on_play(&Play, w, cx)
+            }),
+            ("Play from here", "Shift+F5", |e, w, cx| {
+                e.on_play_from_here(&PlayFromHere, w, cx)
+            }),
+            ("Stop", "Esc", |e, w, cx| e.on_stop_play(&StopPlay, w, cx)),
+        ],
+    ),
 ];
 
 const EDGE_COLOR: Rgba = Rgba {
@@ -146,6 +161,9 @@ struct Editor {
     /// Set after a backup fails, so a read-only temp directory reports once rather than
     /// every tick for the rest of the session.
     autosave_off: bool,
+    /// The play-through walked so far, last entry first — `None` when not playing. One vec
+    /// carries the current node, Back and Restart.
+    play: Option<Vec<u32>>,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -270,6 +288,7 @@ impl Editor {
             open_menu: None,
             closing: false,
             autosave_off: false,
+            play: None,
         }
     }
 
@@ -404,6 +423,8 @@ impl Editor {
         self.doc = doc;
         self.view = View::default();
         self.drag = None;
+        // Node ids belong to the document that is going away.
+        self.play = None;
         self.path = path;
         self.status = None;
         self.select(Selection::None, cx);
@@ -897,13 +918,63 @@ impl Editor {
         cx.notify();
     }
 
+    /// Plays the conversation the selection is standing in, from its top.
+    fn on_play(&mut self, _: &Play, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(seed) = self.play_seed() {
+            self.start_play(self.doc.start_of(seed), window, cx);
+        }
+    }
+
+    /// Plays from the selected node itself, for testing one branch without its run-up.
+    fn on_play_from_here(&mut self, _: &PlayFromHere, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(seed) = self.play_seed() {
+            self.start_play(seed, window, cx);
+        }
+    }
+
+    fn on_stop_play(&mut self, _: &StopPlay, _: &mut Window, cx: &mut Context<Self>) {
+        self.play = None;
+        cx.notify();
+    }
+
+    /// The node play starts from: the selected one, or the first in the document so that a
+    /// stray F5 plays something rather than nagging.
+    fn play_seed(&self) -> Option<u32> {
+        self.selection
+            .only_node()
+            .or_else(|| self.doc.nodes.first().map(|n| n.id))
+    }
+
+    fn start_play(&mut self, at: u32, window: &Window, cx: &mut Context<Self>) {
+        self.play = Some(vec![at]);
+        self.show(at, window);
+        cx.notify();
+    }
+
+    /// Advances the play-through, or ends it if the choice leads nowhere real.
+    fn play_advance(&mut self, to: u32, window: &Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.play.as_mut() {
+            path.push(to);
+            self.show(to, window);
+            cx.notify();
+        }
+    }
+
+    /// Brings a node into view without touching the selection — which is what separates
+    /// following a play-through from [`Editor::jump_to`].
+    fn show(&mut self, id: u32, window: &Window) {
+        if let Some(node) = self.doc.node(id) {
+            self.view
+                .center_on(node_center(node), Self::pane_center(window));
+        }
+    }
+
     /// Selects a node and brings it into view without changing zoom.
     fn jump_to(&mut self, id: u32, window: &Window, cx: &mut Context<Self>) {
-        let Some(node) = self.doc.node(id) else {
+        if self.doc.node(id).is_none() {
             return;
-        };
-        self.view
-            .center_on(node_center(node), Self::pane_center(window));
+        }
+        self.show(id, window);
         self.select(Selection::Nodes(vec![id]), cx);
         cx.notify();
     }
@@ -1011,6 +1082,9 @@ impl Editor {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
             .on_action(cx.listener(Self::on_open))
+            .on_action(cx.listener(Self::on_play))
+            .on_action(cx.listener(Self::on_play_from_here))
+            .on_action(cx.listener(Self::on_stop_play))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_pan_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1052,12 +1126,15 @@ impl Editor {
                 .size_full(),
             )
             .children(self.edge_labels())
-            .children(
-                self.doc
-                    .nodes
-                    .iter()
-                    .map(|node| node_box(node, view, self.selection.nodes().contains(&node.id))),
-            )
+            .children(self.doc.nodes.iter().map(|node| {
+                let playing = self.play.as_ref().and_then(|path| path.last().copied());
+                node_box(
+                    node,
+                    view,
+                    self.selection.nodes().contains(&node.id),
+                    playing == Some(node.id),
+                )
+            }))
             .children(self.doc.nodes.iter().map(|node| port_dot(node, view)))
             .when_some(self.marquee_rect(), |this, (origin, size)| {
                 this.child(
@@ -1156,6 +1233,120 @@ impl Editor {
                     )
                 })
             })
+    }
+
+    /// The conversation as a reader meets it: what the current node says, and the choices
+    /// leading out of it. Replaces the inspector while it is up, so the sidebar is never
+    /// both an editor and a player.
+    fn play_panel(&self, path: &[u32], cx: &mut Context<Self>) -> impl IntoElement {
+        let row = |id: (&'static str, usize), label: String, color: u32| {
+            div()
+                .id(id)
+                .px_1()
+                .rounded_sm()
+                .text_color(rgb(color))
+                .hover(|style| style.bg(rgb(0x33333c)))
+                .child(label)
+        };
+
+        let current = *path.last().expect("a play-through is never empty");
+        let node = self.doc.node(current);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child(div().text_color(rgb(0x9ecbff)).child("Playing"))
+                    .child(row(("play-stop", 0), "Stop".into(), 0x8a8a96).on_click(
+                        cx.listener(|this, _, window, cx| this.on_stop_play(&StopPlay, window, cx)),
+                    )),
+            )
+            .map(|this| {
+                // The node can be deleted from the canvas mid-play; say so rather than
+                // silently showing nothing.
+                let Some(node) = node else {
+                    return this.child(
+                        div()
+                            .text_color(rgb(0xff7a7a))
+                            .child("This node has been deleted."),
+                    );
+                };
+
+                let speaker = node.speaker.trim();
+                let text = node.text.trim();
+                this.when(!speaker.is_empty(), |this| {
+                    this.child(div().text_color(rgb(0x8a8a96)).child(speaker.to_string()))
+                })
+                .child(if text.is_empty() {
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child("(no line written yet)")
+                } else {
+                    div().child(text.to_string())
+                })
+            })
+            .children(
+                self.doc
+                    .choices(current)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (to, label))| {
+                        // A blank label is an unwritten choice, not a missing one.
+                        let label = match label.trim() {
+                            "" => "Continue".to_string(),
+                            label => label.to_string(),
+                        };
+                        row(("play-choice", i), format!("→ {label}"), 0xd6d6dd).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.play_advance(to, window, cx)
+                            }),
+                        )
+                    }),
+            )
+            .when(self.doc.choices(current).is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child("End of conversation."),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .when(path.len() > 1, |this| {
+                        this.child(row(("play-nav", 0), "← Back".into(), 0x8a8a96).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                let Some(path) = this.play.as_mut() else {
+                                    return;
+                                };
+                                path.pop();
+                                let back = *path.last().expect("Back is hidden at the top");
+                                this.show(back, window);
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .child(
+                        row(("play-nav", 1), "Restart".into(), 0x8a8a96).on_click(cx.listener(
+                            |this, _, window, cx| {
+                                let Some(path) = this.play.as_mut() else {
+                                    return;
+                                };
+                                path.truncate(1);
+                                let start = path[0];
+                                this.show(start, window);
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
     }
 
     /// Everything wrong with the document, worst first. Clicking a row jumps to the node.
@@ -1263,36 +1454,41 @@ impl Editor {
             .border_color(rgb(0x3a3a44))
             .text_color(rgb(0xd6d6dd))
             .child(self.search_panel(cx))
-            .map(|this| match (self.selection.only_node(), &self.selection) {
-                (Some(id), _) => this
-                    .child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
-                    .child(field("Speaker", &self.speaker_input))
-                    .child(field("Text", &self.text_input))
-                    .child(self.end_toggle(id, cx)),
-                (None, Selection::Nodes(ids)) => this
-                    .child(
-                        div()
-                            .text_color(rgb(0x9ecbff))
-                            .child(format!("{} nodes selected", ids.len())),
-                    )
-                    .child(
+            .when_some(self.play.clone(), |this, path| {
+                this.child(self.play_panel(&path, cx))
+            })
+            .when(self.play.is_none(), |this| {
+                this.map(|this| match (self.selection.only_node(), &self.selection) {
+                    (Some(id), _) => this
+                        .child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
+                        .child(field("Speaker", &self.speaker_input))
+                        .child(field("Text", &self.text_input))
+                        .child(self.end_toggle(id, cx)),
+                    (None, Selection::Nodes(ids)) => this
+                        .child(
+                            div()
+                                .text_color(rgb(0x9ecbff))
+                                .child(format!("{} nodes selected", ids.len())),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(0x6c6c78))
+                                .child("Drag any of them to move the group."),
+                        ),
+                    (None, Selection::Edge(index)) => {
+                        let title = match self.doc.edges.get(*index) {
+                            Some(edge) => format!("Node {} → Node {}", edge.from, edge.to),
+                            None => "Edge".into(),
+                        };
+                        this.child(div().text_color(rgb(0x9ecbff)).child(title))
+                            .child(field("Choice", &self.label_input))
+                    }
+                    _ => this.child(
                         div()
                             .text_color(rgb(0x6c6c78))
-                            .child("Drag any of them to move the group."),
+                            .child("Select a node or an edge to edit it."),
                     ),
-                (None, Selection::Edge(index)) => {
-                    let title = match self.doc.edges.get(*index) {
-                        Some(edge) => format!("Node {} → Node {}", edge.from, edge.to),
-                        None => "Edge".into(),
-                    };
-                    this.child(div().text_color(rgb(0x9ecbff)).child(title))
-                        .child(field("Choice", &self.label_input))
-                }
-                _ => this.child(
-                    div()
-                        .text_color(rgb(0x6c6c78))
-                        .child("Select a node or an edge to edit it."),
-                ),
+                })
             })
             .child(self.problems_panel(cx))
             .child(
@@ -1373,7 +1569,6 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
     match problem {
         Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
         Problem::NoStart => "No start node — every node is linked to".into(),
-        Problem::ManyStarts(ids) => format!("{} possible start nodes", ids.len()),
         Problem::Unreachable(id) => format!("Unreachable: {}", label(*id)),
         Problem::DeadEnd(id) => format!("Dead end: {}", label(*id)),
         Problem::Empty(id) => format!("No text: {}", label(*id)),
@@ -1395,7 +1590,7 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
         .border_color(rgb(0x7d7d8c))
 }
 
-fn node_box(node: &Node, view: View, selected: bool) -> impl IntoElement {
+fn node_box(node: &Node, view: View, selected: bool, playing: bool) -> impl IntoElement {
     let (x, y) = view.to_screen((node.x, node.y));
     div()
         .absolute()
@@ -1413,10 +1608,12 @@ fn node_box(node: &Node, view: View, selected: bool) -> impl IntoElement {
         .p_2()
         .bg(rgb(0x2b2b33))
         .border_1()
-        .border_color(match (selected, node.end) {
-            (true, _) => rgb(0x7aa2f7),
-            (false, true) => rgb(0xf7c96a),
-            (false, false) => rgb(0x4a4a57),
+        // Where the play-through is standing outranks an ending; the selection outranks both.
+        .border_color(match (selected, playing, node.end) {
+            (true, _, _) => rgb(0x7aa2f7),
+            (false, true, _) => rgb(0x8ce99a),
+            (false, false, true) => rgb(0xf7c96a),
+            (false, false, false) => rgb(0x4a4a57),
         })
         .rounded_md()
         .shadow_md()
@@ -1479,6 +1676,10 @@ fn main() {
             KeyBinding::new("ctrl-s", Save, Some("Editor")),
             KeyBinding::new("ctrl-shift-s", SaveAs, Some("Editor")),
             KeyBinding::new("ctrl-o", Open, Some("Editor")),
+            KeyBinding::new("f5", Play, Some("Editor")),
+            KeyBinding::new("shift-f5", PlayFromHere, Some("Editor")),
+            // A no-op when nothing is playing; the field's own escape is scoped elsewhere.
+            KeyBinding::new("escape", StopPlay, Some("Editor")),
             KeyBinding::new("escape", FocusCanvas, Some("TextInput")),
         ]);
         text_input::bind_keys(cx);
