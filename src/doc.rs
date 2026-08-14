@@ -207,17 +207,45 @@ impl Doc {
             id
         };
 
-        let greet = node(&mut doc, 60.0, 260.0, "Innkeeper", "You look lost, traveler.");
+        let greet = node(
+            &mut doc,
+            60.0,
+            260.0,
+            "Innkeeper",
+            "You look lost, traveler.",
+        );
         let ask = node(&mut doc, 360.0, 140.0, "Player", "Where am I?");
         let rude = node(&mut doc, 360.0, 380.0, "Player", "None of your business.");
-        let answer = node(&mut doc, 660.0, 140.0, "Innkeeper", "Sern's Rest. Last inn before the pass.");
+        let answer = node(
+            &mut doc,
+            660.0,
+            140.0,
+            "Innkeeper",
+            "Sern's Rest. Last inn before the pass.",
+        );
         let sulk = node(&mut doc, 660.0, 380.0, "Innkeeper", "Suit yourself.");
 
         doc.edges = vec![
-            Edge { from: greet, to: ask, label: "Ask".into() },
-            Edge { from: greet, to: rude, label: "Refuse".into() },
-            Edge { from: ask, to: answer, label: String::new() },
-            Edge { from: rude, to: sulk, label: String::new() },
+            Edge {
+                from: greet,
+                to: ask,
+                label: "Ask".into(),
+            },
+            Edge {
+                from: greet,
+                to: rude,
+                label: "Refuse".into(),
+            },
+            Edge {
+                from: ask,
+                to: answer,
+                label: String::new(),
+            },
+            Edge {
+                from: rude,
+                to: sulk,
+                label: String::new(),
+            },
         ];
         doc
     }
@@ -246,7 +274,13 @@ mod tests {
             assert!(doc.node(e.from).is_some(), "dangling from {}", e.from);
             assert!(doc.node(e.to).is_some(), "dangling to {}", e.to);
         }
-        assert_eq!(doc.edges.iter().filter(|e| e.from == doc.nodes[0].id).count(), 2);
+        assert_eq!(
+            doc.edges
+                .iter()
+                .filter(|e| e.from == doc.nodes[0].id)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -256,8 +290,16 @@ mod tests {
         let over = doc.add_node(150.0, 120.0);
 
         assert_eq!(doc.hit_test(110.0, 110.0), Some(under));
-        assert_eq!(doc.hit_test(160.0, 130.0), Some(over), "later node is on top");
-        assert_eq!(doc.hit_test(100.0 + NODE_W, 110.0), None, "right edge is exclusive");
+        assert_eq!(
+            doc.hit_test(160.0, 130.0),
+            Some(over),
+            "later node is on top"
+        );
+        assert_eq!(
+            doc.hit_test(100.0 + NODE_W, 110.0),
+            None,
+            "right edge is exclusive"
+        );
         assert_eq!(doc.hit_test(0.0, 0.0), None);
     }
 
@@ -265,7 +307,11 @@ mod tests {
     fn remove_node_drops_its_edges() {
         let mut doc = Doc::sample();
         let victim = doc.nodes[1].id;
-        let kept = doc.edges.iter().filter(|e| e.from != victim && e.to != victim).count();
+        let kept = doc
+            .edges
+            .iter()
+            .filter(|e| e.from != victim && e.to != victim)
+            .count();
 
         doc.remove_node(victim);
 

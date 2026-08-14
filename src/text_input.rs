@@ -565,18 +565,19 @@ impl Element for TextElement {
 
         // Height grows with the wrapped text, so the field never clips its own content.
         let input = self.input.clone();
-        let layout_id = window.request_measured_layout(style, move |known, available, window, cx| {
-            let width = known.width.unwrap_or(match available.width {
-                AvailableSpace::Definite(width) => width,
-                _ => px(0.),
+        let layout_id =
+            window.request_measured_layout(style, move |known, available, window, cx| {
+                let width = known.width.unwrap_or(match available.width {
+                    AvailableSpace::Definite(width) => width,
+                    _ => px(0.),
+                });
+                let line_height = window.line_height();
+                let (text, runs) = text_and_runs(input.read(cx), window);
+                let height = shape_wrapped(text, &runs, width, window)
+                    .map(|line| line.size(line_height).height)
+                    .unwrap_or(line_height);
+                size(width, height.max(line_height))
             });
-            let line_height = window.line_height();
-            let (text, runs) = text_and_runs(input.read(cx), window);
-            let height = shape_wrapped(text, &runs, width, window)
-                .map(|line| line.size(line_height).height)
-                .unwrap_or(line_height);
-            size(width, height.max(line_height))
-        });
         (layout_id, ())
     }
 
@@ -634,10 +635,24 @@ impl Element for TextElement {
             return;
         };
         // Selection is a run background, so it is painted here rather than as a quad.
-        line.paint_background(bounds.origin, line_height, TextAlign::Left, None, window, cx)
-            .unwrap();
-        line.paint(bounds.origin, line_height, TextAlign::Left, None, window, cx)
-            .unwrap();
+        line.paint_background(
+            bounds.origin,
+            line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
+        line.paint(
+            bounds.origin,
+            line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()

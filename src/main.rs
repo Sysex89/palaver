@@ -1,9 +1,7 @@
 mod doc;
 mod text_input;
 
-use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, in_port, out_port, with_default_extension,
-};
+use doc::{Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, in_port, out_port, with_default_extension};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, PathPromptOptions, Pixels,
@@ -13,7 +11,10 @@ use gpui::{
 use std::path::PathBuf;
 use text_input::TextInput;
 
-actions!(papugai, [DeleteNode, Undo, FocusCanvas, New, Save, SaveAs, Open]);
+actions!(
+    papugai,
+    [DeleteNode, Undo, FocusCanvas, New, Save, SaveAs, Open]
+);
 
 /// Height of the menu bar. Mouse positions are window-relative, so this is also the
 /// offset between window coordinates and the canvas pane below the bar.
@@ -96,10 +97,17 @@ enum Selection {
 #[derive(Clone, Copy)]
 enum Drag {
     /// `grab` is the cursor's offset inside the node, in document coordinates.
-    Node { id: u32, grab: (f32, f32), moved: bool },
+    Node {
+        id: u32,
+        grab: (f32, f32),
+        moved: bool,
+    },
     /// Rubber band from a node's out-port to the cursor.
     Edge { from: u32, cursor: (f32, f32) },
-    Pan { start_mouse: (f32, f32), start_pan: (f32, f32) },
+    Pan {
+        start_mouse: (f32, f32),
+        start_pan: (f32, f32),
+    },
 }
 
 impl Editor {
@@ -111,7 +119,8 @@ impl Editor {
         let text_input = cx.new(|cx| TextInput::new("Line of dialog", cx));
         let label_input = cx.new(|cx| TextInput::new("Choice", cx));
         for input in [&speaker_input, &text_input, &label_input] {
-            cx.observe(input, |this, _, cx| this.sync_fields(cx)).detach();
+            cx.observe(input, |this, _, cx| this.sync_fields(cx))
+                .detach();
         }
 
         Self {
@@ -134,7 +143,11 @@ impl Editor {
 
     fn file_name(&self) -> String {
         match &self.path {
-            Some(path) => path.file_name().unwrap_or_default().to_string_lossy().into(),
+            Some(path) => path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into(),
             None => format!("untitled.{FILE_EXT}"),
         }
     }
@@ -291,7 +304,9 @@ impl Editor {
                 let speaker = self.speaker_input.read(cx).content().to_string();
                 let text = self.text_input.read(cx).content().to_string();
 
-                let Some(node) = self.doc.node(id) else { return };
+                let Some(node) = self.doc.node(id) else {
+                    return;
+                };
                 if node.speaker == speaker && node.text == text {
                     return;
                 }
@@ -446,7 +461,11 @@ impl Editor {
                 // Checkpoint on the first movement, so a plain click leaves no empty undo entry.
                 if !moved {
                     self.doc.checkpoint();
-                    self.drag = Some(Drag::Node { id, grab, moved: true });
+                    self.drag = Some(Drag::Node {
+                        id,
+                        grab,
+                        moved: true,
+                    });
                 }
                 let (x, y) = self.doc_pos(ev.position);
                 if let Some(node) = self.doc.node_mut(id) {
@@ -465,7 +484,10 @@ impl Editor {
                 start_pan,
             } => {
                 let (x, y) = Self::window_pos(ev.position);
-                self.pan = (start_pan.0 + x - start_mouse.0, start_pan.1 + y - start_mouse.1);
+                self.pan = (
+                    start_pan.0 + x - start_mouse.0,
+                    start_pan.1 + y - start_mouse.1,
+                );
             }
         }
         cx.notify();
@@ -700,11 +722,7 @@ impl Editor {
             .text_color(rgb(0xd6d6dd))
             .map(|this| match selected {
                 Some(Selection::Node(id)) => this
-                    .child(
-                        div()
-                            .text_color(rgb(0x9ecbff))
-                            .child(format!("Node {id}")),
-                    )
+                    .child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
                     .child(field("Speaker", &self.speaker_input))
                     .child(field("Text", &self.text_input)),
                 Some(Selection::Edge(index)) => {
