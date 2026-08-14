@@ -13,7 +13,7 @@ use text_input::TextInput;
 
 actions!(
     papugai,
-    [DeleteNode, Undo, FocusCanvas, New, Save, SaveAs, Open]
+    [DeleteNode, Undo, Redo, FocusCanvas, New, Save, SaveAs, Open]
 );
 
 /// Height of the menu bar. Mouse positions are window-relative, so this is also the
@@ -42,6 +42,7 @@ const MENUS: &[MenuSpec] = &[
         "Edit",
         &[
             ("Undo", "Ctrl+Z", |e, w, cx| e.on_undo(&Undo, w, cx)),
+            ("Redo", "Ctrl+Shift+Z", |e, w, cx| e.on_redo(&Redo, w, cx)),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
             }),
@@ -508,17 +509,26 @@ impl Editor {
 
     fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if self.doc.undo() {
-            // Undo can restore or drop whatever was selected, so the fields always reload.
-            let selection = match self.selected {
-                Some(Selection::Node(id)) if self.doc.node(id).is_some() => {
-                    Some(Selection::Node(id))
-                }
-                _ => None,
-            };
-            self.selected = selection;
-            self.load_fields(selection, cx);
-            cx.notify();
+            self.after_history(cx);
         }
+    }
+
+    fn on_redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.redo() {
+            self.after_history(cx);
+        }
+    }
+
+    /// Stepping through history can restore or drop whatever was selected, and it moves
+    /// the document out from under the sidebar, so the fields always reload.
+    fn after_history(&mut self, cx: &mut Context<Self>) {
+        let selection = match self.selected {
+            Some(Selection::Node(id)) if self.doc.node(id).is_some() => Some(Selection::Node(id)),
+            _ => None,
+        };
+        self.selected = selection;
+        self.load_fields(selection, cx);
+        cx.notify();
     }
 
     fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, _: &mut Context<Self>) {
@@ -614,6 +624,7 @@ impl Editor {
             .bg(rgb(0x1e1e22))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
@@ -879,6 +890,8 @@ fn main() {
             KeyBinding::new("delete", DeleteNode, Some("Editor")),
             KeyBinding::new("backspace", DeleteNode, Some("Editor")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
+            KeyBinding::new("ctrl-shift-z", Redo, Some("Editor")),
+            KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),
             KeyBinding::new("ctrl-shift-s", SaveAs, Some("Editor")),

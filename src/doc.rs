@@ -44,6 +44,9 @@ pub struct Doc {
     // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
     #[serde(skip)]
     undo: Vec<Snapshot>,
+    /// Only ever holds snapshots [`Doc::undo`] popped, so it needs no depth cap of its own.
+    #[serde(skip)]
+    redo: Vec<Snapshot>,
     #[serde(skip)]
     dirty: bool,
 }
@@ -149,12 +152,23 @@ impl Doc {
         })
     }
 
+    fn snapshot(&self) -> Snapshot {
+        (self.nodes.clone(), self.edges.clone(), self.next_id)
+    }
+
+    fn restore(&mut self, (nodes, edges, next_id): Snapshot) {
+        self.nodes = nodes;
+        self.edges = edges;
+        self.next_id = next_id;
+    }
+
     /// Records the current state so the next mutation can be undone. Every mutation
     /// goes through here, which is also what makes it the right place to mark dirty.
     pub fn checkpoint(&mut self) {
         self.dirty = true;
-        self.undo
-            .push((self.nodes.clone(), self.edges.clone(), self.next_id));
+        // A fresh edit branches history, so whatever was undone is no longer reachable.
+        self.redo.clear();
+        self.undo.push(self.snapshot());
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
         }
@@ -186,13 +200,23 @@ impl Doc {
 
     /// Restores the last checkpoint. False when there is nothing to undo.
     pub fn undo(&mut self) -> bool {
-        let Some((nodes, edges, next_id)) = self.undo.pop() else {
+        let Some(restored) = self.undo.pop() else {
             return false;
         };
+        self.redo.push(self.snapshot());
         self.dirty = true;
-        self.nodes = nodes;
-        self.edges = edges;
-        self.next_id = next_id;
+        self.restore(restored);
+        true
+    }
+
+    /// Replays the last undone change. False when there is nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(restored) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(self.snapshot());
+        self.dirty = true;
+        self.restore(restored);
         true
     }
 
@@ -333,6 +357,52 @@ mod tests {
         assert_eq!(doc.edges.len(), edges);
         assert!(doc.node(victim).is_some());
         assert!(!doc.undo(), "history is empty again");
+    }
+
+    #[test]
+    fn redo_replays_an_undone_change() {
+        let mut doc = Doc::sample();
+        let nodes = doc.nodes.len();
+
+        doc.checkpoint();
+        let added = doc.add_node(10.0, 10.0);
+        assert!(doc.undo());
+        assert_eq!(doc.nodes.len(), nodes, "the node is gone after undo");
+
+        assert!(doc.redo());
+        assert_eq!(doc.nodes.len(), nodes + 1);
+        assert!(doc.node(added).is_some());
+        assert_eq!(doc.add_node(0.0, 0.0), added + 1, "next_id came back too");
+        assert!(!doc.redo(), "nothing left to replay");
+    }
+
+    #[test]
+    fn redo_is_empty_until_something_is_undone() {
+        let mut doc = Doc::sample();
+        doc.checkpoint();
+        doc.add_node(10.0, 10.0);
+
+        assert!(!doc.redo(), "an edit alone gives nothing to redo");
+    }
+
+    #[test]
+    fn a_new_edit_discards_the_redo_stack() {
+        let mut doc = Doc::sample();
+        let nodes = doc.nodes.len();
+
+        doc.checkpoint();
+        doc.add_node(10.0, 10.0);
+        assert!(doc.undo());
+
+        doc.checkpoint();
+        doc.add_node(20.0, 20.0);
+
+        assert!(
+            !doc.redo(),
+            "the branch that added the first node is unreachable"
+        );
+        assert_eq!(doc.nodes.len(), nodes + 1);
+        assert_eq!(doc.nodes.last().unwrap().x, 20.0, "the new edit survived");
     }
 
     #[test]

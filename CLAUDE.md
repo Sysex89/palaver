@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `papugai` — a node-graph dialog editor in the spirit of articy:draft: branching dialogue graphs of speaker/text nodes connected by labelled choice edges.
 
-Working today: pan, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, snapshot undo, new/open/save/save-as of `.dln` JSON files.
+Working today: pan, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
 
 The intended end state is bigger than that — see **Roadmap** at the bottom. Everything outside that section describes code that exists; the roadmap is the only forward-looking part of this file.
 
@@ -28,13 +28,13 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-Clippy is clean at `-D warnings`. **`cargo fmt` is not**: the source is hand-formatted tighter than rustfmt wants in places (`Doc::sample`, several `assert_eq!`s, the `request_measured_layout` closure), so a blanket `cargo fmt` produces a large diff unrelated to whatever you were doing. Format only what you touched, or leave it.
+The tree is clean under both `cargo fmt --check` and clippy at `-D warnings`; keep it that way.
 
 ## Layout
 
 Three files, no `lib.rs`:
 
-- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (14 unit tests at the bottom of the file).
+- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (17 unit tests at the bottom of the file).
 - `src/main.rs` — `Editor`, the single `Render` view: menu bar, canvas pane, sidebar, all mouse/key handling.
 - `src/text_input.rs` — a single-line `TextInput`, **vendored from gpui 0.2.2's `examples/input.rs`**; the header comment lists the local deltas. Treat it as third-party: on a gpui upgrade, re-vendor and re-apply the deltas rather than hand-patching. It holds the crate's only hand-written `impl Element` (`TextElement`, `text_input.rs:544`). `text_input::bind_keys(cx)` must be called at startup or the fields ignore every key.
 
@@ -58,13 +58,14 @@ Three of them, converted only through the helpers at `src/main.rs:330-342`:
 
 ## Invariants
 
-- **Checkpoint before you mutate.** `Doc` never checkpoints itself — the view calls `doc.checkpoint()` (`doc.rs:154`) *before* each mutation. It pushes a full snapshot (50 deep) *and* sets the dirty flag; it is the single choke point for both, and `dirty` is only cleared in `save()`. A mutation that skips it is both un-undoable and silently unsaved. Undo only — there is no redo stack, and `undo()` itself sets dirty.
+- **Checkpoint before you mutate.** `Doc` never checkpoints itself — the view calls `doc.checkpoint()` (`doc.rs:154`) *before* each mutation. It pushes a full snapshot (50 deep) *and* sets the dirty flag; it is the single choke point for both, and `dirty` is only cleared in `save()`. A mutation that skips it is both un-undoable and silently unsaved. `undo()` and `redo()` also set dirty — stepping through history counts as an edit.
+- **`checkpoint()` clears the redo stack**, since a fresh edit branches history. `undo`/`redo` are symmetric: pop one stack, push the current snapshot onto the other. Only `undo` is capped at `UNDO_DEPTH`; the redo stack needs no cap of its own because it can only ever hold snapshots `undo` popped.
 - **Checkpoints are placed to avoid empty undo steps.** Typing coalesces: `Editor::checkpoint_once` + the `text_dirty` flag give one checkpoint per editing session, and `text_dirty` resets in `load_fields` when the selection changes. Node drag checkpoints on the first `MouseMove`, not on mouse-down, so a plain click leaves no history entry.
 - **`Selection::Edge(usize)` is a bare index into `doc.edges`**, invalidated by any edge removal. The mitigation is convention: every structural change calls `select(None, cx)`, and `on_undo` re-validates a node selection and drops anything else.
 - **`sync_fields` runs on every keystroke** (via `cx.observe` on the three `Entity<TextInput>` handles, wired in `Editor::new`), so it must early-return when the content is unchanged — otherwise `set_content` → notify → sync loops and spams checkpoints. It is paired with `load_fields`, which pushes doc content *into* the fields; `self.edited` tracks which selection the fields currently hold. There is no `cx.emit`/`cx.subscribe` anywhere in the crate.
 - **`render` sets the window title**, but only when it changed (`src/main.rs:514`) — render runs constantly, so keep any other side effect out of it.
 - **Key contexts partition the keyboard**: `"Editor"` on the canvas pane, `"TextInput"` on the field. `delete`/`backspace` mean "delete node" in one and "delete character" in the other; `escape` exists only in `TextInput` scope and routes focus back via the `FocusCanvas` action.
-- `next_id` is monotonic, serialized, and part of the snapshot; ids are never reused, including across undo or load.
+- `next_id` is serialized *and* part of the snapshot, so a loaded document can't collide with new nodes. It is monotonic only in the absence of undo: an undo rolls `next_id` back with everything else, so the next `add_node` reissues the id the undone node had. Ids are unique within a document at any instant, but not stable across a history step — don't cache one outside the `Doc`.
 - The `.dln` file is pretty-printed serde JSON of `Doc`; `undo` and `dirty` are `#[serde(skip)]`, so loading starts with empty history and clean state. `with_default_extension` only appends `.dln` when the path has *no* extension, so "Save As `scene.json`" stays `.json`.
 - A fresh `Editor` starts on `Doc::sample()` (a 5-node innkeeper conversation), not an empty document.
 
@@ -89,7 +90,5 @@ None of this exists yet. Grep before assuming otherwise. Where each piece should
 **Flow fragments** — nested subgraphs, turning a `Doc` into a tree of graphs rather than one flat node list. The largest change: it touches ids (unique per fragment or globally?), the `Selection` enum, pan state (per fragment), and the JSON format. Design it before starting; snapshot undo over the whole tree stays fine.
 
 **Zoom** — add a scale factor next to `pan` and thread it through the three coordinate helpers (`src/main.rs:330-342`) and nothing else. Node sizes come from `doc.rs` constants, so they scale for free.
-
-**Redo** — the current `undo: Vec<Snapshot>` needs a matching redo stack, cleared on any new checkpoint. Cheap now, and worth doing before the snapshot approach is ever replaced.
 
 When a roadmap item ships, move its description into the sections above and delete it from here.
