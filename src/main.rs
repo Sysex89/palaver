@@ -1,24 +1,48 @@
 mod doc;
 mod text_input;
 
-use doc::{Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, in_port, out_port, with_default_extension};
+use doc::{
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, View, in_port, out_port, with_default_extension,
+};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, PathPromptOptions, Pixels,
-    Point, PromptLevel, Render, Rgba, Window, WindowBounds, WindowOptions, actions, canvas,
-    deferred, div, point, prelude::*, px, rgb, size,
+    Point, PromptLevel, Render, Rgba, ScrollWheelEvent, Window, WindowBounds, WindowOptions,
+    actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use text_input::TextInput;
 
 actions!(
     papugai,
-    [DeleteNode, Undo, Redo, FocusCanvas, New, Save, SaveAs, Open]
+    [
+        DeleteNode,
+        Undo,
+        Redo,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        FocusCanvas,
+        New,
+        Save,
+        SaveAs,
+        Open
+    ]
 );
 
 /// Height of the menu bar. Mouse positions are window-relative, so this is also the
 /// offset between window coordinates and the canvas pane below the bar.
 const MENU_H: f32 = 30.0;
+/// Width of the inspector on the right. With [`MENU_H`], this is what bounds the canvas.
+const SIDEBAR_W: f32 = 280.0;
+
+/// How much one pixel of scroll changes the zoom. Multiplicative, so a scroll up and an
+/// equal scroll down cancel out exactly.
+const ZOOM_PER_PIXEL: f32 = 1.0015;
+/// Zoom step for the keyboard commands. `1 / 1.25 == 0.8`, so in-then-out is a round trip.
+const ZOOM_STEP: f32 = 1.25;
+/// Node and label text size at 1:1, matching the `text_sm` the rest of the UI uses.
+const BASE_TEXT: f32 = 14.0;
 
 type MenuAction = fn(&mut Editor, &mut Window, &mut Context<Editor>);
 /// Label, shortcut hint, what it runs.
@@ -43,6 +67,13 @@ const MENUS: &[MenuSpec] = &[
         &[
             ("Undo", "Ctrl+Z", |e, w, cx| e.on_undo(&Undo, w, cx)),
             ("Redo", "Ctrl+Shift+Z", |e, w, cx| e.on_redo(&Redo, w, cx)),
+            ("Zoom in", "Ctrl+=", |e, w, cx| e.on_zoom_in(&ZoomIn, w, cx)),
+            ("Zoom out", "Ctrl+-", |e, w, cx| {
+                e.on_zoom_out(&ZoomOut, w, cx)
+            }),
+            ("Actual size", "Ctrl+0", |e, w, cx| {
+                e.on_zoom_reset(&ZoomReset, w, cx)
+            }),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
             }),
@@ -65,8 +96,8 @@ const ACCENT_COLOR: Rgba = Rgba {
 
 struct Editor {
     doc: Doc,
-    /// Canvas offset in pixels, applied to everything drawn.
-    pan: (f32, f32),
+    /// Where the canvas is looking. Applied to everything drawn.
+    view: View,
     selected: Option<Selection>,
     drag: Option<Drag>,
     focus_handle: FocusHandle,
@@ -126,7 +157,7 @@ impl Editor {
 
         Self {
             doc: Doc::sample(),
-            pan: (0.0, 0.0),
+            view: View::default(),
             selected: None,
             drag: None,
             focus_handle,
@@ -177,6 +208,7 @@ impl Editor {
     /// Starts an empty, unnamed document.
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.doc = Doc::default();
+        self.view = View::default();
         self.drag = None;
         self.path = None;
         self.status = None;
@@ -348,13 +380,22 @@ impl Editor {
     }
 
     fn doc_pos(&self, pos: Point<Pixels>) -> (f32, f32) {
-        let (x, y) = Self::window_pos(pos);
-        (x - self.pan.0, y - self.pan.1)
+        self.view.to_doc(Self::window_pos(pos))
     }
 
     /// Screen position of a document point.
-    fn screen_pos(&self, (x, y): (f32, f32)) -> Point<Pixels> {
-        point(px(x + self.pan.0), px(y + self.pan.1))
+    fn screen_pos(&self, doc: (f32, f32)) -> Point<Pixels> {
+        let (x, y) = self.view.to_screen(doc);
+        point(px(x), px(y))
+    }
+
+    /// Centre of the canvas pane, which is what the keyboard zoom commands anchor on.
+    fn pane_center(window: &Window) -> (f32, f32) {
+        let size = window.viewport_size();
+        (
+            (f32::from(size.width) - SIDEBAR_W) / 2.0,
+            (f32::from(size.height) - MENU_H) / 2.0,
+        )
     }
 
     /// One entry per edge: the line from the source's out-port to the target's in-port,
@@ -428,7 +469,7 @@ impl Editor {
             self.select(None, cx);
             self.drag = Some(Drag::Pan {
                 start_mouse: Self::window_pos(ev.position),
-                start_pan: self.pan,
+                start_pan: self.view.pan,
             });
         }
         cx.notify();
@@ -484,8 +525,9 @@ impl Editor {
                 start_mouse,
                 start_pan,
             } => {
+                // Pan is in screen pixels, so this is the same arithmetic at every zoom.
                 let (x, y) = Self::window_pos(ev.position);
-                self.pan = (
+                self.view.pan = (
                     start_pan.0 + x - start_mouse.0,
                     start_pan.1 + y - start_mouse.1,
                 );
@@ -531,6 +573,36 @@ impl Editor {
         cx.notify();
     }
 
+    /// Wheel zooms about the cursor, so whatever you are pointing at stays put.
+    fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let dy = f32::from(ev.delta.pixel_delta(window.line_height()).y);
+        if dy == 0.0 {
+            return;
+        }
+        self.view
+            .zoom_at(ZOOM_PER_PIXEL.powf(dy), Self::window_pos(ev.position));
+        cx.notify();
+    }
+
+    fn on_zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(ZOOM_STEP, window, cx);
+    }
+
+    fn on_zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(1.0 / ZOOM_STEP, window, cx);
+    }
+
+    /// Back to 1:1, expressed as the factor that gets there — so there is no second
+    /// code path that could disagree with [`View::zoom_at`] about where pan lands.
+    fn on_zoom_reset(&mut self, _: &ZoomReset, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(1.0 / self.view.zoom, window, cx);
+    }
+
+    fn zoom_by(&mut self, factor: f32, window: &Window, cx: &mut Context<Self>) {
+        self.view.zoom_at(factor, Self::pane_center(window));
+        cx.notify();
+    }
+
     fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, _: &mut Context<Self>) {
         window.focus(&self.focus_handle);
     }
@@ -550,7 +622,7 @@ impl Render for Editor {
 
         let lines = self.edge_lines();
         let pending = self.pending_edge();
-        let (pan, selected) = (self.pan, self.selected);
+        let (view, selected) = (self.view, self.selected);
 
         div()
             .flex()
@@ -564,7 +636,7 @@ impl Render for Editor {
                     .flex_row()
                     .flex_1()
                     .overflow_hidden()
-                    .child(self.canvas_pane(lines, pending, pan, selected, cx))
+                    .child(self.canvas_pane(lines, pending, view, selected, cx))
                     .child(self.sidebar(selected)),
             )
     }
@@ -610,7 +682,7 @@ impl Editor {
         &self,
         lines: Vec<(Point<Pixels>, Point<Pixels>, bool)>,
         pending: Option<(Point<Pixels>, Point<Pixels>)>,
-        pan: (f32, f32),
+        view: View,
         selected: Option<Selection>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -625,6 +697,9 @@ impl Editor {
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
@@ -634,6 +709,7 @@ impl Editor {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
                 canvas(
                     |_, _, _| {},
@@ -647,7 +723,8 @@ impl Editor {
                             if let Ok(line) = line.build() {
                                 window.paint_path(line, color);
                             }
-                            if let Some(head) = arrow_head(to, from) {
+                            // The stroke stays a hairline at every zoom; only the head scales.
+                            if let Some(head) = arrow_head(to, from, view.zoom) {
                                 window.paint_path(head, color);
                             }
                         };
@@ -670,9 +747,9 @@ impl Editor {
                 self.doc
                     .nodes
                     .iter()
-                    .map(|node| node_box(node, pan, selected == Some(Selection::Node(node.id)))),
+                    .map(|node| node_box(node, view, selected == Some(Selection::Node(node.id)))),
             )
-            .children(self.doc.nodes.iter().map(|node| port_dot(node, pan)))
+            .children(self.doc.nodes.iter().map(|node| port_dot(node, view)))
     }
 
     /// Choice text, centred on each labelled edge.
@@ -687,15 +764,17 @@ impl Editor {
                 let from = out_port(self.doc.node(edge.from)?);
                 let to = in_port(self.doc.node(edge.to)?);
                 let mid = self.screen_pos(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
+                let width = self.view.scale(W);
                 Some(
                     // Fixed width and centred content, so the label centres without measuring it.
                     div()
                         .absolute()
-                        .left(mid.x - px(W / 2.0))
-                        .top(mid.y - px(18.))
-                        .w(px(W))
+                        .left(mid.x - px(width / 2.0))
+                        .top(mid.y - px(self.view.scale(18.)))
+                        .w(px(width))
                         .flex()
                         .justify_center()
+                        .text_size(px(self.view.scale(BASE_TEXT)))
                         .child(
                             div()
                                 .px_1()
@@ -724,7 +803,7 @@ impl Editor {
             .flex()
             .flex_col()
             .gap_3()
-            .w(px(280.))
+            .w(px(SIDEBAR_W))
             .h_full()
             .p_3()
             .bg(rgb(0x26262c))
@@ -809,29 +888,34 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
 }
 
 /// The handle an edge is dragged out of.
-fn port_dot(node: &Node, pan: (f32, f32)) -> impl IntoElement {
-    let (x, y) = out_port(node);
+fn port_dot(node: &Node, view: View) -> impl IntoElement {
+    let (x, y) = view.to_screen(out_port(node));
+    let r = view.scale(PORT_R);
     div()
         .absolute()
-        .left(px(x + pan.0 - PORT_R))
-        .top(px(y + pan.1 - PORT_R))
-        .size(px(PORT_R * 2.0))
+        .left(px(x - r))
+        .top(px(y - r))
+        .size(px(r * 2.0))
         .rounded_full()
         .bg(rgb(0x3a3a44))
         .border_2()
         .border_color(rgb(0x7d7d8c))
 }
 
-fn node_box(node: &Node, pan: (f32, f32), selected: bool) -> impl IntoElement {
+fn node_box(node: &Node, view: View, selected: bool) -> impl IntoElement {
+    let (x, y) = view.to_screen((node.x, node.y));
     div()
         .absolute()
-        .left(px(node.x + pan.0))
-        .top(px(node.y + pan.1))
-        .w(px(NODE_W))
-        .h(px(NODE_H))
+        .left(px(x))
+        .top(px(y))
+        .w(px(view.scale(NODE_W)))
+        .h(px(view.scale(NODE_H)))
+        .text_size(px(view.scale(BASE_TEXT)))
         .overflow_hidden()
         .flex()
         .flex_col()
+        // ponytail: padding, border and radius stay fixed while the box scales, so a node
+        // reads chrome-heavy at 0.25x and thin at 3x. Scale them too if that starts to grate.
         .gap_1()
         .p_2()
         .bg(rgb(0x2b2b33))
@@ -862,8 +946,8 @@ fn node_box(node: &Node, pan: (f32, f32), selected: bool) -> impl IntoElement {
 }
 
 /// Filled triangle pointing at `tip`, aimed along the direction from `from`.
-fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>) -> Option<Path<Pixels>> {
-    const SIZE: f32 = 10.0;
+fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>, zoom: f32) -> Option<Path<Pixels>> {
+    let size = 10.0 * zoom;
 
     let (tip_x, tip_y) = (f32::from(tip.x), f32::from(tip.y));
     let (dx, dy) = (tip_x - f32::from(from.x), tip_y - f32::from(from.y));
@@ -872,9 +956,9 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>) -> Option<Path<Pixels>> {
         return None;
     }
     let (ux, uy) = (dx / len, dy / len);
-    let (base_x, base_y) = (tip_x - ux * SIZE, tip_y - uy * SIZE);
+    let (base_x, base_y) = (tip_x - ux * size, tip_y - uy * size);
     // Perpendicular to the direction, half the head's width.
-    let (wx, wy) = (-uy * SIZE * 0.4, ux * SIZE * 0.4);
+    let (wx, wy) = (-uy * size * 0.4, ux * size * 0.4);
 
     let mut head = PathBuilder::fill();
     head.move_to(tip);
@@ -891,6 +975,10 @@ fn main() {
             KeyBinding::new("backspace", DeleteNode, Some("Editor")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Editor")),
+            KeyBinding::new("ctrl-=", ZoomIn, Some("Editor")),
+            KeyBinding::new("ctrl-+", ZoomIn, Some("Editor")),
+            KeyBinding::new("ctrl--", ZoomOut, Some("Editor")),
+            KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),

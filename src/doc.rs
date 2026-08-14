@@ -1,4 +1,5 @@
-//! The dialog document: nodes, edges, and nothing that knows about gpui.
+//! The dialog document — nodes, edges — and the canvas viewport that looks at it.
+//! Nothing here knows about gpui, which is what keeps it testable.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,53 @@ pub fn out_port(node: &Node) -> (f32, f32) {
 /// Where an edge arrives at a node.
 pub fn in_port(node: &Node) -> (f32, f32) {
     (node.x, node.y + NODE_H / 2.0)
+}
+
+pub const MIN_ZOOM: f32 = 0.25;
+pub const MAX_ZOOM: f32 = 3.0;
+
+/// Where the canvas is looking: `screen = doc * zoom + pan`, with `pan` in screen
+/// pixels so dragging the canvas is the same arithmetic at every zoom level.
+///
+/// Not part of the document and never serialized — it is view state that happens to
+/// live here because it is pure arithmetic worth unit-testing.
+#[derive(Clone, Copy)]
+pub struct View {
+    pub pan: (f32, f32),
+    pub zoom: f32,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            pan: (0.0, 0.0),
+            zoom: 1.0,
+        }
+    }
+}
+
+impl View {
+    pub fn to_doc(self, (x, y): (f32, f32)) -> (f32, f32) {
+        ((x - self.pan.0) / self.zoom, (y - self.pan.1) / self.zoom)
+    }
+
+    pub fn to_screen(self, (x, y): (f32, f32)) -> (f32, f32) {
+        (x * self.zoom + self.pan.0, y * self.zoom + self.pan.1)
+    }
+
+    /// A document-space length in screen pixels.
+    pub fn scale(self, len: f32) -> f32 {
+        len * self.zoom
+    }
+
+    /// Zooms by `factor`, keeping whatever sits under `anchor` (in screen coordinates)
+    /// in place. Pan is recomputed from the *clamped* zoom, so the anchor still holds
+    /// when the factor runs into a limit.
+    pub fn zoom_at(&mut self, factor: f32, anchor: (f32, f32)) {
+        let (x, y) = self.to_doc(anchor);
+        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.pan = (anchor.0 - x * self.zoom, anchor.1 - y * self.zoom);
+    }
 }
 
 const UNDO_DEPTH: usize = 50;
@@ -528,5 +576,65 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len());
+    }
+
+    /// Both coordinates within a pixel of each other, which is all the canvas cares about.
+    fn close(a: (f32, f32), b: (f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
+    }
+
+    #[test]
+    fn view_round_trips_a_point() {
+        let view = View {
+            pan: (-120.0, 45.0),
+            zoom: 1.75,
+        };
+        let doc_point = (310.0, 220.0);
+
+        let there = view.to_screen(doc_point);
+        assert!(there != doc_point, "the transform is doing something");
+        assert!(close(view.to_doc(there), doc_point));
+    }
+
+    #[test]
+    fn zoom_keeps_the_anchor_fixed() {
+        let mut view = View::default();
+        let anchor = (400.0, 300.0);
+        let under_cursor = view.to_doc(anchor);
+
+        view.zoom_at(1.5, anchor);
+
+        assert_eq!(view.zoom, 1.5);
+        assert!(
+            close(view.to_screen(under_cursor), anchor),
+            "the point under the cursor stayed put"
+        );
+    }
+
+    #[test]
+    fn zoom_is_clamped() {
+        let mut view = View::default();
+        for _ in 0..50 {
+            view.zoom_at(1.5, (0.0, 0.0));
+        }
+        assert_eq!(view.zoom, MAX_ZOOM);
+
+        for _ in 0..50 {
+            view.zoom_at(0.5, (0.0, 0.0));
+        }
+        assert_eq!(view.zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn clamped_zoom_still_holds_the_anchor() {
+        let mut view = View::default();
+        let anchor = (250.0, 180.0);
+        let under_cursor = view.to_doc(anchor);
+
+        // Way past the ceiling, so pan must be recomputed from the clamped zoom.
+        view.zoom_at(100.0, anchor);
+
+        assert_eq!(view.zoom, MAX_ZOOM);
+        assert!(close(view.to_screen(under_cursor), anchor));
     }
 }
