@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `papugai` — a node-graph dialog editor in the spirit of articy:draft: branching dialogue graphs of speaker/text nodes connected by labelled choice edges.
 
-Working today: pan and zoom, node drag, edge drag from a port, marquee multi-select and group move, select/delete node or edge, sidebar text editing, search and jump-to-node, Tab to quick-create a connected node, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
+Working today: pan and zoom, node drag, edge drag from a port, marquee multi-select and group move, select/delete node or edge, sidebar text editing, search and jump-to-node, Tab to quick-create a connected node, a validation problem list, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
 
 The intended end state is bigger than that — see **Roadmap** at the bottom. Everything outside that section describes code that exists; the roadmap is the only forward-looking part of this file.
 
@@ -34,7 +34,7 @@ The tree is clean under both `cargo fmt --check` and clippy at `-D warnings`; ke
 
 Three files, no `lib.rs`:
 
-- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (31 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
+- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (38 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
 - `src/main.rs` — `Editor`, the single `Render` view: menu bar, canvas pane, sidebar, all mouse/key handling.
 - `src/text_input.rs` — a single-line `TextInput`, **vendored from gpui 0.2.2's `examples/input.rs`**; the header comment lists the local deltas. Treat it as third-party: on a gpui upgrade, re-vendor and re-apply the deltas rather than hand-patching. It holds the crate's only hand-written `impl Element` (`TextElement`, `text_input.rs:544`). `text_input::bind_keys(cx)` must be called at startup or the fields ignore every key.
 
@@ -74,6 +74,7 @@ Three of them:
 - **`Selection` is `None | Nodes(Vec<u32>) | Edge(usize)`** — plural for nodes, singular for edges. `Selection::Edge(usize)` is a bare index into `doc.edges`, invalidated by any edge removal; the mitigation is convention: every structural change calls `select(Selection::None, cx)`, and `after_history` re-validates the node set against the document and drops anything else. Node ids survive a history step, so a node set does not need the same treatment — only the ids that vanished are filtered out.
 - **`Selection::only_node()` is the gate on every single-node path** — `load_fields`, `sync_fields`, `on_branch`. A multi-selection returns `None` there, so it has no inspector fields to write and cannot half-edit a group. New per-node commands go through it too, not through `nodes()[0]`.
 - **A group drag anchors the grabbed node and moves the rest by its delta** (`Drag::Node` in `on_mouse_move`), rather than storing a per-node offset. That way the node under the cursor never drifts, and the maths is the same for one node as for twenty.
+- **`Problem` carries no message text.** `Doc::problems` returns an enum; the wording lives in `problem_text` in `main.rs`, which keeps view strings out of the model and lets the tests assert on variants instead of phrasing. Its `Severity` split is load-bearing, not decoration: a leaf node is an ordinary way for a conversation to end, so only a broken document (`DanglingEdge`, `NoStart`) is an `Error`. Anything new that would fire on a healthy graph is a `Warning`.
 - **The three inspector inputs are observed as a group; `search_input` is not.** The `sync_fields` loop in `Editor::new` exists to write field content *into* the document — a search query is not document content, so it gets its own observer that only calls `cx.notify()`. Adding a non-document field to that loop would write it into the selected node.
 - **`sync_fields` runs on every keystroke** (via `cx.observe` on the three `Entity<TextInput>` handles, wired in `Editor::new`), so it must early-return when the content is unchanged — otherwise `set_content` → notify → sync loops and spams checkpoints. It is paired with `load_fields`, which pushes doc content *into* the fields; `self.edited` tracks which selection the fields currently hold. There is no `cx.emit`/`cx.subscribe` anywhere in the crate.
 - **`render` sets the window title**, but only when it changed (`src/main.rs:514`) — render runs constantly, so keep any other side effect out of it.
@@ -93,13 +94,11 @@ Three of them:
 
 ## Roadmap — intent, not code
 
-None of this exists yet. Grep before assuming otherwise. Roughly smallest-first; the first three need no schema change at all.
+None of this exists yet. Grep before assuming otherwise. Roughly smallest-first; the first two need no schema change at all.
 
 **Autosave and recovery** — same family as the window-close guard: a crash or a kill still loses everything since the last Ctrl+S. A loop of `cx.background_executor().timer(..)` inside a detached `cx.spawn`, waking every minute or so and writing only when `is_dirty()`.
 
 Two traps. First, **do not call `Doc::save`** — it clears the dirty flag, so the title would stop showing `*` and the close guard would stop asking. Write `to_json()` to the file directly and leave `dirty` alone. Second, **do not write over the user's file**: an autosave they never asked for must not clobber the document on disk. Write a sidecar (`<name>.dln.autosave`, and a fixed path for a document with no `path` yet), delete it on a real save and on a confirmed close, and on launch offer to recover any that survived. Skip a tick while `self.drag.is_some()` so a save never lands mid-drag.
-
-**Validation** — a problem list: dangling edges, unreachable nodes, dead ends, empty text, zero-or-many start nodes. Pure `doc.rs` returning a `Vec<Problem>`, which makes it the most testable item here. Surface it in the sidebar; clicking a problem should reuse `Editor::jump_to`, which search already built.
 
 **Play mode** — walk the graph from a start node, showing the node's text and its outgoing edge labels as choices, click to advance. This turns a diagram into something you can actually judge, and it **works today with zero schema change**. The one decision is what "start" means — derive it (the node with no incoming edges) or mark it explicitly; deriving is enough until it isn't. Later this is where variables and conditions pay off, so keep the traversal a plain `doc.rs` function over `&Doc` rather than view state.
 

@@ -2,8 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, View, in_port, node_center, out_port,
-    with_default_extension,
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, Problem, Severity, View, in_port, node_center,
+    out_port, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -1045,13 +1045,7 @@ impl Editor {
                     this.child(div().text_color(rgb(0x6c6c78)).child("No matches."))
                 })
                 .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
-                    let node = self.doc.node(id)?;
-                    let label = match (node.speaker.trim(), node.text.trim()) {
-                        ("", "") => format!("Node {id}"),
-                        ("", text) => text.to_string(),
-                        (speaker, "") => speaker.to_string(),
-                        (speaker, text) => format!("{speaker} — {text}"),
-                    };
+                    let label = node_label(self.doc.node(id)?);
                     Some(
                         div()
                             .id(("search-result", id))
@@ -1068,6 +1062,63 @@ impl Editor {
                             ),
                     )
                 }))
+                .when(more > 0, |this| {
+                    this.child(
+                        div()
+                            .text_color(rgb(0x6c6c78))
+                            .child(format!("…and {more} more")),
+                    )
+                })
+            })
+    }
+
+    /// Everything wrong with the document, worst first. Clicking a row jumps to the node.
+    fn problems_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /// Same ceiling as the search results, for the same reason.
+        const MAX_ROWS: usize = 20;
+
+        // ponytail: revalidates the whole document each frame. Cheap at this scale, and a
+        // cache would need invalidating on every edit, undo and load.
+        let problems = self.doc.problems();
+        let more = problems.len().saturating_sub(MAX_ROWS);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(!problems.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x8a8a96))
+                        .child(format!("Problems ({})", problems.len())),
+                )
+                .children(
+                    problems
+                        .iter()
+                        .take(MAX_ROWS)
+                        .enumerate()
+                        .map(|(i, problem)| {
+                            let color = match problem.severity() {
+                                Severity::Error => rgb(0xff7a7a),
+                                Severity::Warning => rgb(0xb8b8c4),
+                            };
+                            div()
+                                .id(("problem", i))
+                                .px_1()
+                                .rounded_sm()
+                                .truncate()
+                                .text_color(color)
+                                .child(problem_text(problem, &self.doc))
+                                // A dangling edge has no live node to jump to, so its row is inert.
+                                .when_some(problem.node(), |this, id| {
+                                    this.hover(|style| style.bg(rgb(0x33333c))).on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.jump_to(id, window, cx)
+                                        }),
+                                    )
+                                })
+                        }),
+                )
                 .when(more > 0, |this| {
                     this.child(
                         div()
@@ -1131,6 +1182,7 @@ impl Editor {
                         .child("Select a node or an edge to edit it."),
                 ),
             })
+            .child(self.problems_panel(cx))
             .child(
                 div()
                     .mt_auto()
@@ -1188,6 +1240,32 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
                     }))
             })),
     )
+}
+
+/// How a node reads in a list: what it says, or who says it, or its id as a last resort.
+fn node_label(node: &Node) -> String {
+    match (node.speaker.trim(), node.text.trim()) {
+        ("", "") => format!("Node {}", node.id),
+        ("", text) => text.to_string(),
+        (speaker, "") => speaker.to_string(),
+        (speaker, text) => format!("{speaker} — {text}"),
+    }
+}
+
+/// Wording for a problem row. Lives here, not in `doc.rs`, which stays free of view text.
+fn problem_text(problem: &Problem, doc: &Doc) -> String {
+    let label = |id: u32| match doc.node(id) {
+        Some(node) => node_label(node),
+        None => format!("Node {id}"),
+    };
+    match problem {
+        Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
+        Problem::NoStart => "No start node — every node is linked to".into(),
+        Problem::ManyStarts(ids) => format!("{} possible start nodes", ids.len()),
+        Problem::Unreachable(id) => format!("Unreachable: {}", label(*id)),
+        Problem::DeadEnd(id) => format!("Dead end: {}", label(*id)),
+        Problem::Empty(id) => format!("No text: {}", label(*id)),
+    }
 }
 
 /// The handle an edge is dragged out of.

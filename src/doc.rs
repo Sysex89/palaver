@@ -2,6 +2,7 @@
 //! Nothing here knows about gpui, which is what keeps it testable.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Extension of a saved dialog document.
@@ -131,7 +132,115 @@ pub struct Edge {
     pub label: String,
 }
 
+/// Something wrong with the document, as found by [`Doc::problems`]. Carries no message
+/// text — the wording is view text and lives in `main.rs`, which also keeps these
+/// assertable in tests without being brittle about phrasing.
+#[derive(Debug, PartialEq)]
+pub enum Problem {
+    /// An edge pointing at a node that is not there. Only reachable through a bad file.
+    DanglingEdge(usize),
+    /// Nodes exist but every one has an incoming edge, so nothing can start.
+    NoStart,
+    /// Several nodes have no incoming edge, so which one starts is ambiguous.
+    ManyStarts(Vec<u32>),
+    /// Not reachable from any start node.
+    Unreachable(u32),
+    /// No outgoing edges — the conversation stops here.
+    DeadEnd(u32),
+    /// No dialogue text.
+    Empty(u32),
+}
+
+/// A leaf node is an ordinary way for a conversation to end, so most findings are
+/// warnings; only a broken document is an error. Without the split the list cries wolf.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl Problem {
+    /// The node to jump to, when the problem has one.
+    pub fn node(&self) -> Option<u32> {
+        match self {
+            Problem::Unreachable(id) | Problem::DeadEnd(id) | Problem::Empty(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub fn severity(&self) -> Severity {
+        match self {
+            Problem::DanglingEdge(_) | Problem::NoStart => Severity::Error,
+            _ => Severity::Warning,
+        }
+    }
+}
+
 impl Doc {
+    /// Every fault in the document, errors first. An empty document has none at all.
+    // ponytail: rebuilt from scratch on every call, which is once per frame. A cache
+    // would need invalidating on every edit, undo and load; revisit past a few thousand nodes.
+    pub fn problems(&self) -> Vec<Problem> {
+        let mut found = Vec::new();
+        if self.nodes.is_empty() {
+            return found;
+        }
+
+        for (index, edge) in self.edges.iter().enumerate() {
+            if self.node(edge.from).is_none() || self.node(edge.to).is_none() {
+                found.push(Problem::DanglingEdge(index));
+            }
+        }
+
+        // A start node is one nothing links to.
+        let roots: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter(|n| !self.edges.iter().any(|e| e.to == n.id))
+            .map(|n| n.id)
+            .collect();
+        match roots.len() {
+            0 => found.push(Problem::NoStart),
+            1 => {}
+            _ => found.push(Problem::ManyStarts(roots.clone())),
+        }
+
+        // Walking from every root at once keeps this meaningful while the start is still
+        // ambiguous, and an island cycle stays unreachable either way.
+        let mut seen: HashSet<u32> = roots.iter().copied().collect();
+        let mut queue = roots;
+        while let Some(id) = queue.pop() {
+            for edge in self.edges.iter().filter(|e| e.from == id) {
+                if self.node(edge.to).is_some() && seen.insert(edge.to) {
+                    queue.push(edge.to);
+                }
+            }
+        }
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| !seen.contains(&n.id))
+                .map(|n| Problem::Unreachable(n.id)),
+        );
+
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| !self.edges.iter().any(|e| e.from == n.id))
+                .map(|n| Problem::DeadEnd(n.id)),
+        );
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| n.text.trim().is_empty())
+                .map(|n| Problem::Empty(n.id)),
+        );
+
+        // Stable, so rule order survives inside each severity band.
+        found.sort_by_key(|p| p.severity());
+        found
+    }
+
     pub fn add_node(&mut self, x: f32, y: f32) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -566,6 +675,110 @@ mod tests {
         assert_eq!(doc.edge_at(midpoint.0, midpoint.1), Some(0));
         assert_eq!(doc.edge_at(midpoint.0, midpoint.1 + 50.0), None);
         assert_eq!(doc.edge_at(-100.0, NODE_H / 2.0), None, "before the start");
+    }
+
+    /// A node with text, so it is not flagged empty by accident.
+    fn spoken(doc: &mut Doc, x: f32, y: f32) -> u32 {
+        let id = doc.add_node(x, y);
+        doc.node_mut(id).unwrap().text = "…".into();
+        id
+    }
+
+    #[test]
+    fn sample_has_no_errors() {
+        let problems = Doc::sample().problems();
+
+        assert!(
+            problems.iter().all(|p| p.severity() == Severity::Warning),
+            "a well-formed document raises nothing red: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| matches!(p, Problem::DeadEnd(_))),
+            "its two leaves are still reported, as warnings"
+        );
+    }
+
+    #[test]
+    fn dangling_edge_is_an_error() {
+        let mut doc = Doc::sample();
+        doc.edges.push(Edge {
+            from: doc.nodes[0].id,
+            to: 999,
+            label: String::new(),
+        });
+
+        let problems = doc.problems();
+        let index = doc.edges.len() - 1;
+        assert!(problems.contains(&Problem::DanglingEdge(index)));
+        assert_eq!(problems[0].severity(), Severity::Error, "errors sort first");
+    }
+
+    #[test]
+    fn unreachable_nodes_are_reported() {
+        let mut doc = Doc::default();
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let reached = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(start, reached);
+
+        // An island cycle: neither node is a root, so nothing walks into it.
+        let (a, b) = (spoken(&mut doc, 0.0, 400.0), spoken(&mut doc, 300.0, 400.0));
+        doc.add_edge(a, b);
+        doc.add_edge(b, a);
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::Unreachable(a)));
+        assert!(problems.contains(&Problem::Unreachable(b)));
+        assert!(!problems.contains(&Problem::Unreachable(reached)));
+        assert!(!problems.contains(&Problem::Unreachable(start)));
+    }
+
+    #[test]
+    fn no_start_is_reported() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.add_edge(b, a);
+
+        assert!(doc.problems().contains(&Problem::NoStart));
+    }
+
+    #[test]
+    fn many_starts_lists_them_all() {
+        let mut doc = Doc::default();
+        let first = spoken(&mut doc, 0.0, 0.0);
+        let second = spoken(&mut doc, 0.0, 200.0);
+        let shared = spoken(&mut doc, 300.0, 100.0);
+        doc.add_edge(first, shared);
+        doc.add_edge(second, shared);
+
+        assert!(
+            doc.problems()
+                .contains(&Problem::ManyStarts(vec![first, second])),
+            "both roots, in document order"
+        );
+    }
+
+    #[test]
+    fn empty_text_and_dead_ends_are_reported() {
+        let mut doc = Doc::default();
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let blank = doc.add_node(300.0, 0.0);
+        doc.add_edge(start, blank);
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::Empty(blank)));
+        assert!(!problems.contains(&Problem::Empty(start)));
+        assert!(problems.contains(&Problem::DeadEnd(blank)));
+        assert!(!problems.contains(&Problem::DeadEnd(start)));
+    }
+
+    #[test]
+    fn an_empty_document_has_no_problems() {
+        assert!(
+            Doc::default().problems().is_empty(),
+            "nothing to start is not a fault when there is nothing at all"
+        );
     }
 
     #[test]
