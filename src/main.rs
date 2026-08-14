@@ -24,6 +24,7 @@ actions!(
         ZoomOut,
         ZoomReset,
         Find,
+        Branch,
         FocusCanvas,
         New,
         Save,
@@ -77,6 +78,9 @@ const MENUS: &[MenuSpec] = &[
                 e.on_zoom_reset(&ZoomReset, w, cx)
             }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
+            ("New connected node", "Tab", |e, w, cx| {
+                e.on_branch(&Branch, w, cx)
+            }),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
             }),
@@ -672,6 +676,26 @@ impl Editor {
         window.focus(&self.search_input.read(cx).focus_handle(cx));
     }
 
+    /// Creates a node already connected to the selected one and drops the cursor in its
+    /// Speaker field, so a branch is one keystroke instead of a double-click and a drag.
+    fn on_branch(&mut self, _: &Branch, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Selection::Node(from)) = self.selected else {
+            return;
+        };
+        // Guard before the checkpoint: one whose mutation then fails is an empty undo
+        // step and a false dirty flag.
+        if self.doc.node(from).is_none() {
+            return;
+        }
+        self.doc.checkpoint();
+        let Some(id) = self.doc.branch_from(from) else {
+            return;
+        };
+        self.select(Some(Selection::Node(id)), cx);
+        window.focus(&self.speaker_input.read(cx).focus_handle(cx));
+        cx.notify();
+    }
+
     /// Selects a node and brings it into view without changing zoom.
     fn jump_to(&mut self, id: u32, window: &Window, cx: &mut Context<Self>) {
         let Some(node) = self.doc.node(id) else {
@@ -781,6 +805,7 @@ impl Editor {
             .on_action(cx.listener(Self::on_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
             .on_action(cx.listener(Self::on_find))
+            .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
@@ -1116,6 +1141,7 @@ fn main() {
             KeyBinding::new("ctrl--", ZoomOut, Some("Editor")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
+            KeyBinding::new("tab", Branch, Some("Editor")),
             KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),

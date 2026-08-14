@@ -37,6 +37,11 @@ pub fn node_center(node: &Node) -> (f32, f32) {
     (node.x + NODE_W / 2.0, node.y + NODE_H / 2.0)
 }
 
+/// Horizontal gap between a node and one branched off it.
+pub const GAP_X: f32 = 100.0;
+/// Vertical gap between siblings sharing a parent.
+pub const GAP_Y: f32 = 30.0;
+
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 3.0;
 
@@ -209,6 +214,31 @@ impl Doc {
             label: String::new(),
         });
         true
+    }
+
+    /// Adds a node connected to `from`, to its right and below any children it already
+    /// has, so a fan of choices stacks downward. None when `from` is gone, and then
+    /// nothing is added.
+    // ponytail: only avoids siblings; it can land on an unrelated node elsewhere in the
+    // graph. Scan every node for a collision if that starts to bite.
+    pub fn branch_from(&mut self, from: u32) -> Option<u32> {
+        let parent = self.node(from)?;
+        let (x, mut y) = (parent.x + NODE_W + GAP_X, parent.y);
+        let lowest_child = self
+            .edges
+            .iter()
+            .filter(|e| e.from == from)
+            .filter_map(|e| self.node(e.to))
+            .map(|n| n.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if lowest_child.is_finite() {
+            y = lowest_child + NODE_H + GAP_Y;
+        }
+
+        let id = self.add_node(x, y);
+        // A fresh id is neither a self-loop nor a duplicate, so this cannot fail.
+        self.add_edge(from, id);
+        Some(id)
     }
 
     pub fn remove_edge(&mut self, index: usize) {
@@ -515,6 +545,43 @@ mod tests {
         assert_eq!(doc.edge_at(midpoint.0, midpoint.1), Some(0));
         assert_eq!(doc.edge_at(midpoint.0, midpoint.1 + 50.0), None);
         assert_eq!(doc.edge_at(-100.0, NODE_H / 2.0), None, "before the start");
+    }
+
+    #[test]
+    fn branch_from_places_the_new_node_to_the_right() {
+        let mut doc = Doc::default();
+        let parent = doc.add_node(100.0, 200.0);
+
+        let child = doc.branch_from(parent).expect("parent is live");
+
+        let node = doc.node(child).unwrap();
+        assert_eq!(node.x, 100.0 + NODE_W + GAP_X);
+        assert_eq!(node.y, 200.0, "the first child is level with its parent");
+        assert!(doc.has_edge(parent, child));
+    }
+
+    #[test]
+    fn branch_from_stacks_siblings() {
+        let mut doc = Doc::default();
+        let parent = doc.add_node(0.0, 0.0);
+
+        let first = doc.branch_from(parent).unwrap();
+        let second = doc.branch_from(parent).unwrap();
+
+        let (a, b) = (doc.node(first).unwrap(), doc.node(second).unwrap());
+        assert_eq!(a.x, b.x, "siblings share a column");
+        assert_eq!(b.y, a.y + NODE_H + GAP_Y, "the second sits below the first");
+        assert_eq!(doc.edges.iter().filter(|e| e.from == parent).count(), 2);
+    }
+
+    #[test]
+    fn branch_from_ignores_a_missing_node() {
+        let mut doc = Doc::sample();
+        let (nodes, edges) = (doc.nodes.len(), doc.edges.len());
+
+        assert!(doc.branch_from(999).is_none());
+        assert_eq!(doc.nodes.len(), nodes, "nothing was added");
+        assert_eq!(doc.edges.len(), edges);
     }
 
     #[test]

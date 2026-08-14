@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `papugai` — a node-graph dialog editor in the spirit of articy:draft: branching dialogue graphs of speaker/text nodes connected by labelled choice edges.
 
-Working today: pan and zoom, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, search and jump-to-node, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
+Working today: pan and zoom, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, search and jump-to-node, Tab to quick-create a connected node, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
 
 The intended end state is bigger than that — see **Roadmap** at the bottom. Everything outside that section describes code that exists; the roadmap is the only forward-looking part of this file.
 
@@ -34,7 +34,7 @@ The tree is clean under both `cargo fmt --check` and clippy at `-D warnings`; ke
 
 Three files, no `lib.rs`:
 
-- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (25 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
+- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (28 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
 - `src/main.rs` — `Editor`, the single `Render` view: menu bar, canvas pane, sidebar, all mouse/key handling.
 - `src/text_input.rs` — a single-line `TextInput`, **vendored from gpui 0.2.2's `examples/input.rs`**; the header comment lists the local deltas. Treat it as third-party: on a gpui upgrade, re-vendor and re-apply the deltas rather than hand-patching. It holds the crate's only hand-written `impl Element` (`TextElement`, `text_input.rs:544`). `text_input::bind_keys(cx)` must be called at startup or the fields ignore every key.
 
@@ -83,9 +83,7 @@ Three of them:
 
 ## Roadmap — intent, not code
 
-None of this exists yet. Grep before assuming otherwise. Roughly smallest-first; the first four need no schema change at all.
-
-**Quick-create** — with a node selected, one key makes a new node already connected to it and placed to its right. Authoring is double-click-then-drag-an-edge today, which is slow. Reuses `add_node` and `add_edge`; remember `checkpoint()` first, and select the new node so typing goes straight into it.
+None of this exists yet. Grep before assuming otherwise. Roughly smallest-first; the first three need no schema change at all.
 
 **Autosave and recovery** — same family as the window-close guard: a crash or a kill still loses everything since the last Ctrl+S. A loop of `cx.background_executor().timer(..)` inside a detached `cx.spawn`, waking every minute or so and writing only when `is_dirty()`.
 
