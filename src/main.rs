@@ -1,13 +1,15 @@
 mod doc;
+mod text_input;
 
 use doc::{Doc, NODE_H, NODE_W, Node};
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Path, PathBuilder, Pixels, Point, Render, Window, WindowBounds, WindowOptions,
-    actions, canvas, div, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Path, PathBuilder, Pixels, Point, Render, Window, WindowBounds,
+    WindowOptions, actions, canvas, div, point, prelude::*, px, rgb, size,
 };
+use text_input::TextInput;
 
-actions!(papugai, [Delete, Undo]);
+actions!(papugai, [DeleteNode, Undo, FocusCanvas]);
 
 struct Editor {
     doc: Doc,
@@ -16,6 +18,12 @@ struct Editor {
     selected: Option<u32>,
     drag: Option<Drag>,
     focus_handle: FocusHandle,
+    speaker_input: Entity<TextInput>,
+    text_input: Entity<TextInput>,
+    /// Node whose content is currently loaded into the fields.
+    edited: Option<u32>,
+    /// Whether this editing session already pushed an undo checkpoint.
+    text_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -29,13 +37,62 @@ impl Editor {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+
+        let speaker_input = cx.new(|cx| TextInput::new("Speaker", cx));
+        let text_input = cx.new(|cx| TextInput::new("Line of dialog", cx));
+        for input in [&speaker_input, &text_input] {
+            cx.observe(input, |this, _, cx| this.sync_fields(cx)).detach();
+        }
+
         Self {
             doc: Doc::sample(),
             pan: (0.0, 0.0),
             selected: None,
             drag: None,
             focus_handle,
+            speaker_input,
+            text_input,
+            edited: None,
+            text_dirty: false,
         }
+    }
+
+    /// Loads a node's content into the sidebar fields, starting a fresh editing session.
+    fn load_fields(&mut self, id: Option<u32>, cx: &mut Context<Self>) {
+        let (speaker, text) = match id.and_then(|id| self.doc.node(id)) {
+            Some(node) => (node.speaker.clone(), node.text.clone()),
+            None => (String::new(), String::new()),
+        };
+        self.speaker_input
+            .update(cx, |input, cx| input.set_content(&speaker, cx));
+        self.text_input
+            .update(cx, |input, cx| input.set_content(&text, cx));
+        self.edited = id;
+        self.text_dirty = false;
+    }
+
+    /// Writes the fields back into the edited node. Runs on every input notification,
+    /// so it must be a no-op when nothing actually changed.
+    fn sync_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.edited else { return };
+        let speaker = self.speaker_input.read(cx).content().to_string();
+        let text = self.text_input.read(cx).content().to_string();
+
+        let Some(node) = self.doc.node(id) else { return };
+        if node.speaker == speaker && node.text == text {
+            return;
+        }
+
+        // ponytail: one undo checkpoint per node-editing session, not per keystroke.
+        if !self.text_dirty {
+            self.doc.checkpoint();
+            self.text_dirty = true;
+        }
+        if let Some(node) = self.doc.node_mut(id) {
+            node.speaker = speaker;
+            node.text = text;
+        }
+        cx.notify();
     }
 
     fn window_pos(pos: Point<Pixels>) -> (f32, f32) {
@@ -64,27 +121,39 @@ impl Editor {
             .collect()
     }
 
-    fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
         let (x, y) = self.doc_pos(ev.position);
 
         if let Some(id) = self.doc.hit_test(x, y) {
             let node = self.doc.node(id).expect("hit_test returned a live node");
+            let grab = (x - node.x, y - node.y);
             self.selected = Some(id);
             self.drag = Some(Drag::Node {
                 id,
-                grab: (x - node.x, y - node.y),
+                grab,
                 moved: false,
             });
+            if self.edited != Some(id) {
+                self.load_fields(Some(id), cx);
+            }
+            if ev.click_count == 2 {
+                window.focus(&self.text_input.read(cx).focus_handle(cx));
+            }
         } else if ev.click_count == 2 {
             self.doc.checkpoint();
-            self.selected = Some(self.doc.add_node(x, y));
+            let id = self.doc.add_node(x, y);
+            self.selected = Some(id);
             self.drag = None;
+            self.load_fields(Some(id), cx);
+            window.focus(&self.speaker_input.read(cx).focus_handle(cx));
         } else {
             self.selected = None;
             self.drag = Some(Drag::Pan {
                 start_mouse: Self::window_pos(ev.position),
                 start_pan: self.pan,
             });
+            self.load_fields(None, cx);
         }
         cx.notify();
     }
@@ -116,12 +185,13 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete(&mut self, _: &DeleteNode, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected.take() else {
             return;
         };
         self.doc.checkpoint();
         self.doc.remove_node(id);
+        self.load_fields(None, cx);
         cx.notify();
     }
 
@@ -130,8 +200,13 @@ impl Editor {
             if self.selected.is_some_and(|id| self.doc.node(id).is_none()) {
                 self.selected = None;
             }
+            self.load_fields(self.selected, cx);
             cx.notify();
         }
+    }
+
+    fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, _: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
     }
 }
 
@@ -141,13 +216,35 @@ impl Render for Editor {
         let (pan, selected) = (self.pan, self.selected);
 
         div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .text_sm()
+            .child(self.canvas_pane(lines, pan, selected, cx))
+            .child(self.sidebar(selected))
+    }
+}
+
+impl Editor {
+    /// The graph itself. Owns the mouse and key handling, so sidebar clicks never reach it.
+    fn canvas_pane(
+        &self,
+        lines: Vec<(Point<Pixels>, Point<Pixels>)>,
+        pan: (f32, f32),
+        selected: Option<u32>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .key_context("Editor")
             .track_focus(&self.focus_handle)
             .relative()
-            .size_full()
+            .flex_1()
+            .h_full()
+            .overflow_hidden()
             .bg(rgb(0x1e1e22))
-            .text_sm()
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_focus_canvas))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(
@@ -189,6 +286,52 @@ impl Render for Editor {
                     .map(|node| node_box(node, pan, selected == Some(node.id))),
             )
     }
+
+    /// Inspector for the selected node.
+    fn sidebar(&self, selected: Option<u32>) -> impl IntoElement {
+        let field = |label: &str, input: &Entity<TextInput>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(0x8a8a96)).child(label.to_string()))
+                .child(input.clone())
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w(px(280.))
+            .h_full()
+            .p_3()
+            .bg(rgb(0x26262c))
+            .border_l_1()
+            .border_color(rgb(0x3a3a44))
+            .text_color(rgb(0xd6d6dd))
+            .when_some(selected, |this, id| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x9ecbff))
+                        .child(format!("Node {id}")),
+                )
+                .child(field("Speaker", &self.speaker_input))
+                .child(field("Text", &self.text_input))
+                .child(
+                    div()
+                        .mt_auto()
+                        .text_color(rgb(0x6c6c78))
+                        .child("Esc — back to canvas"),
+                )
+            })
+            .when(selected.is_none(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child("Select a node to edit it."),
+                )
+            })
+    }
 }
 
 fn node_box(node: &Node, pan: (f32, f32), selected: bool) -> impl IntoElement {
@@ -212,8 +355,22 @@ fn node_box(node: &Node, pan: (f32, f32), selected: bool) -> impl IntoElement {
         })
         .rounded_md()
         .shadow_md()
-        .child(div().text_color(rgb(0x9ecbff)).child(node.speaker.clone()))
-        .child(div().text_color(rgb(0xd6d6dd)).child(node.text.clone()))
+        .child(
+            div()
+                .flex_none()
+                .w_full()
+                .text_color(rgb(0x9ecbff))
+                .truncate()
+                .child(node.speaker.clone()),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_color(rgb(0xd6d6dd))
+                .text_ellipsis()
+                .line_clamp(3)
+                .child(node.text.clone()),
+        )
 }
 
 /// Filled triangle pointing at `tip`, aimed along the direction from `from`.
@@ -242,10 +399,12 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>) -> Option<Path<Pixels>> {
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
-            KeyBinding::new("delete", Delete, None),
-            KeyBinding::new("backspace", Delete, None),
-            KeyBinding::new("ctrl-z", Undo, None),
+            KeyBinding::new("delete", DeleteNode, Some("Editor")),
+            KeyBinding::new("backspace", DeleteNode, Some("Editor")),
+            KeyBinding::new("ctrl-z", Undo, Some("Editor")),
+            KeyBinding::new("escape", FocusCanvas, Some("TextInput")),
         ]);
+        text_input::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
