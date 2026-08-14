@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `papugai` — a node-graph dialog editor in the spirit of articy:draft: branching dialogue graphs of speaker/text nodes connected by labelled choice edges.
 
-Working today: pan and zoom, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
+Working today: pan and zoom, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, search and jump-to-node, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
 
 The intended end state is bigger than that — see **Roadmap** at the bottom. Everything outside that section describes code that exists; the roadmap is the only forward-looking part of this file.
 
@@ -34,7 +34,7 @@ The tree is clean under both `cargo fmt --check` and clippy at `-D warnings`; ke
 
 Three files, no `lib.rs`:
 
-- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (21 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
+- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (25 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
 - `src/main.rs` — `Editor`, the single `Render` view: menu bar, canvas pane, sidebar, all mouse/key handling.
 - `src/text_input.rs` — a single-line `TextInput`, **vendored from gpui 0.2.2's `examples/input.rs`**; the header comment lists the local deltas. Treat it as third-party: on a gpui upgrade, re-vendor and re-apply the deltas rather than hand-patching. It holds the crate's only hand-written `impl Element` (`TextElement`, `text_input.rs:544`). `text_input::bind_keys(cx)` must be called at startup or the fields ignore every key.
 
@@ -64,6 +64,7 @@ Three of them:
 - **`checkpoint()` clears the redo stack**, since a fresh edit branches history. `undo`/`redo` are symmetric: pop one stack, push the current snapshot onto the other. Only `undo` is capped at `UNDO_DEPTH`; the redo stack needs no cap of its own because it can only ever hold snapshots `undo` popped.
 - **Checkpoints are placed to avoid empty undo steps.** Typing coalesces: `Editor::checkpoint_once` + the `text_dirty` flag give one checkpoint per editing session, and `text_dirty` resets in `load_fields` when the selection changes. Node drag checkpoints on the first `MouseMove`, not on mouse-down, so a plain click leaves no history entry.
 - **`Selection::Edge(usize)` is a bare index into `doc.edges`**, invalidated by any edge removal. The mitigation is convention: every structural change calls `select(None, cx)`, and `on_undo` re-validates a node selection and drops anything else.
+- **The three inspector inputs are observed as a group; `search_input` is not.** The `sync_fields` loop in `Editor::new` exists to write field content *into* the document — a search query is not document content, so it gets its own observer that only calls `cx.notify()`. Adding a non-document field to that loop would write it into the selected node.
 - **`sync_fields` runs on every keystroke** (via `cx.observe` on the three `Entity<TextInput>` handles, wired in `Editor::new`), so it must early-return when the content is unchanged — otherwise `set_content` → notify → sync loops and spams checkpoints. It is paired with `load_fields`, which pushes doc content *into* the fields; `self.edited` tracks which selection the fields currently hold. There is no `cx.emit`/`cx.subscribe` anywhere in the crate.
 - **`render` sets the window title**, but only when it changed (`src/main.rs:514`) — render runs constantly, so keep any other side effect out of it.
 - **Key contexts partition the keyboard**: `"Editor"` on the canvas pane, `"TextInput"` on the field. `delete`/`backspace` mean "delete node" in one and "delete character" in the other; `escape` exists only in `TextInput` scope and routes focus back via the `FocusCanvas` action.
@@ -82,14 +83,32 @@ Three of them:
 
 ## Roadmap — intent, not code
 
-None of this exists yet. Grep before assuming otherwise. Where each piece should land when built:
+None of this exists yet. Grep before assuming otherwise. Roughly smallest-first; the first four need no schema change at all.
+
+**Quick-create** — with a node selected, one key makes a new node already connected to it and placed to its right. Authoring is double-click-then-drag-an-edge today, which is slow. Reuses `add_node` and `add_edge`; remember `checkpoint()` first, and select the new node so typing goes straight into it.
+
+**Autosave and recovery** — same family as the window-close guard: a crash or a kill still loses everything since the last Ctrl+S. A loop of `cx.background_executor().timer(..)` inside a detached `cx.spawn`, waking every minute or so and writing only when `is_dirty()`.
+
+Two traps. First, **do not call `Doc::save`** — it clears the dirty flag, so the title would stop showing `*` and the close guard would stop asking. Write `to_json()` to the file directly and leave `dirty` alone. Second, **do not write over the user's file**: an autosave they never asked for must not clobber the document on disk. Write a sidecar (`<name>.dln.autosave`, and a fixed path for a document with no `path` yet), delete it on a real save and on a confirmed close, and on launch offer to recover any that survived. Skip a tick while `self.drag.is_some()` so a save never lands mid-drag.
+
+**Validation** — a problem list: dangling edges, unreachable nodes, dead ends, empty text, zero-or-many start nodes. Pure `doc.rs` returning a `Vec<Problem>`, which makes it the most testable item here. Surface it in the sidebar; clicking a problem should reuse `Editor::jump_to`, which search already built.
+
+**Play mode** — walk the graph from a start node, showing the node's text and its outgoing edge labels as choices, click to advance. This turns a diagram into something you can actually judge, and it **works today with zero schema change**. The one decision is what "start" means — derive it (the node with no incoming edges) or mark it explicitly; deriving is enough until it isn't. Later this is where variables and conditions pay off, so keep the traversal a plain `doc.rs` function over `&Doc` rather than view state.
+
+**Node kinds** — `kind: NodeKind` on `Node`, with at least *Hub* (a textless branch point) and *Jump* (links to a distant node without dragging an edge across the whole canvas). This is what keeps a large graph legible, far more cheaply than nesting it. The first schema change on this list, so settle it before **entities**: add the field with `#[serde(default)]` so existing `.dln` files keep loading, and decide whether play mode walks *through* a Hub or stops on it.
 
 **Entities** — speakers as first-class records rather than the free-text `Node::speaker` string. An `entities` vec on `Doc` with its own id space; `Node::speaker` becomes an optional id, keeping the string as a fallback for un-migrated files. Watch the name collision with `gpui::Entity<T>` — call the document type `Character` or `Actor`, or `doc.rs` types become unreadable at the `main.rs` call sites.
 
-**Variables** — global flags/counters the dialogue reads and writes. A `variables` vec on `Doc`, typed (bool/int/string), plus per-node effects. Pure model work, fully unit-testable.
+**Variables** — global flags/counters the dialogue reads and writes. A `variables` vec on `Doc`, typed (bool/int/string), plus per-node effects. Pure model work, fully unit-testable, but inert on its own — it only becomes visible through **conditions** and **play mode**.
 
 **Conditions** on edges — a guard expression gating whether a choice is offered. Extends `Edge` with an optional expression, needs an evaluator over the variable set (`fn eval(&self, vars: &VarState) -> bool`) with tests, and a canvas affordance so a guarded edge reads differently.
 
-**Flow fragments** — nested subgraphs, turning a `Doc` into a tree of graphs rather than one flat node list. The largest change: it touches ids (unique per fragment or globally?), the `Selection` enum, `View` state (one per fragment), and the JSON format. Design it before starting; snapshot undo over the whole tree stays fine.
+**Flow fragments** — nested subgraphs, turning a `Doc` into a tree of graphs rather than one flat node list. Deliberately last: it exists to solve "this graph is too big", and *Jump* nodes plus search solve that far more cheaply. Still the largest change when it comes — it touches ids (unique per fragment or globally?), the `Selection` enum, `View` state (one per fragment), and the JSON format. Design it before starting; snapshot undo over the whole tree stays fine.
+
+### Out of scope
+
+**Templates** — articy:draft's central idea is user-defined property schemas: every entity and node type gets an editable template with its own fields, constraints and read-only properties. Our fixed `Node { speaker, text }` is the opposite of that, and adopting it means a dynamic property bag plus a schema editor — a bigger project than this entire roadmap combined. Named here so nobody half-builds it by accident while adding a field.
+
+Also considered and rejected as out of proportion to a local single-file editor: localisation views and translation, multi-user collaboration and version control, AI and voice synthesis, game-engine import plugins, the vector Location editor, the Word-like Document view, and the plugin/macro SDK.
 
 When a roadmap item ships, move its description into the sections above and delete it from here.

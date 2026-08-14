@@ -32,6 +32,11 @@ pub fn in_port(node: &Node) -> (f32, f32) {
     (node.x, node.y + NODE_H / 2.0)
 }
 
+/// Middle of a node, which is what the canvas centres on when jumping to one.
+pub fn node_center(node: &Node) -> (f32, f32) {
+    (node.x + NODE_W / 2.0, node.y + NODE_H / 2.0)
+}
+
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 3.0;
 
@@ -69,13 +74,18 @@ impl View {
         len * self.zoom
     }
 
+    /// Moves the viewport so `doc` lands at `screen`, leaving zoom alone.
+    pub fn center_on(&mut self, doc: (f32, f32), screen: (f32, f32)) {
+        self.pan = (screen.0 - doc.0 * self.zoom, screen.1 - doc.1 * self.zoom);
+    }
+
     /// Zooms by `factor`, keeping whatever sits under `anchor` (in screen coordinates)
-    /// in place. Pan is recomputed from the *clamped* zoom, so the anchor still holds
-    /// when the factor runs into a limit.
+    /// in place: note what is there, change zoom, put it back. Because the put-back runs
+    /// after the clamp, the anchor still holds when the factor hits a limit.
     pub fn zoom_at(&mut self, factor: f32, anchor: (f32, f32)) {
-        let (x, y) = self.to_doc(anchor);
+        let under = self.to_doc(anchor);
         self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        self.pan = (anchor.0 - x * self.zoom, anchor.1 - y * self.zoom);
+        self.center_on(under, anchor);
     }
 }
 
@@ -159,6 +169,23 @@ impl Doc {
                 (x - px).hypot(y - py) <= PORT_R
             })
             .map(|n| n.id)
+    }
+
+    /// Nodes whose speaker or text contains `query`, ignoring case, in document order.
+    /// A blank query matches nothing rather than everything, so an idle search box is free.
+    // ponytail: node text only; extend to edge labels if choices need finding too.
+    pub fn find(&self, query: &str) -> Vec<u32> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        self.nodes
+            .iter()
+            .filter(|n| {
+                n.speaker.to_lowercase().contains(&query) || n.text.to_lowercase().contains(&query)
+            })
+            .map(|n| n.id)
+            .collect()
     }
 
     /// Removes the node and every edge touching it.
@@ -623,6 +650,52 @@ mod tests {
             view.zoom_at(0.5, (0.0, 0.0));
         }
         assert_eq!(view.zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn find_matches_speaker_and_text() {
+        let doc = Doc::sample();
+
+        // "Innkeeper" is a speaker; "inn before the pass" is inside another node's text.
+        let hits = doc.find("inn");
+        let expected: Vec<u32> = doc
+            .nodes
+            .iter()
+            .filter(|n| n.speaker.contains("Innkeeper") || n.text.contains("inn"))
+            .map(|n| n.id)
+            .collect();
+
+        assert!(hits.len() > 1, "matched both fields, not just one");
+        assert_eq!(hits, expected, "ids come back in document order");
+    }
+
+    #[test]
+    fn find_ignores_case() {
+        let doc = Doc::sample();
+        assert_eq!(doc.find("INNKEEPER"), doc.find("innkeeper"));
+        assert!(!doc.find("INNKEEPER").is_empty());
+    }
+
+    #[test]
+    fn find_on_an_empty_query_returns_nothing() {
+        let doc = Doc::sample();
+        assert!(doc.find("").is_empty());
+        assert!(doc.find("   ").is_empty(), "whitespace is not a match-all");
+        assert!(doc.find("no such speaker").is_empty());
+    }
+
+    #[test]
+    fn center_on_puts_the_point_where_asked() {
+        let mut view = View {
+            pan: (37.0, -12.0),
+            zoom: 2.5,
+        };
+        let target = (410.0, 260.0);
+
+        view.center_on((120.0, 340.0), target);
+
+        assert_eq!(view.zoom, 2.5, "centring does not rescale");
+        assert!(close(view.to_screen((120.0, 340.0)), target));
     }
 
     #[test]

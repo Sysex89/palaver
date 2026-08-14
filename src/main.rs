@@ -2,7 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, View, in_port, out_port, with_default_extension,
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, View, in_port, node_center, out_port,
+    with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -22,6 +23,7 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        Find,
         FocusCanvas,
         New,
         Save,
@@ -74,6 +76,7 @@ const MENUS: &[MenuSpec] = &[
             ("Actual size", "Ctrl+0", |e, w, cx| {
                 e.on_zoom_reset(&ZoomReset, w, cx)
             }),
+            ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
             }),
@@ -104,6 +107,8 @@ struct Editor {
     speaker_input: Entity<TextInput>,
     text_input: Entity<TextInput>,
     label_input: Entity<TextInput>,
+    /// Search query. Deliberately outside the `sync_fields` loop — it is not document content.
+    search_input: Entity<TextInput>,
     /// What is currently loaded into the sidebar fields.
     edited: Option<Selection>,
     /// Whether this editing session already pushed an undo checkpoint.
@@ -157,6 +162,11 @@ impl Editor {
                 .detach();
         }
 
+        // The search field is not document content, so it stays out of the loop above and
+        // only asks for a re-render — without this, typing would not refresh the results.
+        let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
+        cx.observe(&search_input, |_, _, cx| cx.notify()).detach();
+
         Self {
             doc: Doc::sample(),
             view: View::default(),
@@ -166,6 +176,7 @@ impl Editor {
             speaker_input,
             text_input,
             label_input,
+            search_input,
             edited: None,
             text_dirty: false,
             path: None,
@@ -657,6 +668,21 @@ impl Editor {
         cx.notify();
     }
 
+    fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.search_input.read(cx).focus_handle(cx));
+    }
+
+    /// Selects a node and brings it into view without changing zoom.
+    fn jump_to(&mut self, id: u32, window: &Window, cx: &mut Context<Self>) {
+        let Some(node) = self.doc.node(id) else {
+            return;
+        };
+        self.view
+            .center_on(node_center(node), Self::pane_center(window));
+        self.select(Some(Selection::Node(id)), cx);
+        cx.notify();
+    }
+
     fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, _: &mut Context<Self>) {
         window.focus(&self.focus_handle);
     }
@@ -691,7 +717,7 @@ impl Render for Editor {
                     .flex_1()
                     .overflow_hidden()
                     .child(self.canvas_pane(lines, pending, view, selected, cx))
-                    .child(self.sidebar(selected)),
+                    .child(self.sidebar(selected, cx)),
             )
     }
 }
@@ -754,6 +780,7 @@ impl Editor {
             .on_action(cx.listener(Self::on_zoom_in))
             .on_action(cx.listener(Self::on_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
+            .on_action(cx.listener(Self::on_find))
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
@@ -842,8 +869,62 @@ impl Editor {
             .collect()
     }
 
+    /// Search box and results, above the inspector so both stay usable at once.
+    fn search_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /// Beyond this the list stops being scannable, and the sidebar would need to scroll.
+        const MAX_ROWS: usize = 20;
+
+        let query = self.search_input.read(cx).content().to_string();
+        // ponytail: rescans every node each frame, but only while a query is active — which
+        // is never while dragging. Cache it if searching a huge graph ever stutters.
+        let hits = self.doc.find(&query);
+        let more = hits.len().saturating_sub(MAX_ROWS);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.search_input.clone())
+            .when(!query.trim().is_empty(), |this| {
+                this.when(hits.is_empty(), |this| {
+                    this.child(div().text_color(rgb(0x6c6c78)).child("No matches."))
+                })
+                .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
+                    let node = self.doc.node(id)?;
+                    let label = match (node.speaker.trim(), node.text.trim()) {
+                        ("", "") => format!("Node {id}"),
+                        ("", text) => text.to_string(),
+                        (speaker, "") => speaker.to_string(),
+                        (speaker, text) => format!("{speaker} — {text}"),
+                    };
+                    Some(
+                        div()
+                            .id(("search-result", id))
+                            .px_1()
+                            .rounded_sm()
+                            .truncate()
+                            .text_color(rgb(0xb8b8c4))
+                            .hover(|style| style.bg(rgb(0x33333c)))
+                            .child(label)
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.jump_to(id, window, cx)
+                                }),
+                            ),
+                    )
+                }))
+                .when(more > 0, |this| {
+                    this.child(
+                        div()
+                            .text_color(rgb(0x6c6c78))
+                            .child(format!("…and {more} more")),
+                    )
+                })
+            })
+    }
+
     /// Inspector for the selected node or edge.
-    fn sidebar(&self, selected: Option<Selection>) -> impl IntoElement {
+    fn sidebar(&self, selected: Option<Selection>, cx: &mut Context<Self>) -> impl IntoElement {
         let field = |label: &str, input: &Entity<TextInput>| {
             div()
                 .flex()
@@ -864,6 +945,7 @@ impl Editor {
             .border_l_1()
             .border_color(rgb(0x3a3a44))
             .text_color(rgb(0xd6d6dd))
+            .child(self.search_panel(cx))
             .map(|this| match selected {
                 Some(Selection::Node(id)) => this
                     .child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
@@ -1033,6 +1115,7 @@ fn main() {
             KeyBinding::new("ctrl-+", ZoomIn, Some("Editor")),
             KeyBinding::new("ctrl--", ZoomOut, Some("Editor")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
+            KeyBinding::new("ctrl-f", Find, Some("Editor")),
             KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),
