@@ -193,6 +193,27 @@ impl Doc {
             .collect()
     }
 
+    /// Ids of every node whose box touches the rectangle spanned by two document points,
+    /// given in either corner order. Touching is enough — a marquee need not swallow a
+    /// node whole to catch it.
+    pub fn nodes_in_rect(&self, a: (f32, f32), b: (f32, f32)) -> Vec<u32> {
+        let (min_x, max_x) = (a.0.min(b.0), a.0.max(b.0));
+        let (min_y, max_y) = (a.1.min(b.1), a.1.max(b.1));
+        self.nodes
+            .iter()
+            .filter(|n| n.x < max_x && n.x + NODE_W > min_x && n.y < max_y && n.y + NODE_H > min_y)
+            .map(|n| n.id)
+            .collect()
+    }
+
+    /// Shifts every listed node by the same amount. Unknown ids are skipped.
+    pub fn move_nodes(&mut self, ids: &[u32], dx: f32, dy: f32) {
+        for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
+            node.x += dx;
+            node.y += dy;
+        }
+    }
+
     /// Removes the node and every edge touching it.
     pub fn remove_node(&mut self, id: u32) {
         self.nodes.retain(|n| n.id != id);
@@ -545,6 +566,56 @@ mod tests {
         assert_eq!(doc.edge_at(midpoint.0, midpoint.1), Some(0));
         assert_eq!(doc.edge_at(midpoint.0, midpoint.1 + 50.0), None);
         assert_eq!(doc.edge_at(-100.0, NODE_H / 2.0), None, "before the start");
+    }
+
+    #[test]
+    fn nodes_in_rect_catches_touched_nodes() {
+        let mut doc = Doc::default();
+        let first = doc.add_node(0.0, 0.0);
+        let second = doc.add_node(300.0, 0.0);
+        doc.add_node(0.0, 900.0); // far below the band
+
+        // Starts inside the first node and stops just past the second's left edge.
+        assert_eq!(
+            doc.nodes_in_rect((10.0, 10.0), (310.0, 20.0)),
+            vec![first, second]
+        );
+        assert!(
+            doc.nodes_in_rect((NODE_W + 10.0, 10.0), (290.0, 20.0))
+                .is_empty(),
+            "the gap between two nodes touches neither"
+        );
+    }
+
+    #[test]
+    fn nodes_in_rect_ignores_corner_order() {
+        let doc = Doc::sample();
+        let corner = ((0.0, 0.0), (700.0, 300.0));
+
+        let dragged_down = doc.nodes_in_rect(corner.0, corner.1);
+        assert!(!dragged_down.is_empty(), "the band caught something");
+        assert_eq!(doc.nodes_in_rect(corner.1, corner.0), dragged_down);
+    }
+
+    #[test]
+    fn move_nodes_shifts_the_whole_set() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.add_node(100.0, 50.0);
+        let untouched = doc.add_node(500.0, 500.0);
+
+        doc.move_nodes(&[a, b, 999], 10.0, -5.0);
+
+        assert_eq!(
+            (doc.node(a).unwrap().x, doc.node(a).unwrap().y),
+            (10.0, -5.0)
+        );
+        assert_eq!(
+            (doc.node(b).unwrap().x, doc.node(b).unwrap().y),
+            (110.0, 45.0),
+            "the set moved rigidly"
+        );
+        assert_eq!(doc.node(untouched).unwrap().x, 500.0);
     }
 
     #[test]

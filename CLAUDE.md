@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `papugai` — a node-graph dialog editor in the spirit of articy:draft: branching dialogue graphs of speaker/text nodes connected by labelled choice edges.
 
-Working today: pan and zoom, node drag, edge drag from a port, select/delete node or edge, sidebar text editing, search and jump-to-node, Tab to quick-create a connected node, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
+Working today: pan and zoom, node drag, edge drag from a port, marquee multi-select and group move, select/delete node or edge, sidebar text editing, search and jump-to-node, Tab to quick-create a connected node, snapshot undo/redo, new/open/save/save-as of `.dln` JSON files.
 
 The intended end state is bigger than that — see **Roadmap** at the bottom. Everything outside that section describes code that exists; the roadmap is the only forward-looking part of this file.
 
@@ -34,7 +34,7 @@ The tree is clean under both `cargo fmt --check` and clippy at `-D warnings`; ke
 
 Three files, no `lib.rs`:
 
-- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (28 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
+- `src/doc.rs` — the document model. `Doc { nodes, edges, next_id }` plus geometry constants (`NODE_W/H`, `PORT_R`), hit-testing, undo and JSON IO. **Imports no `gpui`** and must stay that way; it is the only testable layer (31 unit tests at the bottom of the file). It also holds `View`, the canvas pan/zoom transform — not document state, and never serialized, but pure arithmetic that belongs where it can be tested.
 - `src/main.rs` — `Editor`, the single `Render` view: menu bar, canvas pane, sidebar, all mouse/key handling.
 - `src/text_input.rs` — a single-line `TextInput`, **vendored from gpui 0.2.2's `examples/input.rs`**; the header comment lists the local deltas. Treat it as third-party: on a gpui upgrade, re-vendor and re-apply the deltas rather than hand-patching. It holds the crate's only hand-written `impl Element` (`TextElement`, `text_input.rs:544`). `text_input::bind_keys(cx)` must be called at startup or the fields ignore every key.
 
@@ -44,7 +44,15 @@ Hybrid, deliberately:
 
 - Node boxes, port dots and edge labels are **absolutely-positioned `div`s** built in `Editor::canvas_pane`. Follow this when adding chrome — do not port them to a custom element.
 - Only the edge lines and arrowheads go through gpui's `canvas()` helper + `PathBuilder` (`src/main.rs:605`), because there is no div-based way to draw a diagonal line.
-- Hit-testing is **not** GPUI's; it is arithmetic in `doc.rs` (`hit_test`, `port_hit_test`, `edge_at`) run from `Editor::on_mouse_down`. Ports overlap node boxes, so `port_hit_test` must be checked first (`doc.rs:100`). `hit_test` iterates in reverse so the topmost (last-painted) node wins.
+- Hit-testing is **not** GPUI's; it is arithmetic in `doc.rs` (`hit_test`, `port_hit_test`, `edge_at`, `nodes_in_rect`) run from `Editor::on_mouse_down`. Ports overlap node boxes, so `port_hit_test` must be checked first (`doc.rs:100`). `hit_test` iterates in reverse so the topmost (last-painted) node wins.
+
+### The mouse map
+
+`on_mouse_down` is an ordered if-chain and the order *is* the specification; adding a gesture means picking its rung. Alt is checked before any hit test, so Alt+left pans over anything. Then: out-port → edge drag; node + shift → toggle it in the set, no drag; node already selected → keep the set and drag the group; node → select just it and drag; edge → select it; empty + double-click → create; empty → marquee.
+
+**Middle-drag pans**, via `on_pan_down`, which the Alt+left branch also calls — the two gestures share one function so they cannot drift apart. `on_mouse_move` is button-agnostic, so panning needed nothing there, but every button that can start a drag must register `on_mouse_up` *and* `on_mouse_up_out`.
+
+A plain click on empty canvas is a zero-size marquee that touches nothing, so clearing the selection falls out of the marquee commit in `on_mouse_up` rather than being its own branch.
 
 ### Coordinate spaces (the most common source of bugs)
 
@@ -63,7 +71,9 @@ Three of them:
 - **Checkpoint before you mutate.** `Doc` never checkpoints itself — the view calls `doc.checkpoint()` (`doc.rs:154`) *before* each mutation. It pushes a full snapshot (50 deep) *and* sets the dirty flag; it is the single choke point for both, and `dirty` is only cleared in `save()`. A mutation that skips it is both un-undoable and silently unsaved. `undo()` and `redo()` also set dirty — stepping through history counts as an edit.
 - **`checkpoint()` clears the redo stack**, since a fresh edit branches history. `undo`/`redo` are symmetric: pop one stack, push the current snapshot onto the other. Only `undo` is capped at `UNDO_DEPTH`; the redo stack needs no cap of its own because it can only ever hold snapshots `undo` popped.
 - **Checkpoints are placed to avoid empty undo steps.** Typing coalesces: `Editor::checkpoint_once` + the `text_dirty` flag give one checkpoint per editing session, and `text_dirty` resets in `load_fields` when the selection changes. Node drag checkpoints on the first `MouseMove`, not on mouse-down, so a plain click leaves no history entry.
-- **`Selection::Edge(usize)` is a bare index into `doc.edges`**, invalidated by any edge removal. The mitigation is convention: every structural change calls `select(None, cx)`, and `on_undo` re-validates a node selection and drops anything else.
+- **`Selection` is `None | Nodes(Vec<u32>) | Edge(usize)`** — plural for nodes, singular for edges. `Selection::Edge(usize)` is a bare index into `doc.edges`, invalidated by any edge removal; the mitigation is convention: every structural change calls `select(Selection::None, cx)`, and `after_history` re-validates the node set against the document and drops anything else. Node ids survive a history step, so a node set does not need the same treatment — only the ids that vanished are filtered out.
+- **`Selection::only_node()` is the gate on every single-node path** — `load_fields`, `sync_fields`, `on_branch`. A multi-selection returns `None` there, so it has no inspector fields to write and cannot half-edit a group. New per-node commands go through it too, not through `nodes()[0]`.
+- **A group drag anchors the grabbed node and moves the rest by its delta** (`Drag::Node` in `on_mouse_move`), rather than storing a per-node offset. That way the node under the cursor never drifts, and the maths is the same for one node as for twenty.
 - **The three inspector inputs are observed as a group; `search_input` is not.** The `sync_fields` loop in `Editor::new` exists to write field content *into* the document — a search query is not document content, so it gets its own observer that only calls `cx.notify()`. Adding a non-document field to that loop would write it into the selected node.
 - **`sync_fields` runs on every keystroke** (via `cx.observe` on the three `Entity<TextInput>` handles, wired in `Editor::new`), so it must early-return when the content is unchanged — otherwise `set_content` → notify → sync loops and spams checkpoints. It is paired with `load_fields`, which pushes doc content *into* the fields; `self.edited` tracks which selection the fields currently hold. There is no `cx.emit`/`cx.subscribe` anywhere in the crate.
 - **`render` sets the window title**, but only when it changed (`src/main.rs:514`) — render runs constantly, so keep any other side effect out of it.
