@@ -2,17 +2,54 @@ mod doc;
 
 use doc::{Doc, NODE_H, NODE_W, Node};
 use gpui::{
-    App, Application, Bounds, Context, Path, PathBuilder, Pixels, Point, Render, Window,
-    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Path, PathBuilder, Pixels, Point, Render, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, point, prelude::*, px, rgb, size,
 };
+
+actions!(papugai, [Delete, Undo]);
 
 struct Editor {
     doc: Doc,
+    /// Canvas offset in pixels, applied to everything drawn.
+    pan: (f32, f32),
+    selected: Option<u32>,
+    drag: Option<Drag>,
+    focus_handle: FocusHandle,
+}
+
+#[derive(Clone, Copy)]
+enum Drag {
+    /// `grab` is the cursor's offset inside the node, in document coordinates.
+    Node { id: u32, grab: (f32, f32), moved: bool },
+    Pan { start_mouse: (f32, f32), start_pan: (f32, f32) },
 }
 
 impl Editor {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle);
+        Self {
+            doc: Doc::sample(),
+            pan: (0.0, 0.0),
+            selected: None,
+            drag: None,
+            focus_handle,
+        }
+    }
+
+    fn window_pos(pos: Point<Pixels>) -> (f32, f32) {
+        (f32::from(pos.x), f32::from(pos.y))
+    }
+
+    fn doc_pos(&self, pos: Point<Pixels>) -> (f32, f32) {
+        let (x, y) = Self::window_pos(pos);
+        (x - self.pan.0, y - self.pan.1)
+    }
+
     /// Straight lines from the right edge of the source node to the left edge of the target.
     fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>)> {
+        let (pan_x, pan_y) = self.pan;
         self.doc
             .edges
             .iter()
@@ -20,23 +57,107 @@ impl Editor {
                 let from = self.doc.node(e.from)?;
                 let to = self.doc.node(e.to)?;
                 Some((
-                    point(px(from.x + NODE_W), px(from.y + NODE_H / 2.0)),
-                    point(px(to.x), px(to.y + NODE_H / 2.0)),
+                    point(px(from.x + NODE_W + pan_x), px(from.y + NODE_H / 2.0 + pan_y)),
+                    point(px(to.x + pan_x), px(to.y + NODE_H / 2.0 + pan_y)),
                 ))
             })
             .collect()
     }
+
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let (x, y) = self.doc_pos(ev.position);
+
+        if let Some(id) = self.doc.hit_test(x, y) {
+            let node = self.doc.node(id).expect("hit_test returned a live node");
+            self.selected = Some(id);
+            self.drag = Some(Drag::Node {
+                id,
+                grab: (x - node.x, y - node.y),
+                moved: false,
+            });
+        } else if ev.click_count == 2 {
+            self.doc.checkpoint();
+            self.selected = Some(self.doc.add_node(x, y));
+            self.drag = None;
+        } else {
+            self.selected = None;
+            self.drag = Some(Drag::Pan {
+                start_mouse: Self::window_pos(ev.position),
+                start_pan: self.pan,
+            });
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag else { return };
+
+        match drag {
+            Drag::Node { id, grab, moved } => {
+                // Checkpoint on the first movement, so a plain click leaves no empty undo entry.
+                if !moved {
+                    self.doc.checkpoint();
+                    self.drag = Some(Drag::Node { id, grab, moved: true });
+                }
+                let (x, y) = self.doc_pos(ev.position);
+                if let Some(node) = self.doc.node_mut(id) {
+                    node.x = x - grab.0;
+                    node.y = y - grab.1;
+                }
+            }
+            Drag::Pan {
+                start_mouse,
+                start_pan,
+            } => {
+                let (x, y) = Self::window_pos(ev.position);
+                self.pan = (start_pan.0 + x - start_mouse.0, start_pan.1 + y - start_mouse.1);
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected.take() else {
+            return;
+        };
+        self.doc.checkpoint();
+        self.doc.remove_node(id);
+        cx.notify();
+    }
+
+    fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.undo() {
+            if self.selected.is_some_and(|id| self.doc.node(id).is_none()) {
+                self.selected = None;
+            }
+            cx.notify();
+        }
+    }
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let lines = self.edge_lines();
+        let (pan, selected) = (self.pan, self.selected);
 
         div()
+            .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .bg(rgb(0x1e1e22))
             .text_sm()
+            .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_undo))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag = None),
+            )
             .child(
                 canvas(
                     |_, _, _| {},
@@ -61,15 +182,20 @@ impl Render for Editor {
                 .left(px(0.))
                 .size_full(),
             )
-            .children(self.doc.nodes.iter().map(node_box))
+            .children(
+                self.doc
+                    .nodes
+                    .iter()
+                    .map(|node| node_box(node, pan, selected == Some(node.id))),
+            )
     }
 }
 
-fn node_box(node: &Node) -> impl IntoElement {
+fn node_box(node: &Node, pan: (f32, f32), selected: bool) -> impl IntoElement {
     div()
         .absolute()
-        .left(px(node.x))
-        .top(px(node.y))
+        .left(px(node.x + pan.0))
+        .top(px(node.y + pan.1))
         .w(px(NODE_W))
         .h(px(NODE_H))
         .overflow_hidden()
@@ -79,7 +205,11 @@ fn node_box(node: &Node) -> impl IntoElement {
         .p_2()
         .bg(rgb(0x2b2b33))
         .border_1()
-        .border_color(rgb(0x4a4a57))
+        .border_color(if selected {
+            rgb(0x7aa2f7)
+        } else {
+            rgb(0x4a4a57)
+        })
         .rounded_md()
         .shadow_md()
         .child(div().text_color(rgb(0x9ecbff)).child(node.speaker.clone()))
@@ -111,13 +241,19 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>) -> Option<Path<Pixels>> {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("backspace", Delete, None),
+            KeyBinding::new("ctrl-z", Undo, None),
+        ]);
+
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Editor { doc: Doc::sample() }),
+            |window, cx| cx.new(|cx| Editor::new(window, cx)),
         )
         .unwrap();
         cx.on_window_closed(|cx| cx.quit()).detach();

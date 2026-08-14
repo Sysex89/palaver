@@ -3,11 +3,18 @@
 pub const NODE_W: f32 = 200.0;
 pub const NODE_H: f32 = 90.0;
 
-#[derive(Clone, Default)]
+const UNDO_DEPTH: usize = 50;
+
+/// Everything an undo restores: the document data, minus the history itself.
+type Snapshot = (Vec<Node>, Vec<Edge>, u32);
+
+#[derive(Default)]
 pub struct Doc {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     next_id: u32,
+    // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
+    undo: Vec<Snapshot>,
 }
 
 #[derive(Clone)]
@@ -51,6 +58,41 @@ impl Doc {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
+    /// Topmost node containing the point, in document coordinates.
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<u32> {
+        self.nodes
+            .iter()
+            .rev()
+            .find(|n| x >= n.x && x < n.x + NODE_W && y >= n.y && y < n.y + NODE_H)
+            .map(|n| n.id)
+    }
+
+    /// Removes the node and every edge touching it.
+    pub fn remove_node(&mut self, id: u32) {
+        self.nodes.retain(|n| n.id != id);
+        self.edges.retain(|e| e.from != id && e.to != id);
+    }
+
+    /// Records the current state so the next mutation can be undone.
+    pub fn checkpoint(&mut self) {
+        self.undo
+            .push((self.nodes.clone(), self.edges.clone(), self.next_id));
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Restores the last checkpoint. False when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some((nodes, edges, next_id)) = self.undo.pop() else {
+            return false;
+        };
+        self.nodes = nodes;
+        self.edges = edges;
+        self.next_id = next_id;
+        true
+    }
+
     /// A small hardcoded conversation, including one branch.
     pub fn sample() -> Doc {
         let mut doc = Doc::default();
@@ -90,6 +132,56 @@ mod tests {
             assert!(doc.node(e.to).is_some(), "dangling to {}", e.to);
         }
         assert_eq!(doc.edges.iter().filter(|e| e.from == doc.nodes[0].id).count(), 2);
+    }
+
+    #[test]
+    fn hit_test_picks_topmost() {
+        let mut doc = Doc::default();
+        let under = doc.add_node(100.0, 100.0);
+        let over = doc.add_node(150.0, 120.0);
+
+        assert_eq!(doc.hit_test(110.0, 110.0), Some(under));
+        assert_eq!(doc.hit_test(160.0, 130.0), Some(over), "later node is on top");
+        assert_eq!(doc.hit_test(100.0 + NODE_W, 110.0), None, "right edge is exclusive");
+        assert_eq!(doc.hit_test(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn remove_node_drops_its_edges() {
+        let mut doc = Doc::sample();
+        let victim = doc.nodes[1].id;
+        let kept = doc.edges.iter().filter(|e| e.from != victim && e.to != victim).count();
+
+        doc.remove_node(victim);
+
+        assert!(doc.node(victim).is_none());
+        assert_eq!(doc.edges.len(), kept);
+    }
+
+    #[test]
+    fn undo_restores_previous_state() {
+        let mut doc = Doc::sample();
+        let (nodes, edges) = (doc.nodes.len(), doc.edges.len());
+        let victim = doc.nodes[0].id;
+
+        doc.checkpoint();
+        doc.remove_node(victim);
+        assert!(doc.undo());
+
+        assert_eq!(doc.nodes.len(), nodes);
+        assert_eq!(doc.edges.len(), edges);
+        assert!(doc.node(victim).is_some());
+        assert!(!doc.undo(), "history is empty again");
+    }
+
+    #[test]
+    fn undo_depth_is_capped() {
+        let mut doc = Doc::default();
+        for _ in 0..UNDO_DEPTH + 10 {
+            doc.checkpoint();
+            doc.add_node(0.0, 0.0);
+        }
+        assert_eq!(doc.undo.len(), UNDO_DEPTH);
     }
 
     #[test]
