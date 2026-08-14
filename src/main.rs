@@ -7,8 +7,8 @@ use doc::{
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, PathPromptOptions, Pixels,
-    Point, PromptLevel, Render, Rgba, ScrollWheelEvent, Window, WindowBounds, WindowOptions,
-    actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
+    Point, PromptLevel, Render, Rgba, ScrollWheelEvent, Window, WindowBounds, WindowHandle,
+    WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use text_input::TextInput;
@@ -116,6 +116,8 @@ struct Editor {
     title: String,
     /// Name of the menu whose dropdown is open.
     open_menu: Option<&'static str>,
+    /// Set once discarding has been confirmed, so the close hook stops asking.
+    closing: bool,
 }
 
 /// Edge indices shift when edges are removed, so an edge selection is cleared
@@ -170,6 +172,7 @@ impl Editor {
             status: None,
             title: String::new(),
             open_menu: None,
+            closing: false,
         }
     }
 
@@ -184,12 +187,16 @@ impl Editor {
         }
     }
 
-    fn on_new(&mut self, _: &New, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.doc.is_dirty() {
-            return self.reset(cx);
-        }
-
-        // Unsaved edits would be lost, so confirm first.
+    /// Asks before unsaved edits are thrown away. Resolves to true on "Discard".
+    ///
+    // ponytail: two buttons, not Save/Discard/Cancel. A Save button would have to chain
+    // into the Save As dialog when there is no path yet — a second async prompt inside
+    // this one. Add it if discarding by accident turns out to bite.
+    fn confirm_discard(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl Future<Output = bool> + use<> {
         let answer = window.prompt(
             PromptLevel::Warning,
             "Discard unsaved changes?",
@@ -197,9 +204,40 @@ impl Editor {
             &["Discard", "Cancel"],
             cx,
         );
+        async move { answer.await == Ok(0) }
+    }
+
+    fn on_new(&mut self, _: &New, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.doc.is_dirty() {
+            return self.reset(cx);
+        }
+
+        let confirmed = self.confirm_discard(window, cx);
         cx.spawn(async move |this, cx| {
-            if answer.await == Ok(0) {
+            if confirmed.await {
                 this.update(cx, |this, cx| this.reset(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Vetoed close: ask, and only then take the window down. Setting `closing` is what
+    /// lets the second pass through the hook go straight to true.
+    fn confirm_close(
+        &mut self,
+        handle: WindowHandle<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let confirmed = self.confirm_discard(window, cx);
+        cx.spawn(async move |_, cx| {
+            if confirmed.await {
+                handle
+                    .update(cx, |this, window, _| {
+                        this.closing = true;
+                        window.remove_window();
+                    })
+                    .ok();
             }
         })
         .detach();
@@ -246,7 +284,22 @@ impl Editor {
         .detach();
     }
 
-    fn on_open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.doc.is_dirty() {
+            return self.open_dialog(cx);
+        }
+
+        // Opening replaces the document, so it discards unsaved edits just like New does.
+        let confirmed = self.confirm_discard(window, cx);
+        cx.spawn(async move |this, cx| {
+            if confirmed.await {
+                this.update(cx, |this, cx| this.open_dialog(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn open_dialog(&mut self, cx: &mut Context<Self>) {
         let response = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -273,6 +326,7 @@ impl Editor {
             this.update(cx, |this, cx| match Doc::load(&path) {
                 Ok(doc) => {
                     this.doc = doc;
+                    this.view = View::default();
                     this.drag = None;
                     this.path = Some(path);
                     this.status = None;
@@ -989,14 +1043,36 @@ fn main() {
         text_input::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| Editor::new(window, cx)),
-        )
-        .unwrap();
+        let handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| Editor::new(window, cx)),
+            )
+            .unwrap();
+
+        // Closing a dirty document has to be vetoable, and `on_window_closed` fires too
+        // late to veto anything. So: refuse the first close, ask, and let the answer
+        // drive a second one that goes through.
+        handle
+            .update(cx, |_, window, cx| {
+                let editor = cx.entity();
+                window.on_window_should_close(cx, move |window, cx| {
+                    let settled = {
+                        let this = editor.read(cx);
+                        this.closing || !this.doc.is_dirty()
+                    };
+                    if settled {
+                        return true;
+                    }
+                    editor.update(cx, |this, cx| this.confirm_close(handle, window, cx));
+                    false
+                });
+            })
+            .unwrap();
+
         cx.on_window_closed(|cx| cx.quit()).detach();
         cx.activate(true);
     });
