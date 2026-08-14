@@ -1129,6 +1129,31 @@ impl Editor {
             })
     }
 
+    /// Marks a node as a deliberate ending, which is what keeps it out of the dead-end
+    /// warnings. A discrete edit, so it checkpoints outright rather than coalescing.
+    fn end_toggle(&self, id: u32, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.doc.node(id).is_some_and(|node| node.end);
+        div()
+            .id("end-toggle")
+            .flex()
+            .gap_2()
+            .cursor_pointer()
+            .text_color(if on { rgb(0xf7c96a) } else { rgb(0x8a8a96) })
+            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .child(if on { "☑" } else { "☐" })
+            .child("Ending")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.doc.node(id).is_none() {
+                    return;
+                }
+                this.doc.checkpoint();
+                if let Some(node) = this.doc.node_mut(id) {
+                    node.end = !node.end;
+                }
+                cx.notify();
+            }))
+    }
+
     /// Inspector for the selected node or edge.
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let field = |label: &str, input: &Entity<TextInput>| {
@@ -1156,7 +1181,8 @@ impl Editor {
                 (Some(id), _) => this
                     .child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
                     .child(field("Speaker", &self.speaker_input))
-                    .child(field("Text", &self.text_input)),
+                    .child(field("Text", &self.text_input))
+                    .child(self.end_toggle(id, cx)),
                 (None, Selection::Nodes(ids)) => this
                     .child(
                         div()
@@ -1301,10 +1327,10 @@ fn node_box(node: &Node, view: View, selected: bool) -> impl IntoElement {
         .p_2()
         .bg(rgb(0x2b2b33))
         .border_1()
-        .border_color(if selected {
-            rgb(0x7aa2f7)
-        } else {
-            rgb(0x4a4a57)
+        .border_color(match (selected, node.end) {
+            (true, _) => rgb(0x7aa2f7),
+            (false, true) => rgb(0xf7c96a),
+            (false, false) => rgb(0x4a4a57),
         })
         .rounded_md()
         .shadow_md()

@@ -122,6 +122,10 @@ pub struct Node {
     pub y: f32,
     pub speaker: String,
     pub text: String,
+    /// Marked as a deliberate ending, so having no outgoing edges is not a fault.
+    /// `default` so `.dln` files written before this field keep loading.
+    #[serde(default)]
+    pub end: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -226,7 +230,7 @@ impl Doc {
         found.extend(
             self.nodes
                 .iter()
-                .filter(|n| !self.edges.iter().any(|e| e.from == n.id))
+                .filter(|n| !n.end && !self.edges.iter().any(|e| e.from == n.id))
                 .map(|n| Problem::DeadEnd(n.id)),
         );
         found.extend(
@@ -250,6 +254,7 @@ impl Doc {
             y,
             speaker: String::new(),
             text: String::new(),
+            end: false,
         });
         id
     }
@@ -771,6 +776,18 @@ mod tests {
         assert!(!problems.contains(&Problem::Empty(start)));
         assert!(problems.contains(&Problem::DeadEnd(blank)));
         assert!(!problems.contains(&Problem::DeadEnd(start)));
+    }
+
+    #[test]
+    fn an_end_node_is_not_a_dead_end() {
+        let mut doc = Doc::default();
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let last = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(start, last);
+        assert!(doc.problems().contains(&Problem::DeadEnd(last)));
+
+        doc.node_mut(last).unwrap().end = true;
+        assert!(!doc.problems().contains(&Problem::DeadEnd(last)));
     }
 
     #[test]
