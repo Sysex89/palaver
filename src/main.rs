@@ -2,8 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, Problem, Severity, View, in_port, node_center,
-    out_port, with_default_extension,
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, Problem, Severity, View, clear_backup, in_port,
+    node_center, out_port, read_backup, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -12,6 +12,7 @@ use gpui::{
     WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, rgba, size,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 use text_input::TextInput;
 
 actions!(
@@ -46,6 +47,9 @@ const ZOOM_PER_PIXEL: f32 = 1.0015;
 const ZOOM_STEP: f32 = 1.25;
 /// Node and label text size at 1:1, matching the `text_sm` the rest of the UI uses.
 const BASE_TEXT: f32 = 14.0;
+
+/// How often a dirty document gets a crash copy. Also the most work a crash can cost.
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 
 type MenuAction = fn(&mut Editor, &mut Window, &mut Context<Editor>);
 /// Label, shortcut hint, what it runs.
@@ -101,6 +105,18 @@ const ACCENT_COLOR: Rgba = Rgba {
     a: 1.0,
 };
 
+/// A document's display name, or a placeholder while it has no file yet.
+fn document_name(path: Option<&std::path::Path>) -> String {
+    match path {
+        Some(path) => path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into(),
+        None => format!("untitled.{FILE_EXT}"),
+    }
+}
+
 struct Editor {
     doc: Doc,
     /// Where the canvas is looking. Applied to everything drawn.
@@ -127,6 +143,9 @@ struct Editor {
     open_menu: Option<&'static str>,
     /// Set once discarding has been confirmed, so the close hook stops asking.
     closing: bool,
+    /// Set after a backup fails, so a read-only temp directory reports once rather than
+    /// every tick for the rest of the session.
+    autosave_off: bool,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -220,6 +239,19 @@ impl Editor {
         let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
         cx.observe(&search_input, |_, _, cx| cx.notify()).detach();
 
+        // Crash copies, for as long as the window lives. Spawning during construction is
+        // fine: the entity slot exists before this closure runs, and the task cannot be
+        // polled until the window is open.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSAVE_EVERY).await;
+                if this.update(cx, |this, cx| this.autosave(cx)).is_err() {
+                    return; // The entity is gone — the window closed.
+                }
+            }
+        })
+        .detach();
+
         Self {
             doc: Doc::sample(),
             view: View::default(),
@@ -237,18 +269,69 @@ impl Editor {
             title: String::new(),
             open_menu: None,
             closing: false,
+            autosave_off: false,
+        }
+    }
+
+    /// Writes a crash copy, when there is something to lose and it is safe to take one.
+    /// Silent on success — the point of an autosave is that nobody notices it.
+    fn autosave(&mut self, cx: &mut Context<Self>) {
+        if self.autosave_off || !self.doc.is_dirty() || self.drag.is_some() {
+            return;
+        }
+        if let Err(error) = self.doc.write_backup(self.path.as_deref()) {
+            self.autosave_off = true;
+            self.set_status(format!("Autosave failed: {error}"), cx);
         }
     }
 
     fn file_name(&self) -> String {
-        match &self.path {
-            Some(path) => path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            None => format!("untitled.{FILE_EXT}"),
-        }
+        document_name(self.path.as_deref())
+    }
+
+    /// Offers back a crash copy left by a previous run. Called once, at startup.
+    fn offer_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(backup) = read_backup() else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Recover unsaved work?",
+            Some(&format!(
+                "{} was not saved before the last session ended.",
+                document_name(backup.path.as_deref())
+            )),
+            &["Recover", "Discard"],
+            cx,
+        );
+
+        cx.spawn(async move |this, cx| {
+            match answer.await {
+                Ok(0) => {
+                    this.update(cx, |this, cx| {
+                        // The prompt does not hold the mouse on Linux, so the document may
+                        // have been edited while it was up. Recovering over it would discard
+                        // those edits without asking, which is the one thing `confirm_discard`
+                        // exists to prevent.
+                        if this.doc.is_dirty() {
+                            return;
+                        }
+                        let path = backup.path;
+                        this.replace_doc(backup.doc, path, cx);
+                        // Recovered work is still unsaved work, and `checkpoint` is the only
+                        // thing that says so. The price is a first undo that restores the
+                        // state it was already in.
+                        this.doc.checkpoint();
+                    })
+                    .ok();
+                }
+                // Only an explicit Discard deletes it — a prompt that was cancelled resolves
+                // to `Err`, and must not take the user's only copy with it.
+                Ok(_) => clear_backup(),
+                Err(_) => {}
+            }
+        })
+        .detach();
     }
 
     /// Asks before unsaved edits are thrown away. Resolves to true on "Discard".
@@ -299,6 +382,8 @@ impl Editor {
                 handle
                     .update(cx, |this, window, _| {
                         this.closing = true;
+                        // Discarding on purpose is not something to offer back next launch.
+                        clear_backup();
                         window.remove_window();
                     })
                     .ok();
@@ -309,10 +394,17 @@ impl Editor {
 
     /// Starts an empty, unnamed document.
     fn reset(&mut self, cx: &mut Context<Self>) {
-        self.doc = Doc::default();
+        self.replace_doc(Doc::default(), None, cx);
+    }
+
+    /// Installs a different document. The one on screen is gone after this, so its crash
+    /// copy goes too — this is the only place a backup is dropped on a document swap.
+    fn replace_doc(&mut self, doc: Doc, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        clear_backup();
+        self.doc = doc;
         self.view = View::default();
         self.drag = None;
-        self.path = None;
+        self.path = path;
         self.status = None;
         self.select(Selection::None, cx);
         cx.notify();
@@ -388,15 +480,7 @@ impl Editor {
                 return;
             };
             this.update(cx, |this, cx| match Doc::load(&path) {
-                Ok(doc) => {
-                    this.doc = doc;
-                    this.view = View::default();
-                    this.drag = None;
-                    this.path = Some(path);
-                    this.status = None;
-                    this.select(Selection::None, cx);
-                    cx.notify();
-                }
+                Ok(doc) => this.replace_doc(doc, Some(path), cx),
                 // The current document is left untouched on a bad file.
                 Err(error) => this.set_status(format!("Open failed: {error}"), cx),
             })
@@ -410,6 +494,8 @@ impl Editor {
         let path = with_default_extension(path);
         match self.doc.save(&path) {
             Ok(()) => {
+                // The work is on disk under its own name now; the crash copy is redundant.
+                clear_backup();
                 self.path = Some(path);
                 let status = format!("Saved {}", self.file_name());
                 self.set_status(status, cx);
@@ -1426,6 +1512,11 @@ fn main() {
                     false
                 });
             })
+            .unwrap();
+
+        // Anything a previous run left behind is offered back before the first frame.
+        handle
+            .update(cx, |this, window, cx| this.offer_recovery(window, cx))
             .unwrap();
 
         cx.on_window_closed(|cx| cx.quit()).detach();

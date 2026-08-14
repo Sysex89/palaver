@@ -16,6 +16,41 @@ pub fn with_default_extension(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The one crash copy, written by [`Doc::write_backup`] while a document is dirty.
+//
+// ponytail: a fixed path, so a second instance of the app shares it and will clobber it.
+// Suffix the name with `std::process::id()` and offer the newest dead pid's file when
+// running two copies at once stops being hypothetical.
+pub fn autosave_path() -> PathBuf {
+    std::env::temp_dir().join("papugai-recovery.dln")
+}
+
+/// A crashed session's document and the file it came from, so recovery restores the file
+/// association and not just the content.
+#[derive(Deserialize)]
+pub struct Backup {
+    pub path: Option<PathBuf>,
+    pub doc: Doc,
+}
+
+/// The same shape borrowed, so taking a backup does not clone the document.
+#[derive(Serialize)]
+struct BackupRef<'a> {
+    path: Option<&'a Path>,
+    doc: &'a Doc,
+}
+
+/// The crash copy a previous run left behind, if there is a readable one.
+pub fn read_backup() -> Option<Backup> {
+    let json = std::fs::read_to_string(autosave_path()).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Removes the crash copy. Silent: not having one is the normal case.
+pub fn clear_backup() {
+    let _ = std::fs::remove_file(autosave_path());
+}
+
 pub const NODE_W: f32 = 200.0;
 pub const NODE_H: f32 = 90.0;
 /// Radius of the out-port drawn on a node's right edge.
@@ -436,6 +471,21 @@ impl Doc {
     pub fn load(path: &Path) -> Result<Doc, String> {
         let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         Doc::from_json(&json).map_err(|e| e.to_string())
+    }
+
+    /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
+    /// title keeps its `*` and the close guard keeps asking.
+    pub fn write_backup(&self, origin: Option<&Path>) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(&BackupRef {
+            path: origin,
+            doc: self,
+        })
+        .map_err(|e| e.to_string())?;
+        // Written beside the target and renamed over it. A kill mid-write is the event this
+        // file exists for, and a plain write would truncate the last good copy first.
+        let temp = autosave_path().with_extension("tmp");
+        std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, autosave_path()).map_err(|e| e.to_string())
     }
 
     /// Restores the last checkpoint. False when there is nothing to undo.
@@ -961,6 +1011,35 @@ mod tests {
 
         doc.undo();
         assert!(doc.is_dirty(), "undo is an edit too");
+    }
+
+    // Touches the real `autosave_path()`, so it is the only test allowed to — a second one
+    // would race it. Everything about the backup is asserted here.
+    #[test]
+    fn a_backup_round_trips_without_clearing_dirty() {
+        let mut doc = Doc::sample();
+        doc.checkpoint();
+        let added = doc.add_node(10.0, 20.0);
+
+        let origin = PathBuf::from("/tmp/papugai-backup-test.dln");
+        doc.write_backup(Some(&origin)).expect("write backup");
+        assert!(
+            doc.is_dirty(),
+            "a backup is not a save: dirty must survive it"
+        );
+        assert!(
+            !autosave_path().with_extension("tmp").exists(),
+            "the temp file is renamed away, not left behind"
+        );
+
+        let backup = read_backup().expect("read backup");
+        assert_eq!(backup.path, Some(origin));
+        assert_eq!(backup.doc.nodes.len(), doc.nodes.len());
+        assert!(backup.doc.node(added).is_some());
+        assert!(!backup.doc.is_dirty(), "a read document starts clean");
+
+        clear_backup();
+        assert!(read_backup().is_none());
     }
 
     #[test]
