@@ -2,7 +2,7 @@
 //! Nothing here knows about gpui, which is what keeps it testable.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Extension of a saved dialog document.
@@ -168,6 +168,14 @@ pub enum NodeKind {
     /// the way across it. Its target is an ordinary [`Edge`] — this kind only changes how
     /// that edge is *drawn*, which is why nothing else in this file has to know about it.
     Jump,
+    /// Writes to the document's variables when the flow passes through it. Logic is graph
+    /// structure here rather than a hidden property of a line of dialogue: you can see it,
+    /// select it, move it and search it like any other node.
+    Instruction,
+    /// Reads the document's variables and sends the flow down its true or false branch.
+    /// Those two pins are a `bool` on the outgoing [`Edge`] rather than a second out-port,
+    /// so the port geometry and the mouse map need to know nothing about this kind.
+    Condition,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,6 +191,40 @@ pub struct Node {
     pub end: bool,
     #[serde(default)]
     pub kind: NodeKind,
+    /// What this node writes to the variables — the *content* of a [`NodeKind::Instruction`],
+    /// and meaningless on every other kind, the way `speaker` is meaningless on a hub.
+    #[serde(default)]
+    pub effects: Vec<Effect>,
+    /// What this node checks — the *content* of a [`NodeKind::Condition`]. Deliberately not
+    /// folded into `effects` despite the identical shape: checks stored in a field called
+    /// "effects" would be a name that lies, and the two share their *editor* instead.
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+}
+
+/// A write an [`NodeKind::Instruction`] node performs when the flow passes through it. At
+/// most one per variable per node — [`Doc::set_effect`] upserts rather than appends — so
+/// the order they are stored in can never change the outcome.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Effect {
+    pub var: String,
+    pub value: Value,
+}
+
+/// A check a [`NodeKind::Condition`] node makes. Every one on a node must hold for the flow
+/// to take its true branch. One per variable, like an effect.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Condition {
+    pub var: String,
+    pub want: Value,
+}
+
+impl Condition {
+    /// A variable nothing declares never holds, so a broken file takes the false branch
+    /// rather than deciding anything. [`Doc::problems`] reports it separately.
+    pub fn holds(&self, vars: &VarState) -> bool {
+        vars.get(&self.var) == Some(&self.want)
+    }
 }
 
 /// What a variable holds. One variant today, but an enum from the start: serde tags it as
@@ -206,12 +248,21 @@ pub struct Variable {
     pub default: Value,
 }
 
+/// Every variable's value at one point in a play-through. Never stored on the editor —
+/// see [`Doc::vars_along`], which recomputes it from the path instead.
+pub type VarState = HashMap<String, Value>;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub from: u32,
     pub to: u32,
     /// The player-facing choice taken to follow this edge.
     pub label: String,
+    /// Which pin of a [`NodeKind::Condition`] this leaves by, and meaningless from any
+    /// other kind. `default` so `.dln` files written before conditions keep loading — they
+    /// have no condition nodes, so the value never matters to them.
+    #[serde(default)]
+    pub branch: bool,
 }
 
 /// Something wrong with the document, as found by [`Doc::problems`]. Carries no message
@@ -227,8 +278,14 @@ pub enum Problem {
     Unreachable(u32),
     /// No outgoing edges — the conversation stops here.
     DeadEnd(u32),
-    /// No dialogue text.
+    /// Nothing in it: no dialogue on a speech node, no writes on an instruction.
     Empty(u32),
+    /// An effect or a check naming a variable nothing declares. Only reachable through a
+    /// bad file — removing a variable takes both with it.
+    UnknownVar(u32, String),
+    /// A condition node with nothing wired to one of its pins, so that branch stops the
+    /// conversation. The `bool` is which pin.
+    UnwiredBranch(u32, bool),
 }
 
 /// A leaf node is an ordinary way for a conversation to end, so most findings are
@@ -243,14 +300,20 @@ impl Problem {
     /// The node to jump to, when the problem has one.
     pub fn node(&self) -> Option<u32> {
         match self {
-            Problem::Unreachable(id) | Problem::DeadEnd(id) | Problem::Empty(id) => Some(*id),
+            Problem::Unreachable(id)
+            | Problem::DeadEnd(id)
+            | Problem::Empty(id)
+            | Problem::UnknownVar(id, _)
+            | Problem::UnwiredBranch(id, _) => Some(*id),
             _ => None,
         }
     }
 
     pub fn severity(&self) -> Severity {
         match self {
-            Problem::DanglingEdge(_) | Problem::NoStart => Severity::Error,
+            Problem::DanglingEdge(_) | Problem::NoStart | Problem::UnknownVar(..) => {
+                Severity::Error
+            }
             _ => Severity::Warning,
         }
     }
@@ -341,14 +404,48 @@ impl Doc {
                 .filter(|n| !n.end && !self.edges.iter().any(|e| e.from == n.id))
                 .map(|n| Problem::DeadEnd(n.id)),
         );
-        // Only dialogue is missing anything when it has no text: a hub and a jump are
-        // textless by definition, the way an `end` node is childless by definition.
+        // An empty node is one with none of whatever it exists to hold: dialogue for a
+        // speech node, writes for an instruction. A hub and a jump hold neither by
+        // definition, the way an `end` node is childless by definition.
         found.extend(
             self.nodes
                 .iter()
-                .filter(|n| n.kind == NodeKind::Speech && n.text.trim().is_empty())
+                .filter(|n| match n.kind {
+                    NodeKind::Speech => n.text.trim().is_empty(),
+                    NodeKind::Instruction => n.effects.is_empty(),
+                    NodeKind::Condition => n.conditions.is_empty(),
+                    NodeKind::Hub | NodeKind::Jump => false,
+                })
                 .map(|n| Problem::Empty(n.id)),
         );
+
+        // A condition with a pin wired to nothing stops half of every play-through dead.
+        // `DeadEnd` only catches one with no edges at all, so this is the gap.
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Condition && !n.conditions.is_empty())
+                .flat_map(|n| {
+                    [true, false]
+                        .into_iter()
+                        .filter(|branch| {
+                            !self
+                                .edges
+                                .iter()
+                                .any(|e| e.from == n.id && e.branch == *branch)
+                        })
+                        .map(|branch| Problem::UnwiredBranch(n.id, branch))
+                }),
+        );
+
+        found.extend(self.nodes.iter().flat_map(|n| {
+            let effects = n.effects.iter().map(|e| &e.var);
+            let conditions = n.conditions.iter().map(|c| &c.var);
+            effects
+                .chain(conditions)
+                .filter(|var| self.variable(var).is_none())
+                .map(|var| Problem::UnknownVar(n.id, var.clone()))
+        }));
 
         // Stable, so rule order survives inside each severity band.
         found.sort_by_key(|p| p.severity());
@@ -366,6 +463,8 @@ impl Doc {
             text: String::new(),
             end: false,
             kind: NodeKind::Speech,
+            effects: Vec::new(),
+            conditions: Vec::new(),
         });
         id
     }
@@ -374,23 +473,103 @@ impl Doc {
         self.node(id).is_some_and(|n| n.kind == NodeKind::Jump)
     }
 
-    /// Where a play-through actually lands when sent to `id`: a jump is an authoring
-    /// convenience the player never sees, so walk through it to the node it points at.
-    /// Guarded against a jump cycle the same way [`Doc::start_of`] is, and stops on the
-    /// last good node when a jump has no target.
-    pub fn resolve_jump(&self, id: u32) -> u32 {
-        let mut current = id;
-        let mut seen = HashSet::from([current]);
-        while self.is_jump(current) {
-            let Some(next) = self.choices(current).first().map(|(to, _)| *to) else {
-                break;
+    pub fn is_instruction(&self, id: u32) -> bool {
+        self.node(id)
+            .is_some_and(|n| n.kind == NodeKind::Instruction)
+    }
+
+    pub fn is_condition(&self, id: u32) -> bool {
+        self.node(id).is_some_and(|n| n.kind == NodeKind::Condition)
+    }
+
+    /// Whether every check on a condition node holds against `vars`. A node with no checks
+    /// holds vacuously, which is why an empty one is reported by [`Doc::problems`] rather
+    /// than silently sending everything down one branch.
+    pub fn condition_holds(&self, id: u32, vars: &VarState) -> bool {
+        self.node(id)
+            .is_some_and(|node| node.conditions.iter().all(|c| c.holds(vars)))
+    }
+
+    /// Whether the player actually stops here. The single definition of it, so the walk
+    /// below and the panel that renders the result cannot disagree about which nodes are
+    /// authoring plumbing. A missing node counts as visible, so a broken graph halts
+    /// rather than walking off the end of it.
+    pub fn pauses_play(&self, id: u32) -> bool {
+        match self.node(id) {
+            Some(node) => matches!(node.kind, NodeKind::Speech | NodeKind::Hub),
+            None => true,
+        }
+    }
+
+    /// The branch a condition sends the flow down, given the variables as they stand.
+    /// None when that pin has nothing wired to it, which stops the walk where it is.
+    fn condition_branch(&self, id: u32, vars: &VarState) -> Option<u32> {
+        let holds = self.condition_holds(id, vars);
+        self.edges
+            .iter()
+            .find(|e| e.from == id && e.branch == holds && self.node(e.to).is_some())
+            .map(|e| e.to)
+    }
+
+    /// Walks on from `id` through everything the player never sees — a jump, an
+    /// instruction — appending each node passed to `path`, and stopping on the first one
+    /// that [`Doc::pauses_play`]. The invisible nodes stay in the path deliberately: it is
+    /// what lets [`Doc::vars_along`] recompute the variables rather than store them.
+    ///
+    /// Guarded against a cycle the same way [`Doc::start_of`] is, and stops where it
+    /// stands when a jump has no target.
+    fn walk_on(&self, path: &mut Vec<u32>) {
+        let mut seen: HashSet<u32> = path.iter().copied().collect();
+        while let Some(&current) = path.last() {
+            if self.pauses_play(current) {
+                return;
+            }
+            // The only place a condition is ever evaluated. `vars_along` is recomputed for
+            // each one met rather than carried along, which keeps the path the single copy
+            // of the play state — and it is a walk of a few dozen nodes.
+            let next = if self.is_condition(current) {
+                self.condition_branch(current, &self.vars_along(path))
+            } else {
+                self.choices(current).first().map(|(to, _)| *to)
+            };
+            let Some(next) = next else {
+                return;
             };
             if !seen.insert(next) {
-                break;
+                return;
             }
-            current = next;
+            path.push(next);
         }
-        current
+    }
+
+    /// The path a play-through opens on: `seed`, plus whatever it walks through to reach
+    /// the first node the player sees.
+    pub fn start_walk(&self, seed: u32) -> Vec<u32> {
+        let mut path = vec![seed];
+        self.walk_on(&mut path);
+        path
+    }
+
+    /// Takes the choice leading to `to` and walks on from there.
+    pub fn advance(&self, path: &mut Vec<u32>, to: u32) {
+        path.push(to);
+        self.walk_on(path);
+    }
+
+    /// Steps back to the previous node the player actually saw, dropping the invisible run
+    /// walked through to reach the current one. False when there is no earlier one — which
+    /// is also what hides the Back button.
+    pub fn step_back(&self, path: &mut Vec<u32>) -> bool {
+        // Searched by position, not by id: a conversation that loops back to a node it has
+        // already visited would otherwise step back to the wrong occurrence of it.
+        let Some(before) = path.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(at) = path[..before].iter().rposition(|&id| self.pauses_play(id)) else {
+            return false;
+        };
+        path.truncate(at + 1);
+        true
     }
 
     // ponytail: O(n) node lookup, add a HashMap index past ~2k nodes.
@@ -482,10 +661,14 @@ impl Doc {
         if self.is_jump(from) && self.edges.iter().any(|e| e.from == from) {
             return false;
         }
+        // The first edge out of a condition is its true branch: the happy path is what gets
+        // drawn first, and the edge inspector flips it either way.
+        let branch = self.is_condition(from) && !self.edges.iter().any(|e| e.from == from);
         self.edges.push(Edge {
             from,
             to,
             label: String::new(),
+            branch,
         });
         true
     }
@@ -556,8 +739,98 @@ impl Doc {
         true
     }
 
-    pub fn remove_variable(&mut self, name: &str) {
+    /// Removes the flag and every effect that writes it, returning how many effects went
+    /// with it — an effect naming a variable nothing declares has no meaning, so leaving
+    /// them behind is not an option. It is one checkpoint's worth of change, so a single
+    /// undo brings the variable and all of its effects back together.
+    pub fn remove_variable(&mut self, name: &str) -> usize {
         self.variables.retain(|v| v.name != name);
+        let mut dropped = 0;
+        for node in &mut self.nodes {
+            let before = node.effects.len() + node.conditions.len();
+            node.effects.retain(|e| e.var != name);
+            node.conditions.retain(|c| c.var != name);
+            dropped += before - node.effects.len() - node.conditions.len();
+        }
+        dropped
+    }
+
+    /// What this node writes to `var`, if anything.
+    pub fn effect_of(&self, id: u32, var: &str) -> Option<Value> {
+        self.node(id)?
+            .effects
+            .iter()
+            .find(|e| e.var == var)
+            .map(|e| e.value)
+    }
+
+    /// Sets — or with `None`, clears — what this node writes to `var`. An upsert, which is
+    /// what keeps at most one effect per variable per node and makes their stored order
+    /// irrelevant.
+    pub fn set_effect(&mut self, id: u32, var: &str, value: Option<Value>) {
+        let Some(node) = self.node_mut(id) else {
+            return;
+        };
+        node.effects.retain(|e| e.var != var);
+        if let Some(value) = value {
+            node.effects.push(Effect {
+                var: var.to_string(),
+                value,
+            });
+        }
+    }
+
+    /// What this node checks `var` against, if anything.
+    pub fn condition_of(&self, id: u32, var: &str) -> Option<Value> {
+        self.node(id)?
+            .conditions
+            .iter()
+            .find(|c| c.var == var)
+            .map(|c| c.want)
+    }
+
+    /// The [`Doc::set_effect`] of the checking side, with the same upsert rule.
+    pub fn set_condition(&mut self, id: u32, var: &str, want: Option<Value>) {
+        let Some(node) = self.node_mut(id) else {
+            return;
+        };
+        node.conditions.retain(|c| c.var != var);
+        if let Some(want) = want {
+            node.conditions.push(Condition {
+                var: var.to_string(),
+                want,
+            });
+        }
+    }
+
+    /// Every declared variable at the value a play-through starts it from.
+    pub fn initial_vars(&self) -> VarState {
+        self.variables
+            .iter()
+            .map(|v| (v.name.clone(), v.default))
+            .collect()
+    }
+
+    /// The variables as they stand after walking `path`: the declared defaults, then every
+    /// instruction along the way applied in order.
+    ///
+    /// Recomputed from the path rather than carried beside it, which is what makes it
+    /// impossible for the two to drift — stepping back through the path steps the
+    /// variables back with it for free.
+    pub fn vars_along(&self, path: &[u32]) -> VarState {
+        let mut vars = self.initial_vars();
+        let instructions = path
+            .iter()
+            .filter_map(|id| self.node(*id))
+            .filter(|n| n.kind == NodeKind::Instruction);
+        for effect in instructions.flat_map(|n| &n.effects) {
+            // Only a declared variable. Inventing one here would paper over the broken file
+            // that `problems` is about to report.
+            if let Some(slot) = vars.get_mut(&effect.var) {
+                *slot = effect.value;
+            }
+        }
+        vars
     }
 
     /// Sets the value a play-through starts this variable from. Unknown names are ignored.
@@ -658,10 +931,11 @@ impl Doc {
         true
     }
 
-    /// A small hardcoded conversation. Deliberately shows one of each node kind: the
+    /// A small hardcoded conversation. Deliberately shows one of every node kind: the
     /// opening branch is plain dialogue, the innkeeper's answer opens onto a *hub* of
-    /// follow-up questions, and each answered question returns through a single *jump*
-    /// rather than an edge dragged all the way back across the canvas.
+    /// follow-up questions, each answered question returns through a single *jump* rather
+    /// than an edge dragged back across the canvas, asking about the pass runs an
+    /// *instruction* that remembers you did, and the goodbye runs a *condition* on it.
     pub fn sample() -> Doc {
         let mut doc = Doc::default();
         let node = |doc: &mut Doc, x, y, speaker: &str, text: &str| {
@@ -676,6 +950,7 @@ impl Doc {
                 from,
                 to,
                 label: label.into(),
+                branch: false,
             });
         };
 
@@ -718,11 +993,32 @@ impl Doc {
             "Innkeeper",
             "Snowed shut since Tuesday. Nobody's crossing.",
         );
-        let farewell = node(&mut doc, 1260.0, 300.0, "Innkeeper", "Safe travels, then.");
+        // What the conversation remembers about itself. One global list, declared here the
+        // same way the variables panel declares one.
+        doc.add_variable("asked_about_pass");
+
+        // Logic is graph structure: the instruction that records the question and the
+        // condition that reads it back are both nodes you can see on the canvas.
+        let noted = doc.add_node(1560.0, 160.0);
+        doc.node_mut(noted).unwrap().kind = NodeKind::Instruction;
+        doc.set_effect(noted, "asked_about_pass", Some(Value::Bool(true)));
+
+        let check = doc.add_node(1260.0, 300.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(check, "asked_about_pass", Some(Value::Bool(true)));
+
+        let warned = node(
+            &mut doc,
+            1560.0,
+            300.0,
+            "Innkeeper",
+            "Mind the drifts on the road out.",
+        );
+        let farewell = node(&mut doc, 1560.0, 440.0, "Innkeeper", "Safe travels, then.");
 
         // One jump serves every branch that returns to the hub, so the canvas carries no
         // long edge doubling back across it.
-        let back = doc.add_node(1560.0, 90.0);
+        let back = doc.add_node(1860.0, 60.0);
         doc.node_mut(back).unwrap().kind = NodeKind::Jump;
 
         edge(&mut doc, greet, ask, "Ask");
@@ -732,10 +1028,15 @@ impl Doc {
         edge(&mut doc, answer, more, "");
         edge(&mut doc, more, rooms, "A room for the night?");
         edge(&mut doc, more, pass, "Is the pass open?");
-        edge(&mut doc, more, farewell, "That's all.");
+        edge(&mut doc, more, check, "That's all.");
         edge(&mut doc, rooms, back, "Ask something else");
-        edge(&mut doc, pass, back, "Ask something else");
+        edge(&mut doc, pass, noted, "Ask something else");
+        edge(&mut doc, noted, back, "");
         edge(&mut doc, back, more, "");
+        // Through `add_edge`, so the first pin out of the condition is its true branch —
+        // the rule the editor relies on when an author drags the happy path first.
+        doc.add_edge(check, warned);
+        doc.add_edge(check, farewell);
         doc
     }
 }
@@ -793,7 +1094,11 @@ mod tests {
 
         assert!(doc.choices(hub.id).len() > 1, "a hub is a branch point");
         assert!(hub.speaker.is_empty(), "nobody speaks at a hub");
-        assert_eq!(doc.resolve_jump(jump.id), hub.id, "the jump returns to it");
+        assert_eq!(
+            doc.start_walk(jump.id).last(),
+            Some(&hub.id),
+            "the jump returns to it"
+        );
         assert!(
             doc.edges.iter().filter(|e| e.to == jump.id).count() > 1,
             "one jump serves several branches, which is the point of it"
@@ -963,6 +1268,7 @@ mod tests {
             from: doc.nodes[0].id,
             to: 999,
             label: String::new(),
+            branch: false,
         });
 
         let problems = doc.problems();
@@ -1128,26 +1434,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_jump_walks_to_the_node_behind_it() {
+    fn the_walk_passes_through_jumps_and_instructions() {
         let mut doc = Doc::default();
         let first = doc.add_node(0.0, 0.0);
         let second = doc.add_node(300.0, 0.0);
+        let sets = doc.add_node(450.0, 0.0);
         let landing = spoken(&mut doc, 600.0, 0.0);
         doc.node_mut(first).unwrap().kind = NodeKind::Jump;
         doc.node_mut(second).unwrap().kind = NodeKind::Jump;
+        doc.node_mut(sets).unwrap().kind = NodeKind::Instruction;
         doc.add_edge(first, second);
-        doc.add_edge(second, landing);
+        doc.add_edge(second, sets);
+        doc.add_edge(sets, landing);
 
-        assert_eq!(doc.resolve_jump(first), landing, "through a chain of jumps");
         assert_eq!(
-            doc.resolve_jump(landing),
-            landing,
-            "speech resolves to itself"
+            doc.start_walk(first),
+            vec![first, second, sets, landing],
+            "every node passed stays in the path, so the variables can be replayed from it"
+        );
+        assert_eq!(
+            doc.start_walk(landing),
+            vec![landing],
+            "a node the player sees is where the walk stops"
         );
     }
 
     #[test]
-    fn resolve_jump_terminates_in_a_cycle() {
+    fn the_walk_terminates_in_a_cycle() {
         let mut doc = Doc::default();
         let first = doc.add_node(0.0, 0.0);
         let second = doc.add_node(300.0, 0.0);
@@ -1157,14 +1470,62 @@ mod tests {
         doc.add_edge(second, first);
 
         assert_eq!(
-            doc.resolve_jump(first),
-            second,
+            doc.start_walk(first),
+            vec![first, second],
             "stops rather than spinning"
         );
 
         let orphan = doc.add_node(600.0, 0.0);
         doc.node_mut(orphan).unwrap().kind = NodeKind::Jump;
-        assert_eq!(doc.resolve_jump(orphan), orphan, "a jump with no target");
+        assert_eq!(
+            doc.start_walk(orphan),
+            vec![orphan],
+            "a jump with no target"
+        );
+    }
+
+    #[test]
+    fn advance_walks_on_from_the_choice_taken() {
+        let mut doc = Doc::default();
+        let here = spoken(&mut doc, 0.0, 0.0);
+        let sets = doc.add_node(300.0, 0.0);
+        let there = spoken(&mut doc, 600.0, 0.0);
+        doc.node_mut(sets).unwrap().kind = NodeKind::Instruction;
+        doc.add_edge(sets, there);
+
+        let mut path = doc.start_walk(here);
+        doc.advance(&mut path, sets);
+
+        assert_eq!(path, vec![here, sets, there]);
+    }
+
+    #[test]
+    fn step_back_lands_on_the_previous_visible_node() {
+        let mut doc = Doc::default();
+        let here = spoken(&mut doc, 0.0, 0.0);
+        let sets = doc.add_node(300.0, 0.0);
+        let there = spoken(&mut doc, 600.0, 0.0);
+        doc.node_mut(sets).unwrap().kind = NodeKind::Instruction;
+
+        let mut path = vec![here, sets, there];
+        assert!(doc.step_back(&mut path));
+        assert_eq!(path, vec![here], "the instruction went back with it");
+
+        assert!(!doc.step_back(&mut path), "nothing before the first node");
+        assert_eq!(path, vec![here], "and it left the path alone");
+    }
+
+    /// A conversation that returns to a node it has already played must step back to the
+    /// occurrence it just came from, not to the first one in the path.
+    #[test]
+    fn step_back_counts_positions_not_ids() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        let away = spoken(&mut doc, 300.0, 0.0);
+
+        let mut path = vec![hub, away, hub, away];
+        assert!(doc.step_back(&mut path));
+        assert_eq!(path, vec![hub, away, hub]);
     }
 
     #[test]
@@ -1375,6 +1736,426 @@ mod tests {
 
         doc.set_default("nonexistent", Value::Bool(true));
         assert_eq!(doc.variables.len(), 1, "an unknown name declares nothing");
+    }
+
+    /// Builds an instruction node that writes `var`.
+    fn sets(doc: &mut Doc, var: &str, value: bool) -> u32 {
+        let id = doc.add_node(0.0, 0.0);
+        doc.node_mut(id).unwrap().kind = NodeKind::Instruction;
+        doc.set_effect(id, var, Some(Value::Bool(value)));
+        id
+    }
+
+    #[test]
+    fn set_effect_upserts_and_clears() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let node = sets(&mut doc, "paid", true);
+
+        doc.set_effect(node, "paid", Some(Value::Bool(false)));
+        assert_eq!(
+            doc.node(node).unwrap().effects.len(),
+            1,
+            "one write per variable per node, so their order can never matter"
+        );
+        assert_eq!(doc.effect_of(node, "paid"), Some(Value::Bool(false)));
+
+        doc.set_effect(node, "paid", None);
+        assert_eq!(doc.effect_of(node, "paid"), None);
+        assert!(doc.node(node).unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn vars_along_replays_the_path() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        doc.add_variable("greeted");
+        doc.set_default("greeted", Value::Bool(true));
+
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let pay = sets(&mut doc, "paid", true);
+        let refund = sets(&mut doc, "paid", false);
+
+        let value = |vars: &VarState, name: &str| vars.get(name).copied();
+
+        let vars = doc.vars_along(&[start]);
+        assert_eq!(
+            value(&vars, "greeted"),
+            Some(Value::Bool(true)),
+            "starts from the declared default, not from false"
+        );
+        assert_eq!(value(&vars, "paid"), Some(Value::Bool(false)));
+
+        let vars = doc.vars_along(&[start, pay]);
+        assert_eq!(value(&vars, "paid"), Some(Value::Bool(true)));
+
+        let vars = doc.vars_along(&[start, pay, refund]);
+        assert_eq!(
+            value(&vars, "paid"),
+            Some(Value::Bool(false)),
+            "later writes win"
+        );
+
+        // Stepping back is what makes this worth recomputing rather than storing.
+        let vars = doc.vars_along(&[start, pay]);
+        assert_eq!(value(&vars, "paid"), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn vars_along_ignores_effects_that_cannot_run() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let speech = spoken(&mut doc, 0.0, 0.0);
+        doc.set_effect(speech, "paid", Some(Value::Bool(true)));
+
+        assert_eq!(
+            doc.vars_along(&[speech]).get("paid"),
+            Some(&Value::Bool(false)),
+            "effects belong to an instruction; play never runs one hidden on a line"
+        );
+
+        let ghost = sets(&mut doc, "nonexistent", true);
+        assert!(
+            !doc.vars_along(&[ghost]).contains_key("nonexistent"),
+            "an undeclared variable is not invented here — `problems` reports it"
+        );
+    }
+
+    #[test]
+    fn removing_a_variable_takes_its_effects() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let one = sets(&mut doc, "paid", true);
+        let two = sets(&mut doc, "paid", false);
+
+        doc.checkpoint();
+        assert_eq!(
+            doc.remove_variable("paid"),
+            2,
+            "reports what it cascaded to"
+        );
+        assert!(doc.node(one).unwrap().effects.is_empty());
+        assert!(doc.node(two).unwrap().effects.is_empty());
+
+        assert!(doc.undo(), "one step, so one undo");
+        assert!(doc.variable("paid").is_some());
+        assert_eq!(doc.effect_of(one, "paid"), Some(Value::Bool(true)));
+        assert_eq!(doc.effect_of(two, "paid"), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn an_undeclared_effect_is_an_error() {
+        let mut doc = Doc::default();
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let ghost = sets(&mut doc, "paid", true);
+        doc.add_edge(start, ghost);
+        doc.node_mut(start).unwrap().end = true;
+        doc.node_mut(ghost).unwrap().end = true;
+
+        let problems = doc.problems();
+        let unknown = Problem::UnknownVar(ghost, "paid".into());
+        assert!(problems.contains(&unknown), "got {problems:?}");
+        assert_eq!(unknown.severity(), Severity::Error);
+        assert_eq!(unknown.node(), Some(ghost), "the row clicks through");
+
+        doc.add_variable("paid");
+        assert!(
+            !doc.problems().contains(&unknown),
+            "declaring it settles it"
+        );
+    }
+
+    /// Builds a condition node checking `var`.
+    fn checks(doc: &mut Doc, var: &str, want: bool) -> u32 {
+        let id = doc.add_node(0.0, 0.0);
+        doc.node_mut(id).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(id, var, Some(Value::Bool(want)));
+        id
+    }
+
+    #[test]
+    fn a_check_needs_the_variable_to_exist_and_match() {
+        let vars = VarState::from([("paid".to_string(), Value::Bool(true))]);
+        let check = |var: &str, want: bool| {
+            Condition {
+                var: var.into(),
+                want: Value::Bool(want),
+            }
+            .holds(&vars)
+        };
+
+        assert!(check("paid", true));
+        assert!(!check("paid", false), "the wrong value");
+        assert!(!check("nonexistent", true), "an undeclared variable");
+        assert!(
+            !check("nonexistent", false),
+            "undeclared never holds, either way round — a broken file takes the false branch"
+        );
+    }
+
+    #[test]
+    fn the_walk_follows_the_branch_the_variables_choose() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let pay = sets(&mut doc, "paid", true);
+        let gate = checks(&mut doc, "paid", true);
+        let yes = spoken(&mut doc, 0.0, 0.0);
+        let no = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, yes);
+        doc.add_edge(gate, no);
+        doc.add_edge(pay, gate);
+
+        let mut path = doc.start_walk(start);
+        doc.advance(&mut path, gate);
+        assert_eq!(path, vec![start, gate, no], "the default is false");
+
+        // The instruction runs earlier on the same path, so the condition must see the
+        // value it wrote rather than the declared default.
+        let mut path = doc.start_walk(start);
+        doc.advance(&mut path, pay);
+        assert_eq!(
+            path,
+            vec![start, pay, gate, yes],
+            "live state, not defaults"
+        );
+    }
+
+    #[test]
+    fn an_unwired_branch_stops_the_walk_on_the_condition() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let gate = checks(&mut doc, "paid", true);
+        let yes = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, yes);
+
+        assert_eq!(
+            doc.start_walk(gate),
+            vec![gate],
+            "it stops rather than taking the only edge it can see"
+        );
+    }
+
+    #[test]
+    fn step_back_crosses_a_condition() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let start = spoken(&mut doc, 0.0, 0.0);
+        // Checks that `paid` is false, which it is by default, so this takes the true pin.
+        let gate = checks(&mut doc, "paid", false);
+        let landing = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, landing);
+        doc.add_edge(start, gate);
+
+        let mut path = doc.start_walk(start);
+        doc.advance(&mut path, gate);
+        assert_eq!(path, vec![start, gate, landing]);
+
+        assert!(doc.step_back(&mut path));
+        assert_eq!(path, vec![start], "the condition went back with it");
+    }
+
+    #[test]
+    fn the_first_edge_out_of_a_condition_is_the_true_branch() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let gate = checks(&mut doc, "paid", true);
+        let yes = spoken(&mut doc, 0.0, 0.0);
+        let no = spoken(&mut doc, 0.0, 0.0);
+
+        doc.add_edge(gate, yes);
+        doc.add_edge(gate, no);
+
+        let plain = spoken(&mut doc, 0.0, 0.0);
+        let onward = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(plain, onward);
+
+        let branch = |to| doc.edges.iter().find(|e| e.to == to).map(|e| e.branch);
+        assert_eq!(branch(yes), Some(true), "the happy path is drawn first");
+        assert_eq!(branch(no), Some(false));
+        assert_eq!(
+            branch(onward),
+            Some(false),
+            "meaningless off any other kind, so it stays false"
+        );
+    }
+
+    #[test]
+    fn a_pin_with_nothing_on_it_is_a_warning() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let gate = checks(&mut doc, "paid", true);
+        let yes = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, yes);
+
+        let problems = doc.problems();
+        assert!(
+            problems.contains(&Problem::UnwiredBranch(gate, false)),
+            "got {problems:?}"
+        );
+        assert!(!problems.contains(&Problem::UnwiredBranch(gate, true)));
+        assert_eq!(
+            Problem::UnwiredBranch(gate, false).severity(),
+            Severity::Warning
+        );
+
+        let no = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, no);
+        assert!(
+            !doc.problems()
+                .iter()
+                .any(|p| matches!(p, Problem::UnwiredBranch(..))),
+            "both pins wired"
+        );
+    }
+
+    #[test]
+    fn a_condition_that_checks_nothing_is_empty() {
+        let mut doc = Doc::default();
+        let bare = doc.add_node(0.0, 0.0);
+        doc.node_mut(bare).unwrap().kind = NodeKind::Condition;
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::Empty(bare)));
+        assert!(
+            !problems
+                .iter()
+                .any(|p| matches!(p, Problem::UnwiredBranch(..))),
+            "an empty condition is one fault, not three"
+        );
+    }
+
+    #[test]
+    fn removing_a_variable_takes_its_checks_too() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let writes = sets(&mut doc, "paid", true);
+        let reads = checks(&mut doc, "paid", true);
+
+        doc.checkpoint();
+        assert_eq!(doc.remove_variable("paid"), 2, "both sides counted");
+        assert!(doc.node(reads).unwrap().conditions.is_empty());
+
+        assert!(doc.undo());
+        assert_eq!(doc.effect_of(writes, "paid"), Some(Value::Bool(true)));
+        assert_eq!(doc.condition_of(reads, "paid"), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn an_undeclared_check_is_an_error() {
+        let mut doc = Doc::default();
+        let gate = checks(&mut doc, "paid", true);
+
+        let unknown = Problem::UnknownVar(gate, "paid".into());
+        assert!(doc.problems().contains(&unknown));
+
+        doc.add_variable("paid");
+        assert!(!doc.problems().contains(&unknown));
+    }
+
+    #[test]
+    fn conditions_round_trip() {
+        let mut original = Doc::default();
+        original.add_variable("paid");
+        let gate = checks(&mut original, "paid", true);
+        let landing = spoken(&mut original, 0.0, 0.0);
+        original.add_edge(gate, landing);
+
+        let restored = Doc::from_json(&original.to_json()).expect("round trip");
+
+        assert_eq!(restored.condition_of(gate, "paid"), Some(Value::Bool(true)));
+        assert!(restored.edges[0].branch, "the pin survived");
+    }
+
+    #[test]
+    fn an_edge_without_a_branch_loads() {
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":0,"x":0.0,"y":0.0,"speaker":"","text":"Hm."},
+                         {"id":1,"x":0.0,"y":0.0,"speaker":"","text":"Ah."}],
+                "edges":[{"from":0,"to":1,"label":""}],"next_id":2}"#,
+        )
+        .expect("loads");
+        assert!(!doc.edges[0].branch);
+        assert!(doc.node(0).unwrap().conditions.is_empty());
+    }
+
+    /// The sample is the first thing anyone sees, so it has to keep demonstrating that a
+    /// conversation can remember something and read it back.
+    #[test]
+    fn sample_gates_a_choice() {
+        let doc = Doc::sample();
+        let of_kind = |kind| {
+            doc.nodes
+                .iter()
+                .find(|n| n.kind == kind)
+                .expect("in sample")
+        };
+
+        let noted = of_kind(NodeKind::Instruction);
+        let gate = of_kind(NodeKind::Condition);
+        let var = &noted.effects[0].var;
+        assert_eq!(
+            doc.condition_of(gate.id, var),
+            Some(Value::Bool(true)),
+            "the condition reads what the instruction writes"
+        );
+
+        // Reaching the goodbye without asking about the pass takes the other branch.
+        let start = doc.start_of(gate.id);
+        let plain = doc.start_walk(start);
+        assert!(
+            !doc.vars_along(&plain)
+                .get(var)
+                .is_some_and(|v| *v == Value::Bool(true)),
+            "nothing has set it yet"
+        );
+
+        let ends: Vec<u32> = doc
+            .edges
+            .iter()
+            .filter(|e| e.from == gate.id)
+            .map(|e| e.to)
+            .collect();
+        assert_eq!(
+            ends.len(),
+            2,
+            "both pins wired, so neither play-through stops"
+        );
+    }
+
+    #[test]
+    fn an_instruction_that_sets_nothing_is_empty() {
+        let mut doc = Doc::default();
+        let bare = doc.add_node(0.0, 0.0);
+        doc.node_mut(bare).unwrap().kind = NodeKind::Instruction;
+
+        assert!(doc.problems().contains(&Problem::Empty(bare)));
+
+        doc.add_variable("paid");
+        doc.set_effect(bare, "paid", Some(Value::Bool(true)));
+        assert!(!doc.problems().contains(&Problem::Empty(bare)));
+    }
+
+    #[test]
+    fn effects_round_trip() {
+        let mut original = Doc::default();
+        original.add_variable("paid");
+        let node = sets(&mut original, "paid", true);
+
+        let restored = Doc::from_json(&original.to_json()).expect("round trip");
+
+        assert_eq!(restored.effect_of(node, "paid"), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn a_node_without_effects_loads() {
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":0,"x":0.0,"y":0.0,"speaker":"","text":"Hm."}],
+                "edges":[],"next_id":1}"#,
+        )
+        .expect("loads");
+        assert!(doc.node(0).unwrap().effects.is_empty());
     }
 
     /// Variables are document state, so they ride in the snapshot with everything else.

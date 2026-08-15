@@ -26,6 +26,10 @@ actions!(
         ZoomReset,
         Find,
         Branch,
+        NewHub,
+        NewJump,
+        NewInstruction,
+        NewCondition,
         FocusCanvas,
         New,
         Save,
@@ -85,11 +89,24 @@ const MENUS: &[MenuSpec] = &[
                 e.on_zoom_reset(&ZoomReset, w, cx)
             }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
-            ("New connected node", "Tab", |e, w, cx| {
-                e.on_branch(&Branch, w, cx)
-            }),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
+            }),
+        ],
+    ),
+    // Every kind is one keystroke, hung off the selected node. Without this a condition
+    // took a double-click and a trip through the inspector's kind picker to reach.
+    (
+        "Node",
+        &[
+            ("Speech", "Tab", |e, w, cx| e.on_branch(&Branch, w, cx)),
+            ("Hub", "Ctrl+2", |e, w, cx| e.on_new_hub(&NewHub, w, cx)),
+            ("Jump", "Ctrl+3", |e, w, cx| e.on_new_jump(&NewJump, w, cx)),
+            ("Instruction", "Ctrl+4", |e, w, cx| {
+                e.on_new_instruction(&NewInstruction, w, cx)
+            }),
+            ("Condition", "Ctrl+5", |e, w, cx| {
+                e.on_new_condition(&NewCondition, w, cx)
             }),
         ],
     ),
@@ -117,6 +134,20 @@ const ACCENT_COLOR: Rgba = Rgba {
     r: 0.48,
     g: 0.64,
     b: 0.97,
+    a: 1.0,
+};
+/// A condition's two pins. Drawn as well as labelled, so which branch an edge leaves by is
+/// never something the author has to guess at.
+const TRUE_COLOR: Rgba = Rgba {
+    r: 0.55,
+    g: 0.91,
+    b: 0.60,
+    a: 1.0,
+};
+const FALSE_COLOR: Rgba = Rgba {
+    r: 1.0,
+    g: 0.48,
+    b: 0.48,
     a: 1.0,
 };
 
@@ -178,6 +209,14 @@ enum Selection {
     None,
     Nodes(Vec<u32>),
     Edge(usize),
+}
+
+/// Which side of a variable a `var_rows` list is editing: what an instruction writes, or
+/// what a condition checks.
+#[derive(Clone, Copy, PartialEq)]
+enum VarRow {
+    Sets,
+    Checks,
 }
 
 #[derive(Clone, Copy)]
@@ -631,10 +670,11 @@ impl Editor {
         )
     }
 
-    /// One entry per edge: the line from the source's out-port to the target's in-port,
-    /// and whether it is the selected edge. An edge leaving a jump is not drawn at all —
-    /// the node itself names its target, which is the whole point of the kind.
-    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, bool)> {
+    /// One entry per edge: the line from the source's out-port to the target's in-port, and
+    /// the colour to draw it in — the selection outranks a condition's branch, which
+    /// outranks the ordinary edge colour. An edge leaving a jump is not drawn at all: the
+    /// node itself names its target, which is the whole point of the kind.
+    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, Rgba)> {
         self.doc
             .edges
             .iter()
@@ -643,10 +683,16 @@ impl Editor {
             .filter_map(|(index, e)| {
                 let from = self.doc.node(e.from)?;
                 let to = self.doc.node(e.to)?;
+                let color = match (self.selection == Selection::Edge(index), e.branch) {
+                    (true, _) => ACCENT_COLOR,
+                    _ if !self.doc.is_condition(e.from) => EDGE_COLOR,
+                    (false, true) => TRUE_COLOR,
+                    (false, false) => FALSE_COLOR,
+                };
                 Some((
                     self.screen_pos(out_port(from)),
                     self.screen_pos(in_port(to)),
-                    self.selection == Selection::Edge(index),
+                    color,
                 ))
             })
             .collect()
@@ -909,21 +955,63 @@ impl Editor {
     /// Creates a node already connected to the selected one and drops the cursor in its
     /// Speaker field, so a branch is one keystroke instead of a double-click and a drag.
     fn on_branch(&mut self, _: &Branch, window: &mut Window, cx: &mut Context<Self>) {
-        // Exactly one node, since a branch needs one parent to hang off.
-        let Some(from) = self.selection.only_node() else {
-            return;
-        };
+        self.insert_node(NodeKind::Speech, window, cx);
+    }
+
+    fn on_new_hub(&mut self, _: &NewHub, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_node(NodeKind::Hub, window, cx);
+    }
+
+    fn on_new_jump(&mut self, _: &NewJump, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_node(NodeKind::Jump, window, cx);
+    }
+
+    fn on_new_instruction(
+        &mut self,
+        _: &NewInstruction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_node(NodeKind::Instruction, window, cx);
+    }
+
+    fn on_new_condition(&mut self, _: &NewCondition, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_node(NodeKind::Condition, window, cx);
+    }
+
+    /// Adds a node of `kind`, hung off the selected one when there is exactly one — a
+    /// branch needs a single parent — and dropped in the middle of the view otherwise, so
+    /// the command always does something rather than silently refusing.
+    fn insert_node(&mut self, kind: NodeKind, window: &mut Window, cx: &mut Context<Self>) {
         // Guard before the checkpoint: one whose mutation then fails is an empty undo
         // step and a false dirty flag.
-        if self.doc.node(from).is_none() {
-            return;
-        }
+        let parent = self
+            .selection
+            .only_node()
+            .filter(|id| self.doc.node(*id).is_some());
+
         self.doc.checkpoint();
-        let Some(id) = self.doc.branch_from(from) else {
-            return;
+        let id = match parent {
+            Some(from) => match self.doc.branch_from(from) {
+                Some(id) => id,
+                None => return,
+            },
+            None => {
+                // Centred on the view rather than parked at its origin, so the node lands
+                // where you are already looking.
+                let (x, y) = self.view.to_doc(Self::pane_center(window));
+                self.doc.add_node(x - NODE_W / 2.0, y - NODE_H / 2.0)
+            }
         };
+        if let Some(node) = self.doc.node_mut(id) {
+            node.kind = kind;
+        }
         self.select(Selection::Nodes(vec![id]), cx);
-        window.focus(&self.speaker_input.read(cx).focus_handle(cx));
+        // Only a speech node has a field worth landing in; every other kind is edited with
+        // pickers, so the keyboard stays on the canvas.
+        if kind == NodeKind::Speech {
+            window.focus(&self.speaker_input.read(cx).focus_handle(cx));
+        }
         cx.notify();
     }
 
@@ -954,22 +1042,31 @@ impl Editor {
             .or_else(|| self.doc.nodes.first().map(|n| n.id))
     }
 
-    /// Both entry points resolve jumps, so a jump never lands in the path — it is an
-    /// authoring convenience, not a step the player takes.
+    /// Both entry points walk on through everything the player does not see, so the path
+    /// always ends on a node worth showing. The nodes walked *through* stay in it — that
+    /// is what lets `Doc::vars_along` recompute the variables from the path alone.
     fn start_play(&mut self, at: u32, window: &Window, cx: &mut Context<Self>) {
-        let at = self.doc.resolve_jump(at);
-        self.play = Some(vec![at]);
-        self.show(at, window);
+        let path = self.doc.start_walk(at);
+        self.follow(&path, window);
+        self.play = Some(path);
         cx.notify();
     }
 
     /// Advances the play-through, or ends it if the choice leads nowhere real.
     fn play_advance(&mut self, to: u32, window: &Window, cx: &mut Context<Self>) {
-        let to = self.doc.resolve_jump(to);
-        if let Some(path) = self.play.as_mut() {
-            path.push(to);
-            self.show(to, window);
-            cx.notify();
+        let Some(mut path) = self.play.take() else {
+            return;
+        };
+        self.doc.advance(&mut path, to);
+        self.follow(&path, window);
+        self.play = Some(path);
+        cx.notify();
+    }
+
+    /// Brings the node a play-through has arrived at into view.
+    fn follow(&mut self, path: &[u32], window: &Window) {
+        if let Some(&at) = path.last() {
+            self.show(at, window);
         }
     }
 
@@ -1069,7 +1166,7 @@ impl Editor {
     /// The graph itself. Owns the mouse and key handling, so sidebar clicks never reach it.
     fn canvas_pane(
         &self,
-        lines: Vec<(Point<Pixels>, Point<Pixels>, bool)>,
+        lines: Vec<(Point<Pixels>, Point<Pixels>, Rgba)>,
         pending: Option<(Point<Pixels>, Point<Pixels>)>,
         view: View,
         cx: &mut Context<Self>,
@@ -1090,6 +1187,10 @@ impl Editor {
             .on_action(cx.listener(Self::on_zoom_reset))
             .on_action(cx.listener(Self::on_find))
             .on_action(cx.listener(Self::on_branch))
+            .on_action(cx.listener(Self::on_new_hub))
+            .on_action(cx.listener(Self::on_new_jump))
+            .on_action(cx.listener(Self::on_new_instruction))
+            .on_action(cx.listener(Self::on_new_condition))
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
@@ -1125,8 +1226,8 @@ impl Editor {
                             }
                         };
 
-                        for (from, to, selected) in lines {
-                            draw(from, to, if selected { ACCENT_COLOR } else { EDGE_COLOR });
+                        for (from, to, color) in lines {
+                            draw(from, to, color);
                         }
                         if let Some((from, to)) = pending {
                             draw(from, to, ACCENT_COLOR);
@@ -1177,8 +1278,21 @@ impl Editor {
         self.doc
             .edges
             .iter()
-            .filter(|edge| !edge.label.is_empty() && !self.doc.is_jump(edge.from))
+            // A condition's edges always carry a label — which pin they leave by — even
+            // though the player never chooses one, so the empty-label skip lets them past.
+            .filter(|edge| {
+                !self.doc.is_jump(edge.from)
+                    && (!edge.label.is_empty() || self.doc.is_condition(edge.from))
+            })
             .filter_map(|edge| {
+                let (text, color) = if self.doc.is_condition(edge.from) {
+                    match edge.branch {
+                        true => ("true".to_string(), TRUE_COLOR),
+                        false => ("false".to_string(), FALSE_COLOR),
+                    }
+                } else {
+                    (edge.label.clone(), rgba(0x9a9aa6ff))
+                };
                 let from = out_port(self.doc.node(edge.from)?);
                 let to = in_port(self.doc.node(edge.to)?);
                 let mid = self.screen_pos(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
@@ -1197,9 +1311,9 @@ impl Editor {
                             div()
                                 .px_1()
                                 .bg(rgb(0x1e1e22))
-                                .text_color(rgb(0x9a9aa6))
+                                .text_color(color)
                                 .truncate()
-                                .child(edge.label.clone()),
+                                .child(text),
                         ),
                 )
             })
@@ -1254,22 +1368,26 @@ impl Editor {
             })
     }
 
-    /// The document's flags and the value each one starts a play-through from. Not
-    /// selection-scoped like the inspector, so it stays up during play too.
+    /// The document's flags. Not selection-scoped like the inspector, so it stays up
+    /// during play — where it switches from showing what each variable *starts* at to what
+    /// it stands at now, and goes read-only, since a click that edited a default while the
+    /// panel displayed a live value would be editing one thing and showing another.
     fn vars_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         /// Lower than the other panels' cap: the sidebar does not scroll, and the problems
         /// list sits below this one and must not get pushed off the bottom.
         const MAX_ROWS: usize = 8;
 
         let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
+        let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
 
         div()
             .flex()
             .flex_col()
             .gap_1()
-            // Named as a start value, not a value: nothing reads these yet, and once play
-            // does (with effects), this panel has to say which of the two it is showing.
-            .child(div().text_color(rgb(0x8a8a96)).child("Variables (start)"))
+            .child(div().text_color(rgb(0x8a8a96)).child(match playing {
+                Some(_) => "Variables (now)",
+                None => "Variables (start)",
+            }))
             .children(
                 self.doc
                     .variables
@@ -1277,7 +1395,11 @@ impl Editor {
                     .take(MAX_ROWS)
                     .enumerate()
                     .map(|(i, variable)| {
-                        let Value::Bool(on) = variable.default;
+                        let shown = playing
+                            .as_ref()
+                            .and_then(|vars| vars.get(&variable.name).copied())
+                            .unwrap_or(variable.default);
+                        let Value::Bool(on) = shown;
                         let name = variable.name.clone();
                         let to_remove = variable.name.clone();
 
@@ -1291,32 +1413,46 @@ impl Editor {
                                     .gap_2()
                                     .flex_grow()
                                     .truncate()
-                                    .cursor_pointer()
                                     .text_color(if on { rgb(0xf7c96a) } else { rgb(0xb8b8c4) })
-                                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
                                     .child(if on { "☑" } else { "☐" })
                                     .child(variable.name.clone())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.doc.checkpoint();
-                                        this.doc.set_default(&name, Value::Bool(!on));
-                                        cx.notify();
-                                    })),
+                                    .when(playing.is_none(), |this| {
+                                        this.cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.doc.checkpoint();
+                                                this.doc.set_default(&name, Value::Bool(!on));
+                                                cx.notify();
+                                            }))
+                                    }),
                             )
-                            .child(
-                                div()
-                                    .id(("var-remove", i))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_color(rgb(0x6c6c78))
-                                    .hover(|style| style.text_color(rgb(0xff7a7a)))
-                                    .child("×")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.doc.checkpoint();
-                                        this.doc.remove_variable(&to_remove);
-                                        cx.notify();
-                                    })),
-                            )
+                            .when(playing.is_none(), |this| {
+                                this.child(
+                                    div()
+                                        .id(("var-remove", i))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(rgb(0x6c6c78))
+                                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                                        .child("×")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.doc.checkpoint();
+                                            // Effects naming it go with it, so say how many.
+                                            let dropped = this.doc.remove_variable(&to_remove);
+                                            if dropped > 0 {
+                                                let s = if dropped == 1 { "" } else { "s" };
+                                                this.set_status(
+                                                    format!(
+                                                        "Removed \"{to_remove}\" and {dropped} effect{s}."
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                     }),
             )
             .when(more > 0, |this| {
@@ -1326,7 +1462,8 @@ impl Editor {
                         .child(format!("…and {more} more")),
                 )
             })
-            .child(
+            .when(playing.is_none(), |this| {
+                this.child(
                 div()
                     .flex()
                     .gap_2()
@@ -1357,7 +1494,29 @@ impl Editor {
                                 cx.notify();
                             })),
                     ),
-            )
+                )
+            })
+    }
+
+    /// What the instructions between the previous node the player saw and the current one
+    /// wrote, in the order they ran.
+    fn effects_fired(&self, path: &[u32]) -> Vec<(String, Value)> {
+        let Some(before) = path.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        let mut run: Vec<u32> = path[..before]
+            .iter()
+            .rev()
+            .take_while(|&&id| !self.doc.pauses_play(id))
+            .copied()
+            .collect();
+        run.reverse();
+        run.iter()
+            .filter_map(|&id| self.doc.node(id))
+            .filter(|node| node.kind == NodeKind::Instruction)
+            .flat_map(|node| node.effects.iter())
+            .map(|effect| (effect.var.clone(), effect.value))
+            .collect()
     }
 
     /// The conversation as a reader meets it: what the current node says, and the choices
@@ -1402,6 +1561,16 @@ impl Editor {
                     );
                 };
 
+                // The walk only stops on a node the player sees, unless it ran out of graph
+                // — a condition with that pin unwired, or a jump pointing at nothing.
+                if !self.doc.pauses_play(current) {
+                    return this.child(
+                        div()
+                            .text_color(rgb(0xff7a7a))
+                            .child("The flow stops here — nothing leads on."),
+                    );
+                }
+
                 let speaker = node.speaker.trim();
                 let text = node.text.trim();
                 this.when(!speaker.is_empty(), |this| {
@@ -1415,6 +1584,13 @@ impl Editor {
                     div().child(text.to_string())
                 })
             })
+            // What the instructions walked through on the way here did. Without this the
+            // only evidence is the variables panel changing in the corner of your eye.
+            .children(self.effects_fired(path).into_iter().map(|(var, value)| {
+                div()
+                    .text_color(rgb(0x8ce99a))
+                    .child(format!("{var} = {}", value_text(value)))
+            }))
             .children(
                 self.doc
                     .choices(current)
@@ -1445,15 +1621,17 @@ impl Editor {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .when(path.len() > 1, |this| {
+                    // Offered only when there is an earlier node the player actually saw:
+                    // the invisible run walked through to get here is not a step back.
+                    .when(self.doc.step_back(&mut path.to_vec()), |this| {
                         this.child(row(("play-nav", 0), "← Back".into(), 0x8a8a96).on_click(
                             cx.listener(|this, _, window, cx| {
-                                let Some(path) = this.play.as_mut() else {
+                                let Some(mut path) = this.play.take() else {
                                     return;
                                 };
-                                path.pop();
-                                let back = *path.last().expect("Back is hidden at the top");
-                                this.show(back, window);
+                                this.doc.step_back(&mut path);
+                                this.follow(&path, window);
+                                this.play = Some(path);
                                 cx.notify();
                             }),
                         ))
@@ -1461,13 +1639,13 @@ impl Editor {
                     .child(
                         row(("play-nav", 1), "Restart".into(), 0x8a8a96).on_click(cx.listener(
                             |this, _, window, cx| {
-                                let Some(path) = this.play.as_mut() else {
+                                let Some(path) = this.play.as_ref() else {
                                     return;
                                 };
-                                path.truncate(1);
-                                let start = path[0];
-                                this.show(start, window);
-                                cx.notify();
+                                // Re-walked rather than truncated, so a conversation that
+                                // opens on an instruction runs it again.
+                                let seed = path[0];
+                                this.start_play(seed, window, cx);
                             },
                         )),
                     ),
@@ -1543,6 +1721,8 @@ impl Editor {
                 (NodeKind::Speech, "Speech", "kind-speech"),
                 (NodeKind::Hub, "Hub", "kind-hub"),
                 (NodeKind::Jump, "Jump", "kind-jump"),
+                (NodeKind::Instruction, "Instruction", "kind-instruction"),
+                (NodeKind::Condition, "Condition", "kind-condition"),
             ]
             .map(|(kind, label, element_id)| {
                 let on = kind == current;
@@ -1569,10 +1749,126 @@ impl Editor {
                                 .edges
                                 .retain(|e| e.from != id || !std::mem::replace(&mut kept, true));
                         }
+                        // Effects and checks are their kind's content, not a property every
+                        // node carries. Leaving them on a node that no longer runs them
+                        // would be the same lie as an undrawn edge out of a jump.
+                        if let Some(node) = this.doc.node_mut(id) {
+                            if kind != NodeKind::Instruction {
+                                node.effects.clear();
+                            }
+                            if kind != NodeKind::Condition {
+                                node.conditions.clear();
+                            }
+                        }
                         cx.notify();
                     }))
             }),
         )
+    }
+
+    /// The content of an instruction or a condition node: what it writes, or what it
+    /// checks. One row per declared variable, cycling nothing → true → false → nothing, so
+    /// there is no add button, no remove button, and no way to name the same variable
+    /// twice. Both kinds share this so the two editors cannot drift apart — the model keeps
+    /// `effects` and `conditions` apart because the *names* would lie, not the widgets.
+    fn var_rows(&self, id: u32, mode: VarRow, cx: &mut Context<Self>) -> impl IntoElement {
+        // ponytail: capped like the sibling panels. Past this the sidebar needs to scroll,
+        // which is the actual fix rather than a bigger cap.
+        const MAX_ROWS: usize = 8;
+
+        let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_color(rgb(0x8a8a96)).child(match mode {
+                VarRow::Sets => "Sets",
+                VarRow::Checks => "Checks",
+            }))
+            .when(self.doc.variables.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child("Declare a variable below first."),
+                )
+            })
+            .children(
+                self.doc
+                    .variables
+                    .iter()
+                    .take(MAX_ROWS)
+                    .enumerate()
+                    .map(|(i, variable)| {
+                        let current = match mode {
+                            VarRow::Sets => self.doc.effect_of(id, &variable.name),
+                            VarRow::Checks => self.doc.condition_of(id, &variable.name),
+                        };
+                        let name = variable.name.clone();
+                        let (glyph, color) = match current {
+                            None => ("—", rgb(0x6c6c78)),
+                            Some(Value::Bool(true)) => ("☑", rgb(0x8ce99a)),
+                            Some(Value::Bool(false)) => ("☐", rgb(0xf7c96a)),
+                        };
+
+                        div()
+                            .id(("var-row", i))
+                            .flex()
+                            .gap_2()
+                            .truncate()
+                            .cursor_pointer()
+                            .text_color(color)
+                            .hover(|style| style.bg(rgb(0x33333c)))
+                            .child(glyph)
+                            .child(variable.name.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let next = match current {
+                                    None => Some(Value::Bool(true)),
+                                    Some(Value::Bool(true)) => Some(Value::Bool(false)),
+                                    Some(Value::Bool(false)) => None,
+                                };
+                                this.doc.checkpoint();
+                                match mode {
+                                    VarRow::Sets => this.doc.set_effect(id, &name, next),
+                                    VarRow::Checks => this.doc.set_condition(id, &name, next),
+                                }
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .when(more > 0, |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child(format!("…and {more} more")),
+                )
+            })
+    }
+
+    /// Flips which pin of a condition an edge leaves by. A discrete edit, so it checkpoints
+    /// outright rather than coalescing, like `end_toggle`.
+    fn branch_toggle(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.doc.edges.get(index).is_some_and(|edge| edge.branch);
+        div()
+            .id("branch-toggle")
+            .flex()
+            .gap_2()
+            .cursor_pointer()
+            .text_color(if on { TRUE_COLOR } else { FALSE_COLOR })
+            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .child(if on {
+                "☑ true branch"
+            } else {
+                "☐ false branch"
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.doc.edges.get(index).is_none() {
+                    return;
+                }
+                this.doc.checkpoint();
+                this.doc.edges[index].branch = !this.doc.edges[index].branch;
+                cx.notify();
+            }))
     }
 
     /// Marks a node as a deliberate ending, which is what keeps it out of the dead-end
@@ -1637,13 +1933,19 @@ impl Editor {
                             .when(kind == NodeKind::Speech, |this| {
                                 this.child(field("Speaker", &self.speaker_input))
                             })
-                            .when(kind != NodeKind::Jump, |this| {
+                            .when(matches!(kind, NodeKind::Speech | NodeKind::Hub), |this| {
                                 let label = if kind == NodeKind::Hub {
                                     "Label"
                                 } else {
                                     "Text"
                                 };
                                 this.child(field(label, &self.text_input))
+                            })
+                            .when(kind == NodeKind::Instruction, |this| {
+                                this.child(self.var_rows(id, VarRow::Sets, cx))
+                            })
+                            .when(kind == NodeKind::Condition, |this| {
+                                this.child(self.var_rows(id, VarRow::Checks, cx))
                             })
                             .when(kind == NodeKind::Speech, |this| {
                                 this.child(self.end_toggle(id, cx))
@@ -1661,12 +1963,23 @@ impl Editor {
                                 .child("Drag any of them to move the group."),
                         ),
                     (None, Selection::Edge(index)) => {
-                        let title = match self.doc.edges.get(*index) {
+                        let index = *index;
+                        let edge = self.doc.edges.get(index);
+                        let title = match edge {
                             Some(edge) => format!("Node {} → Node {}", edge.from, edge.to),
                             None => "Edge".into(),
                         };
+                        // Out of a condition this edge is a pin, not a choice: the player
+                        // never picks it, so a label would be text nobody ever reads.
+                        let from_condition =
+                            edge.is_some_and(|edge| self.doc.is_condition(edge.from));
                         this.child(div().text_color(rgb(0x9ecbff)).child(title))
-                            .child(field("Choice", &self.label_input))
+                            .when(from_condition, |this| {
+                                this.child(self.branch_toggle(index, cx))
+                            })
+                            .when(!from_condition, |this| {
+                                this.child(field("Choice", &self.label_input))
+                            })
                     }
                     _ => this.child(
                         div()
@@ -1761,7 +2074,20 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         // A jump with nothing leaving it is a jump to nowhere, not a conversation ending.
         Problem::DeadEnd(id) if doc.is_jump(*id) => format!("Jump with no target: {}", label(*id)),
         Problem::DeadEnd(id) => format!("Dead end: {}", label(*id)),
+        // "Empty" means holding none of whatever the kind exists to hold.
+        Problem::Empty(id) if doc.is_instruction(*id) => {
+            format!("Sets nothing: {}", label(*id))
+        }
+        Problem::Empty(id) if doc.is_condition(*id) => {
+            format!("Checks nothing: {}", label(*id))
+        }
         Problem::Empty(id) => format!("No text: {}", label(*id)),
+        Problem::UnknownVar(id, var) => {
+            format!("Uses an undeclared variable \"{var}\": {}", label(*id))
+        }
+        Problem::UnwiredBranch(id, branch) => {
+            format!("Nothing on the {branch} branch of: {}", label(*id))
+        }
     }
 }
 
@@ -1836,8 +2162,8 @@ fn node_box(
                         .line_clamp(3)
                         .child(node.text.clone()),
                 ),
-            // A branch point says nothing. It keeps `speaker` as its name, since an
-            // unnamed hub in a graph of hubs is not worth much.
+            // A branch point says nothing, so its `text` is a label for it rather than a
+            // line — an unnamed hub in a graph of hubs is not worth much.
             NodeKind::Hub => this.justify_center().items_center().child(
                 div()
                     .text_color(rgb(0x9a9aa6))
@@ -1857,7 +2183,55 @@ fn node_box(
                         None => "↪ nowhere".into(),
                     }),
             ),
+            // The writes as they read on the page, which is the whole point of logic being
+            // a node: `⚙ paid = true` is legible without opening anything.
+            NodeKind::Instruction => this
+                .justify_center()
+                .child(div().flex_none().text_color(rgb(0x8ce99a)).child("⚙"))
+                .child(
+                    div()
+                        .w_full()
+                        .text_color(rgb(0xd6d6dd))
+                        .text_ellipsis()
+                        .line_clamp(2)
+                        .child(match node.effects.as_slice() {
+                            [] => "(sets nothing)".to_string(),
+                            effects => effects
+                                .iter()
+                                .map(|e| format!("{} = {}", e.var, value_text(e.value)))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        }),
+                ),
+            // The checks as articy writes them — `? paid == true` — with no parser behind
+            // it; the inspector edits them with the same picker an instruction uses.
+            NodeKind::Condition => this
+                .justify_center()
+                .child(div().flex_none().text_color(rgb(0xf7c96a)).child("?"))
+                .child(
+                    div()
+                        .w_full()
+                        .text_color(rgb(0xd6d6dd))
+                        .text_ellipsis()
+                        .line_clamp(2)
+                        .child(match node.conditions.as_slice() {
+                            [] => "(checks nothing)".to_string(),
+                            conditions => conditions
+                                .iter()
+                                .map(|c| format!("{} == {}", c.var, value_text(c.want)))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        }),
+                ),
         })
+}
+
+/// A value as the canvas and the play panel both write it.
+fn value_text(value: Value) -> &'static str {
+    match value {
+        Value::Bool(true) => "true",
+        Value::Bool(false) => "false",
+    }
 }
 
 /// Filled triangle pointing at `tip`, aimed along the direction from `from`.
@@ -1896,6 +2270,13 @@ fn main() {
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
             KeyBinding::new("tab", Branch, Some("Editor")),
+            // Ctrl+1 duplicates Tab so the number row is whole; the menu advertises Tab,
+            // which is the older and better key for the kind you reach for most.
+            KeyBinding::new("ctrl-1", Branch, Some("Editor")),
+            KeyBinding::new("ctrl-2", NewHub, Some("Editor")),
+            KeyBinding::new("ctrl-3", NewJump, Some("Editor")),
+            KeyBinding::new("ctrl-4", NewInstruction, Some("Editor")),
+            KeyBinding::new("ctrl-5", NewCondition, Some("Editor")),
             KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),
