@@ -133,13 +133,16 @@ impl View {
 const UNDO_DEPTH: usize = 50;
 
 /// Everything an undo restores: the document data, minus the history itself.
-type Snapshot = (Vec<Node>, Vec<Edge>, u32);
+type Snapshot = (Vec<Node>, Vec<Edge>, u32, Vec<Variable>);
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Doc {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     next_id: u32,
+    /// `default` so `.dln` files written before variables existed keep loading.
+    #[serde(default)]
+    pub variables: Vec<Variable>,
     // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
     #[serde(skip)]
     undo: Vec<Snapshot>,
@@ -180,6 +183,27 @@ pub struct Node {
     pub end: bool,
     #[serde(default)]
     pub kind: NodeKind,
+}
+
+/// What a variable holds. One variant today, but an enum from the start: serde tags it as
+/// `{"Bool": true}`, so adding the int and string the roadmap wants is a pure addition that
+/// leaves every existing `.dln` loading unchanged.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Value {
+    Bool(bool),
+}
+
+/// A global flag the dialogue reads and writes.
+///
+/// Keyed by `name` rather than by an id — unlike the plan for entities — because the name
+/// is what a `.dln` diff and a merge have to stay readable through, and there are few
+/// enough variables that [`Doc::add_variable`] can simply enforce uniqueness. A rename is
+/// then a find-and-replace over whatever references it.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Variable {
+    pub name: String,
+    /// The value a play-through starts from.
+    pub default: Value,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -507,14 +531,56 @@ impl Doc {
         })
     }
 
-    fn snapshot(&self) -> Snapshot {
-        (self.nodes.clone(), self.edges.clone(), self.next_id)
+    // ponytail: O(n) like the node lookup, and there are far fewer variables than nodes.
+    pub fn variable(&self, name: &str) -> Option<&Variable> {
+        self.variables.iter().find(|v| v.name == name)
     }
 
-    fn restore(&mut self, (nodes, edges, next_id): Snapshot) {
+    /// Whether [`Doc::add_variable`] would accept this name. Separate so the view can ask
+    /// *before* it checkpoints: a refused add must not leave an empty undo step behind.
+    pub fn variable_name_free(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty() && self.variable(name).is_none()
+    }
+
+    /// Declares a flag, starting out false. False when the name is blank or already taken —
+    /// names are the key, so a duplicate would make every reference ambiguous.
+    pub fn add_variable(&mut self, name: &str) -> bool {
+        if !self.variable_name_free(name) {
+            return false;
+        }
+        self.variables.push(Variable {
+            name: name.trim().to_string(),
+            default: Value::Bool(false),
+        });
+        true
+    }
+
+    pub fn remove_variable(&mut self, name: &str) {
+        self.variables.retain(|v| v.name != name);
+    }
+
+    /// Sets the value a play-through starts this variable from. Unknown names are ignored.
+    pub fn set_default(&mut self, name: &str, value: Value) {
+        if let Some(variable) = self.variables.iter_mut().find(|v| v.name == name) {
+            variable.default = value;
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        (
+            self.nodes.clone(),
+            self.edges.clone(),
+            self.next_id,
+            self.variables.clone(),
+        )
+    }
+
+    fn restore(&mut self, (nodes, edges, next_id, variables): Snapshot) {
         self.nodes = nodes;
         self.edges = edges;
         self.next_id = next_id;
+        self.variables = variables;
     }
 
     /// Records the current state so the next mutation can be undone. Every mutation
@@ -1245,6 +1311,93 @@ mod tests {
         // next_id survived, so new nodes cannot collide with loaded ones.
         let fresh = restored.add_node(0.0, 0.0);
         assert!(original.node(fresh).is_none());
+    }
+
+    #[test]
+    fn variables_round_trip() {
+        let mut original = Doc::sample();
+        original.add_variable("has_key");
+        original.add_variable("paid");
+        original.set_default("paid", Value::Bool(true));
+
+        let restored = Doc::from_json(&original.to_json()).expect("round trip");
+
+        assert_eq!(restored.variables, original.variables);
+        assert_eq!(
+            restored.variable("paid").map(|v| v.default),
+            Some(Value::Bool(true))
+        );
+    }
+
+    /// Variables arrived after the format did, so every `.dln` written before them must
+    /// still open — with no variables and no complaint.
+    #[test]
+    fn a_document_without_variables_loads() {
+        let doc = Doc::from_json(r#"{"nodes": [], "edges": [], "next_id": 0}"#).expect("loads");
+        assert!(doc.variables.is_empty());
+    }
+
+    #[test]
+    fn a_variable_name_is_unique_and_not_blank() {
+        let mut doc = Doc::default();
+
+        assert!(doc.add_variable("has_key"));
+        assert!(!doc.add_variable("has_key"), "already declared");
+        assert!(!doc.add_variable("   "), "a blank name keys nothing");
+        assert!(doc.add_variable("  paid  "), "trimmed, not rejected");
+
+        assert!(doc.variable("paid").is_some(), "stored under the trim");
+        assert_eq!(doc.variables.len(), 2);
+
+        // The view checkpoints only when this says yes, so the two must never disagree.
+        for name in ["has_key", "  paid  ", "", "   "] {
+            assert!(!doc.variable_name_free(name), "{name:?} is not free");
+        }
+        assert!(doc.variable_name_free("door_open"));
+    }
+
+    #[test]
+    fn set_default_reads_back() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+
+        assert_eq!(
+            doc.variable("paid").map(|v| v.default),
+            Some(Value::Bool(false)),
+            "a fresh flag starts false"
+        );
+
+        doc.set_default("paid", Value::Bool(true));
+        assert_eq!(
+            doc.variable("paid").map(|v| v.default),
+            Some(Value::Bool(true))
+        );
+
+        doc.set_default("nonexistent", Value::Bool(true));
+        assert_eq!(doc.variables.len(), 1, "an unknown name declares nothing");
+    }
+
+    /// Variables are document state, so they ride in the snapshot with everything else.
+    /// This is the test that catches them being left out of it.
+    #[test]
+    fn undo_restores_a_deleted_variable() {
+        let mut doc = Doc::default();
+        doc.add_variable("has_key");
+        doc.set_default("has_key", Value::Bool(true));
+
+        doc.checkpoint();
+        doc.remove_variable("has_key");
+        assert!(doc.variable("has_key").is_none());
+
+        assert!(doc.undo());
+        assert_eq!(
+            doc.variable("has_key").map(|v| v.default),
+            Some(Value::Bool(true)),
+            "the default came back with it"
+        );
+
+        assert!(doc.redo());
+        assert!(doc.variable("has_key").is_none());
     }
 
     #[test]

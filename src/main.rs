@@ -2,8 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeKind, PORT_R, Problem, Severity, View, clear_backup,
-    in_port, node_center, out_port, read_backup, with_default_extension,
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeKind, PORT_R, Problem, Severity, Value, View,
+    clear_backup, in_port, node_center, out_port, read_backup, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -144,6 +144,9 @@ struct Editor {
     label_input: Entity<TextInput>,
     /// Search query. Deliberately outside the `sync_fields` loop — it is not document content.
     search_input: Entity<TextInput>,
+    /// Name for a variable about to be declared. Outside the `sync_fields` loop for the
+    /// same reason `search_input` is: it is not content of the selected node.
+    var_input: Entity<TextInput>,
     /// What is currently loaded into the sidebar fields.
     edited: Selection,
     /// Whether this editing session already pushed an undo checkpoint.
@@ -252,10 +255,13 @@ impl Editor {
                 .detach();
         }
 
-        // The search field is not document content, so it stays out of the loop above and
-        // only asks for a re-render — without this, typing would not refresh the results.
+        // Neither of these is document content, so they stay out of the loop above and only
+        // ask for a re-render — without this, typing would not refresh what they drive.
         let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
-        cx.observe(&search_input, |_, _, cx| cx.notify()).detach();
+        let var_input = cx.new(|cx| TextInput::new("New flag", cx));
+        for input in [&search_input, &var_input] {
+            cx.observe(input, |_, _, cx| cx.notify()).detach();
+        }
 
         // Crash copies, for as long as the window lives. Spawning during construction is
         // fine: the entity slot exists before this closure runs, and the task cannot be
@@ -280,6 +286,7 @@ impl Editor {
             text_input,
             label_input,
             search_input,
+            var_input,
             edited: Selection::None,
             text_dirty: false,
             path: None,
@@ -1247,6 +1254,112 @@ impl Editor {
             })
     }
 
+    /// The document's flags and the value each one starts a play-through from. Not
+    /// selection-scoped like the inspector, so it stays up during play too.
+    fn vars_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /// Lower than the other panels' cap: the sidebar does not scroll, and the problems
+        /// list sits below this one and must not get pushed off the bottom.
+        const MAX_ROWS: usize = 8;
+
+        let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            // Named as a start value, not a value: nothing reads these yet, and once play
+            // does (with effects), this panel has to say which of the two it is showing.
+            .child(div().text_color(rgb(0x8a8a96)).child("Variables (start)"))
+            .children(
+                self.doc
+                    .variables
+                    .iter()
+                    .take(MAX_ROWS)
+                    .enumerate()
+                    .map(|(i, variable)| {
+                        let Value::Bool(on) = variable.default;
+                        let name = variable.name.clone();
+                        let to_remove = variable.name.clone();
+
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("var-toggle", i))
+                                    .flex()
+                                    .gap_2()
+                                    .flex_grow()
+                                    .truncate()
+                                    .cursor_pointer()
+                                    .text_color(if on { rgb(0xf7c96a) } else { rgb(0xb8b8c4) })
+                                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                                    .child(if on { "☑" } else { "☐" })
+                                    .child(variable.name.clone())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.doc.checkpoint();
+                                        this.doc.set_default(&name, Value::Bool(!on));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("var-remove", i))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(rgb(0x6c6c78))
+                                    .hover(|style| style.text_color(rgb(0xff7a7a)))
+                                    .child("×")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.doc.checkpoint();
+                                        this.doc.remove_variable(&to_remove);
+                                        cx.notify();
+                                    })),
+                            )
+                    }),
+            )
+            .when(more > 0, |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child(format!("…and {more} more")),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_grow().child(self.var_input.clone()))
+                    // No `TextInput` in the crate binds enter, so the click is the whole
+                    // affordance. A blank or duplicate name is simply refused, and the
+                    // field keeping its content is what says so.
+                    .child(
+                        div()
+                            .id("var-add")
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(rgb(0x2b2b33))
+                            .text_color(rgb(0x8a8a96))
+                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                            .child("+")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let name = this.var_input.read(cx).content().to_string();
+                                if !this.doc.variable_name_free(&name) {
+                                    return;
+                                }
+                                this.doc.checkpoint();
+                                this.doc.add_variable(&name);
+                                this.var_input
+                                    .update(cx, |input, cx| input.set_content("", cx));
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     /// The conversation as a reader meets it: what the current node says, and the choices
     /// leading out of it. Replaces the inspector while it is up, so the sidebar is never
     /// both an editor and a player.
@@ -1562,6 +1675,9 @@ impl Editor {
                     ),
                 })
             })
+            // Outside the `play.is_none()` guard above: variables belong to the document
+            // rather than to the selection, so they stay readable during a play-through.
+            .child(self.vars_panel(cx))
             .child(self.problems_panel(cx))
             .child(
                 div()
