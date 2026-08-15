@@ -2,8 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, PORT_R, Problem, Severity, View, clear_backup, in_port,
-    node_center, out_port, read_backup, with_default_extension,
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeKind, PORT_R, Problem, Severity, View, clear_backup,
+    in_port, node_center, out_port, read_backup, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -625,12 +625,14 @@ impl Editor {
     }
 
     /// One entry per edge: the line from the source's out-port to the target's in-port,
-    /// and whether it is the selected edge.
+    /// and whether it is the selected edge. An edge leaving a jump is not drawn at all —
+    /// the node itself names its target, which is the whole point of the kind.
     fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, bool)> {
         self.doc
             .edges
             .iter()
             .enumerate()
+            .filter(|(_, e)| !self.doc.is_jump(e.from))
             .filter_map(|(index, e)| {
                 let from = self.doc.node(e.from)?;
                 let to = self.doc.node(e.to)?;
@@ -945,7 +947,10 @@ impl Editor {
             .or_else(|| self.doc.nodes.first().map(|n| n.id))
     }
 
+    /// Both entry points resolve jumps, so a jump never lands in the path — it is an
+    /// authoring convenience, not a step the player takes.
     fn start_play(&mut self, at: u32, window: &Window, cx: &mut Context<Self>) {
+        let at = self.doc.resolve_jump(at);
         self.play = Some(vec![at]);
         self.show(at, window);
         cx.notify();
@@ -953,6 +958,7 @@ impl Editor {
 
     /// Advances the play-through, or ends it if the choice leads nowhere real.
     fn play_advance(&mut self, to: u32, window: &Window, cx: &mut Context<Self>) {
+        let to = self.doc.resolve_jump(to);
         if let Some(path) = self.play.as_mut() {
             path.push(to);
             self.show(to, window);
@@ -1128,11 +1134,17 @@ impl Editor {
             .children(self.edge_labels())
             .children(self.doc.nodes.iter().map(|node| {
                 let playing = self.play.as_ref().and_then(|path| path.last().copied());
+                let jump_target = (node.kind == NodeKind::Jump)
+                    .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
+                    .flatten()
+                    .and_then(|to| self.doc.node(to))
+                    .map(node_label);
                 node_box(
                     node,
                     view,
                     self.selection.nodes().contains(&node.id),
                     playing == Some(node.id),
+                    jump_target,
                 )
             }))
             .children(self.doc.nodes.iter().map(|node| port_dot(node, view)))
@@ -1158,7 +1170,7 @@ impl Editor {
         self.doc
             .edges
             .iter()
-            .filter(|edge| !edge.label.is_empty())
+            .filter(|edge| !edge.label.is_empty() && !self.doc.is_jump(edge.from))
             .filter_map(|edge| {
                 let from = out_port(self.doc.node(edge.from)?);
                 let to = in_port(self.doc.node(edge.to)?);
@@ -1406,6 +1418,50 @@ impl Editor {
             })
     }
 
+    /// What the node is. Switching to a jump drops every outgoing edge but the first,
+    /// keeping the one-target invariant `Doc::add_edge` enforces — otherwise the extra
+    /// edges would stop being drawn and the canvas would quietly lie about the graph. It
+    /// is checkpointed like any other edit, so an undo brings them back.
+    fn kind_picker(&self, id: u32, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
+
+        div().flex().gap_1().children(
+            [
+                (NodeKind::Speech, "Speech", "kind-speech"),
+                (NodeKind::Hub, "Hub", "kind-hub"),
+                (NodeKind::Jump, "Jump", "kind-jump"),
+            ]
+            .map(|(kind, label, element_id)| {
+                let on = kind == current;
+                div()
+                    .id(element_id)
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(if on { rgb(0x3a3a44) } else { rgb(0x2b2b33) })
+                    .text_color(if on { rgb(0xd6d6dd) } else { rgb(0x8a8a96) })
+                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.doc.node(id).is_none_or(|node| node.kind == kind) {
+                            return;
+                        }
+                        this.doc.checkpoint();
+                        if let Some(node) = this.doc.node_mut(id) {
+                            node.kind = kind;
+                        }
+                        if kind == NodeKind::Jump {
+                            let mut kept = false;
+                            this.doc
+                                .edges
+                                .retain(|e| e.from != id || !std::mem::replace(&mut kept, true));
+                        }
+                        cx.notify();
+                    }))
+            }),
+        )
+    }
+
     /// Marks a node as a deliberate ending, which is what keeps it out of the dead-end
     /// warnings. A discrete edit, so it checkpoints outright rather than coalescing.
     fn end_toggle(&self, id: u32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1459,11 +1515,27 @@ impl Editor {
             })
             .when(self.play.is_none(), |this| {
                 this.map(|this| match (self.selection.only_node(), &self.selection) {
-                    (Some(id), _) => this
-                        .child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
-                        .child(field("Speaker", &self.speaker_input))
-                        .child(field("Text", &self.text_input))
-                        .child(self.end_toggle(id, cx)),
+                    (Some(id), _) => {
+                        // Each kind shows the fields it actually has: a jump has none of
+                        // its own, and a hub has no speaker because nobody speaks at one.
+                        let kind = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
+                        this.child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
+                            .child(self.kind_picker(id, cx))
+                            .when(kind == NodeKind::Speech, |this| {
+                                this.child(field("Speaker", &self.speaker_input))
+                            })
+                            .when(kind != NodeKind::Jump, |this| {
+                                let label = if kind == NodeKind::Hub {
+                                    "Label"
+                                } else {
+                                    "Text"
+                                };
+                                this.child(field(label, &self.text_input))
+                            })
+                            .when(kind == NodeKind::Speech, |this| {
+                                this.child(self.end_toggle(id, cx))
+                            })
+                    }
                     (None, Selection::Nodes(ids)) => this
                         .child(
                             div()
@@ -1570,6 +1642,8 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
         Problem::NoStart => "No start node — every node is linked to".into(),
         Problem::Unreachable(id) => format!("Unreachable: {}", label(*id)),
+        // A jump with nothing leaving it is a jump to nowhere, not a conversation ending.
+        Problem::DeadEnd(id) if doc.is_jump(*id) => format!("Jump with no target: {}", label(*id)),
         Problem::DeadEnd(id) => format!("Dead end: {}", label(*id)),
         Problem::Empty(id) => format!("No text: {}", label(*id)),
     }
@@ -1590,7 +1664,18 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
         .border_color(rgb(0x7d7d8c))
 }
 
-fn node_box(node: &Node, view: View, selected: bool, playing: bool) -> impl IntoElement {
+/// `jump_target` is the label of the node a jump points at, resolved by the caller.
+///
+/// Every kind keeps the same `NODE_W`×`NODE_H` footprint on purpose: hit-testing is
+/// arithmetic over those constants in `doc.rs`, so a box drawn smaller than it is clicked
+/// would put the two out of step. Kinds differ in what they draw, never in how big.
+fn node_box(
+    node: &Node,
+    view: View,
+    selected: bool,
+    playing: bool,
+    jump_target: Option<String>,
+) -> impl IntoElement {
     let (x, y) = view.to_screen((node.x, node.y));
     div()
         .absolute()
@@ -1617,22 +1702,46 @@ fn node_box(node: &Node, view: View, selected: bool, playing: bool) -> impl Into
         })
         .rounded_md()
         .shadow_md()
-        .child(
-            div()
-                .flex_none()
-                .w_full()
-                .text_color(rgb(0x9ecbff))
-                .truncate()
-                .child(node.speaker.clone()),
-        )
-        .child(
-            div()
-                .w_full()
-                .text_color(rgb(0xd6d6dd))
-                .text_ellipsis()
-                .line_clamp(3)
-                .child(node.text.clone()),
-        )
+        .map(|this| match node.kind {
+            NodeKind::Speech => this
+                .child(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .text_color(rgb(0x9ecbff))
+                        .truncate()
+                        .child(node.speaker.clone()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_color(rgb(0xd6d6dd))
+                        .text_ellipsis()
+                        .line_clamp(3)
+                        .child(node.text.clone()),
+                ),
+            // A branch point says nothing. It keeps `speaker` as its name, since an
+            // unnamed hub in a graph of hubs is not worth much.
+            NodeKind::Hub => this.justify_center().items_center().child(
+                div()
+                    .text_color(rgb(0x9a9aa6))
+                    .truncate()
+                    .child(match node.text.trim() {
+                        "" => "◇".to_string(),
+                        label => format!("◇ {label}"),
+                    }),
+            ),
+            NodeKind::Jump => this.justify_center().child(
+                div()
+                    .w_full()
+                    .text_color(rgb(0xc3a6f7))
+                    .truncate()
+                    .child(match jump_target {
+                        Some(target) => format!("↪ {target}"),
+                        None => "↪ nowhere".into(),
+                    }),
+            ),
+        })
 }
 
 /// Filled triangle pointing at `tip`, aimed along the direction from `from`.

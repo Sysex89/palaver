@@ -150,6 +150,23 @@ pub struct Doc {
     dirty: bool,
 }
 
+/// What a node *is*. Deliberately not where `Node::end` lives: an ending has text
+/// ("Farewell, traveller.") — it is a `Speech` node that happens to terminate, so the two
+/// stay orthogonal rather than folding into one enum.
+#[derive(Clone, Copy, Default, PartialEq, Debug, Serialize, Deserialize)]
+pub enum NodeKind {
+    /// A line of dialogue: the only kind before this field existed, and so the `default`
+    /// every un-migrated `.dln` node loads as.
+    #[default]
+    Speech,
+    /// A branch point with no dialogue of its own.
+    Hub,
+    /// A link to a distant node, so the graph stays legible without an edge dragged all
+    /// the way across it. Its target is an ordinary [`Edge`] — this kind only changes how
+    /// that edge is *drawn*, which is why nothing else in this file has to know about it.
+    Jump,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: u32,
@@ -161,6 +178,8 @@ pub struct Node {
     /// `default` so `.dln` files written before this field keep loading.
     #[serde(default)]
     pub end: bool,
+    #[serde(default)]
+    pub kind: NodeKind,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -298,10 +317,12 @@ impl Doc {
                 .filter(|n| !n.end && !self.edges.iter().any(|e| e.from == n.id))
                 .map(|n| Problem::DeadEnd(n.id)),
         );
+        // Only dialogue is missing anything when it has no text: a hub and a jump are
+        // textless by definition, the way an `end` node is childless by definition.
         found.extend(
             self.nodes
                 .iter()
-                .filter(|n| n.text.trim().is_empty())
+                .filter(|n| n.kind == NodeKind::Speech && n.text.trim().is_empty())
                 .map(|n| Problem::Empty(n.id)),
         );
 
@@ -320,8 +341,32 @@ impl Doc {
             speaker: String::new(),
             text: String::new(),
             end: false,
+            kind: NodeKind::Speech,
         });
         id
+    }
+
+    pub fn is_jump(&self, id: u32) -> bool {
+        self.node(id).is_some_and(|n| n.kind == NodeKind::Jump)
+    }
+
+    /// Where a play-through actually lands when sent to `id`: a jump is an authoring
+    /// convenience the player never sees, so walk through it to the node it points at.
+    /// Guarded against a jump cycle the same way [`Doc::start_of`] is, and stops on the
+    /// last good node when a jump has no target.
+    pub fn resolve_jump(&self, id: u32) -> u32 {
+        let mut current = id;
+        let mut seen = HashSet::from([current]);
+        while self.is_jump(current) {
+            let Some(next) = self.choices(current).first().map(|(to, _)| *to) else {
+                break;
+            };
+            if !seen.insert(next) {
+                break;
+            }
+            current = next;
+        }
+        current
     }
 
     // ponytail: O(n) node lookup, add a HashMap index past ~2k nodes.
@@ -403,9 +448,14 @@ impl Doc {
         self.edges.iter().any(|e| e.from == from && e.to == to)
     }
 
-    /// Connects two nodes. False when the edge would be a self-loop or a duplicate.
+    /// Connects two nodes. False when the edge would be a self-loop or a duplicate, or
+    /// would be a second target for a jump — a jump points at exactly one node, and a
+    /// second edge would leave the canvas badge naming one of several.
     pub fn add_edge(&mut self, from: u32, to: u32) -> bool {
         if from == to || self.has_edge(from, to) {
+            return false;
+        }
+        if self.is_jump(from) && self.edges.iter().any(|e| e.from == from) {
             return false;
         }
         self.edges.push(Edge {
@@ -542,7 +592,10 @@ impl Doc {
         true
     }
 
-    /// A small hardcoded conversation, including one branch.
+    /// A small hardcoded conversation. Deliberately shows one of each node kind: the
+    /// opening branch is plain dialogue, the innkeeper's answer opens onto a *hub* of
+    /// follow-up questions, and each answered question returns through a single *jump*
+    /// rather than an edge dragged all the way back across the canvas.
     pub fn sample() -> Doc {
         let mut doc = Doc::default();
         let node = |doc: &mut Doc, x, y, speaker: &str, text: &str| {
@@ -551,6 +604,13 @@ impl Doc {
             n.speaker = speaker.into();
             n.text = text.into();
             id
+        };
+        let edge = |doc: &mut Doc, from, to, label: &str| {
+            doc.edges.push(Edge {
+                from,
+                to,
+                label: label.into(),
+            });
         };
 
         let greet = node(
@@ -571,28 +631,45 @@ impl Doc {
         );
         let sulk = node(&mut doc, 660.0, 380.0, "Innkeeper", "Suit yourself.");
 
-        doc.edges = vec![
-            Edge {
-                from: greet,
-                to: ask,
-                label: "Ask".into(),
-            },
-            Edge {
-                from: greet,
-                to: rude,
-                label: "Refuse".into(),
-            },
-            Edge {
-                from: ask,
-                to: answer,
-                label: String::new(),
-            },
-            Edge {
-                from: rude,
-                to: sulk,
-                label: String::new(),
-            },
-        ];
+        // The hub is the point the conversation keeps coming back to. Nobody speaks at
+        // one, so it has a label and no speaker.
+        let more = doc.add_node(960.0, 140.0);
+        let n = doc.node_mut(more).unwrap();
+        n.kind = NodeKind::Hub;
+        n.text = "Anything else?".into();
+
+        let rooms = node(
+            &mut doc,
+            1260.0,
+            20.0,
+            "Innkeeper",
+            "Two coppers a night, and the fire stays lit.",
+        );
+        let pass = node(
+            &mut doc,
+            1260.0,
+            160.0,
+            "Innkeeper",
+            "Snowed shut since Tuesday. Nobody's crossing.",
+        );
+        let farewell = node(&mut doc, 1260.0, 300.0, "Innkeeper", "Safe travels, then.");
+
+        // One jump serves every branch that returns to the hub, so the canvas carries no
+        // long edge doubling back across it.
+        let back = doc.add_node(1560.0, 90.0);
+        doc.node_mut(back).unwrap().kind = NodeKind::Jump;
+
+        edge(&mut doc, greet, ask, "Ask");
+        edge(&mut doc, greet, rude, "Refuse");
+        edge(&mut doc, ask, answer, "");
+        edge(&mut doc, rude, sulk, "");
+        edge(&mut doc, answer, more, "");
+        edge(&mut doc, more, rooms, "A room for the night?");
+        edge(&mut doc, more, pass, "Is the pass open?");
+        edge(&mut doc, more, farewell, "That's all.");
+        edge(&mut doc, rooms, back, "Ask something else");
+        edge(&mut doc, pass, back, "Ask something else");
+        edge(&mut doc, back, more, "");
         doc
     }
 }
@@ -626,6 +703,34 @@ mod tests {
                 .filter(|e| e.from == doc.nodes[0].id)
                 .count(),
             2
+        );
+    }
+
+    /// The sample is the first thing anyone sees, so it has to keep demonstrating both
+    /// kinds: a hub several questions hang off, and a jump that returns to it.
+    #[test]
+    fn sample_shows_a_hub_and_a_jump() {
+        let doc = Doc::sample();
+        let of_kind = |kind| {
+            doc.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .collect::<Vec<_>>()
+        };
+
+        let [hub] = of_kind(NodeKind::Hub)[..] else {
+            panic!("the sample lost its hub");
+        };
+        let [jump] = of_kind(NodeKind::Jump)[..] else {
+            panic!("the sample lost its jump");
+        };
+
+        assert!(doc.choices(hub.id).len() > 1, "a hub is a branch point");
+        assert!(hub.speaker.is_empty(), "nobody speaks at a hub");
+        assert_eq!(doc.resolve_jump(jump.id), hub.id, "the jump returns to it");
+        assert!(
+            doc.edges.iter().filter(|e| e.to == jump.id).count() > 1,
+            "one jump serves several branches, which is the point of it"
         );
     }
 
@@ -919,6 +1024,92 @@ mod tests {
 
         doc.node_mut(last).unwrap().end = true;
         assert!(!doc.problems().contains(&Problem::DeadEnd(last)));
+    }
+
+    #[test]
+    fn textless_kinds_are_not_empty_nodes() {
+        let mut doc = Doc::default();
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let hub = doc.add_node(300.0, 0.0);
+        let jump = doc.add_node(600.0, 0.0);
+        doc.add_edge(start, hub);
+        doc.add_edge(hub, jump);
+        doc.add_edge(jump, start);
+        assert!(
+            doc.problems().contains(&Problem::Empty(hub)),
+            "a speech node with no text is still a fault"
+        );
+
+        doc.node_mut(hub).unwrap().kind = NodeKind::Hub;
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let problems = doc.problems();
+        assert!(!problems.contains(&Problem::Empty(hub)));
+        assert!(!problems.contains(&Problem::Empty(jump)));
+        assert!(!problems.contains(&Problem::Empty(start)));
+    }
+
+    #[test]
+    fn a_jump_takes_only_one_target() {
+        let mut doc = Doc::default();
+        let jump = doc.add_node(0.0, 0.0);
+        let first = spoken(&mut doc, 300.0, 0.0);
+        let second = spoken(&mut doc, 300.0, 200.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+
+        assert!(doc.add_edge(jump, first));
+        assert!(!doc.add_edge(jump, second), "a jump points at one node");
+        assert_eq!(doc.choices(jump), vec![(first, "")]);
+    }
+
+    #[test]
+    fn resolve_jump_walks_to_the_node_behind_it() {
+        let mut doc = Doc::default();
+        let first = doc.add_node(0.0, 0.0);
+        let second = doc.add_node(300.0, 0.0);
+        let landing = spoken(&mut doc, 600.0, 0.0);
+        doc.node_mut(first).unwrap().kind = NodeKind::Jump;
+        doc.node_mut(second).unwrap().kind = NodeKind::Jump;
+        doc.add_edge(first, second);
+        doc.add_edge(second, landing);
+
+        assert_eq!(doc.resolve_jump(first), landing, "through a chain of jumps");
+        assert_eq!(
+            doc.resolve_jump(landing),
+            landing,
+            "speech resolves to itself"
+        );
+    }
+
+    #[test]
+    fn resolve_jump_terminates_in_a_cycle() {
+        let mut doc = Doc::default();
+        let first = doc.add_node(0.0, 0.0);
+        let second = doc.add_node(300.0, 0.0);
+        doc.node_mut(first).unwrap().kind = NodeKind::Jump;
+        doc.node_mut(second).unwrap().kind = NodeKind::Jump;
+        doc.add_edge(first, second);
+        doc.add_edge(second, first);
+
+        assert_eq!(
+            doc.resolve_jump(first),
+            second,
+            "stops rather than spinning"
+        );
+
+        let orphan = doc.add_node(600.0, 0.0);
+        doc.node_mut(orphan).unwrap().kind = NodeKind::Jump;
+        assert_eq!(doc.resolve_jump(orphan), orphan, "a jump with no target");
+    }
+
+    #[test]
+    fn a_node_without_a_kind_loads_as_speech() {
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":0,"x":1.0,"y":2.0,"speaker":"Innkeeper","text":"Hm."}],
+                "edges":[],"next_id":1}"#,
+        )
+        .expect("a pre-NodeKind document still loads");
+        assert_eq!(doc.node(0).unwrap().kind, NodeKind::Speech);
+        assert!(!doc.node(0).unwrap().end);
     }
 
     #[test]
