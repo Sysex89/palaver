@@ -1,0 +1,5 @@
+# Dialogue graphs do not merge line-wise: node ids come from a shared counter, so two
+# branches that each add a node mint the same id and git can merge that cleanly into a
+# corrupt document. Refuse the auto-merge and pick a side by hand.
+# Lift this once ids are random rather than sequential — see Roadmap in CLAUDE.md.
+*.dln -merge

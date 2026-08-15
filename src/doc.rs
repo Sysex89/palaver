@@ -483,8 +483,10 @@ impl Doc {
         self.dirty
     }
 
+    /// Trailing newline so a committed `.dln` is a well-formed text file and git stops
+    /// reporting "\ No newline at end of file" on every diff.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("a document always serializes")
+        serde_json::to_string_pretty(self).expect("a document always serializes") + "\n"
     }
 
     pub fn from_json(json: &str) -> serde_json::Result<Doc> {
