@@ -44,8 +44,11 @@ actions!(
 /// Height of the menu bar. Mouse positions are window-relative, so this is also the
 /// offset between window coordinates and the canvas pane below the bar.
 const MENU_H: f32 = 30.0;
-/// Width of the inspector on the right. With [`MENU_H`], this is what bounds the canvas.
+/// Width of the inspector on the right.
 const SIDEBAR_W: f32 = 280.0;
+/// Width of the global-variables pane on the left. With [`SIDEBAR_W`] and [`MENU_H`], this
+/// is what bounds the canvas — and what `window_pos` has to subtract off every mouse event.
+const VARS_W: f32 = 200.0;
 
 /// How much one pixel of scroll changes the zoom. Multiplicative, so a scroll up and an
 /// equal scroll down cancel out exactly.
@@ -646,9 +649,11 @@ impl Editor {
         }
     }
 
-    /// Mouse positions arrive in window coordinates; the canvas starts below the menu bar.
+    /// Mouse positions arrive in window coordinates; the canvas pane starts below the menu
+    /// bar and to the right of the variables pane. Miss either offset and every hit test in
+    /// the editor is wrong by that much.
     fn window_pos(pos: Point<Pixels>) -> (f32, f32) {
-        (f32::from(pos.x), f32::from(pos.y) - MENU_H)
+        (f32::from(pos.x) - VARS_W, f32::from(pos.y) - MENU_H)
     }
 
     fn doc_pos(&self, pos: Point<Pixels>) -> (f32, f32) {
@@ -665,7 +670,7 @@ impl Editor {
     fn pane_center(window: &Window) -> (f32, f32) {
         let size = window.viewport_size();
         (
-            (f32::from(size.width) - SIDEBAR_W) / 2.0,
+            (f32::from(size.width) - SIDEBAR_W - VARS_W) / 2.0,
             (f32::from(size.height) - MENU_H) / 2.0,
         )
     }
@@ -1122,6 +1127,7 @@ impl Render for Editor {
                     .flex_row()
                     .flex_1()
                     .overflow_hidden()
+                    .child(self.vars_pane(cx))
                     .child(self.canvas_pane(lines, pending, view, cx))
                     .child(self.sidebar(cx)),
             )
@@ -1368,14 +1374,17 @@ impl Editor {
             })
     }
 
-    /// The document's flags. Not selection-scoped like the inspector, so it stays up
-    /// during play — where it switches from showing what each variable *starts* at to what
-    /// it stands at now, and goes read-only, since a click that edited a default while the
-    /// panel displayed a live value would be editing one thing and showing another.
-    fn vars_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        /// Lower than the other panels' cap: the sidebar does not scroll, and the problems
-        /// list sits below this one and must not get pushed off the bottom.
-        const MAX_ROWS: usize = 8;
+    /// The document's global variables, in a pane of their own on the left — they belong to
+    /// the whole document rather than to whatever is selected, which is the one thing the
+    /// right-hand inspector is for.
+    ///
+    /// It stays up during play, where it switches from showing what each variable *starts*
+    /// at to what it stands at now, and goes read-only: a click that edited a default while
+    /// the pane displayed a live value would be editing one thing and showing another.
+    fn vars_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // ponytail: the pane does not scroll, so a long list would run off the bottom.
+        // Scrolling is the real fix; a bigger cap is not.
+        const MAX_ROWS: usize = 20;
 
         let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
         let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
@@ -1384,6 +1393,14 @@ impl Editor {
             .flex()
             .flex_col()
             .gap_1()
+            .w(px(VARS_W))
+            .flex_none()
+            .h_full()
+            .p_3()
+            .bg(rgb(0x26262c))
+            .border_r_1()
+            .border_color(rgb(0x3a3a44))
+            .text_color(rgb(0xd6d6dd))
             .child(div().text_color(rgb(0x8a8a96)).child(match playing {
                 Some(_) => "Variables (now)",
                 None => "Variables (start)",
@@ -1716,7 +1733,9 @@ impl Editor {
     fn kind_picker(&self, id: u32, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
 
-        div().flex().gap_1().children(
+        // Wraps: five labels do not fit across `SIDEBAR_W`, and without this the last kind
+        // is simply clipped off the right edge — present but unreachable.
+        div().flex().flex_wrap().gap_1().children(
             [
                 (NodeKind::Speech, "Speech", "kind-speech"),
                 (NodeKind::Hub, "Hub", "kind-hub"),
@@ -1790,7 +1809,7 @@ impl Editor {
                 this.child(
                     div()
                         .text_color(rgb(0x6c6c78))
-                        .child("Declare a variable below first."),
+                        .child("Declare one in the Variables pane first."),
                 )
             })
             .children(
@@ -1988,9 +2007,6 @@ impl Editor {
                     ),
                 })
             })
-            // Outside the `play.is_none()` guard above: variables belong to the document
-            // rather than to the selection, so they stay readable during a play-through.
-            .child(self.vars_panel(cx))
             .child(self.problems_panel(cx))
             .child(
                 div()
