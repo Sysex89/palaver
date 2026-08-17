@@ -755,6 +755,35 @@ impl Doc {
         dropped
     }
 
+    /// Renames the flag and every effect and check that names it, returning how many
+    /// references moved. The mirror of [`Doc::remove_variable`], and possible at all
+    /// because the name *is* the key: a rename is a find-and-replace, and there is nowhere
+    /// else for a reference to hide. Any third field that ever stores a variable name has
+    /// to join both functions.
+    ///
+    /// Returns 0 without touching anything when nothing is called `from`. The view checks
+    /// [`Doc::variable_name_free`] for `to` before it checkpoints, the same way the add
+    /// does, so a refused rename leaves no empty undo step.
+    pub fn rename_variable(&mut self, from: &str, to: &str) -> usize {
+        let to = to.trim();
+        let Some(variable) = self.variables.iter_mut().find(|v| v.name == from) else {
+            return 0;
+        };
+        variable.name = to.to_string();
+
+        let mut moved = 0;
+        for node in &mut self.nodes {
+            let effects = node.effects.iter_mut().map(|e| &mut e.var);
+            let conditions = node.conditions.iter_mut().map(|c| &mut c.var);
+            for var in effects.chain(conditions).filter(|var| *var == from) {
+                var.clear();
+                var.push_str(to);
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// What this node writes to `var`, if anything.
     pub fn effect_of(&self, id: u32, var: &str) -> Option<Value> {
         self.node(id)?
@@ -1841,6 +1870,78 @@ mod tests {
         assert!(doc.variable("paid").is_some());
         assert_eq!(doc.effect_of(one, "paid"), Some(Value::Bool(true)));
         assert_eq!(doc.effect_of(two, "paid"), Some(Value::Bool(false)));
+    }
+
+    /// The point of the rename: a typo can be fixed without re-ticking every node, which
+    /// deleting and re-declaring would cost. Both reference sites have to move, and the
+    /// count has to cover both.
+    #[test]
+    fn renaming_a_variable_moves_its_effects_and_checks() {
+        let mut doc = Doc::default();
+        doc.add_variable("pade");
+        let writes = sets(&mut doc, "pade", true);
+        let reads = checks(&mut doc, "pade", true);
+
+        assert_eq!(
+            doc.rename_variable("pade", "  paid  "),
+            2,
+            "trimmed on the way in"
+        );
+        assert!(doc.variable("paid").is_some());
+        assert!(doc.variable("pade").is_none(), "the old key is gone");
+        assert_eq!(doc.effect_of(writes, "paid"), Some(Value::Bool(true)));
+        assert_eq!(doc.condition_of(reads, "paid"), Some(Value::Bool(true)));
+        assert!(
+            doc.problems()
+                .iter()
+                .all(|p| !matches!(p, Problem::UnknownVar(..))),
+            "a reference site the rename missed would show up here"
+        );
+    }
+
+    /// A string that changed is not the same as a flag that still works — assert through
+    /// the walk, which is what the author actually notices.
+    #[test]
+    fn a_renamed_variable_still_drives_the_play_walk() {
+        let mut doc = Doc::default();
+        doc.add_variable("pade");
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let writes = sets(&mut doc, "pade", true);
+        doc.add_edge(start, writes);
+        doc.rename_variable("pade", "paid");
+
+        let mut path = doc.start_walk(start);
+        doc.advance(&mut path, writes);
+        assert_eq!(
+            doc.vars_along(&path).get("paid"),
+            Some(&Value::Bool(true)),
+            "the instruction still writes the flag it was pointed at"
+        );
+    }
+
+    #[test]
+    fn renaming_a_flag_nothing_declares_does_nothing() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let node = sets(&mut doc, "paid", true);
+
+        assert_eq!(doc.rename_variable("ghost", "spectre"), 0);
+        assert!(doc.variable("spectre").is_none());
+        assert_eq!(doc.effect_of(node, "paid"), Some(Value::Bool(true)));
+    }
+
+    /// The view gates on this before it checkpoints, so a refused rename must be refusable
+    /// without touching the document — including a rename to the name it already has.
+    #[test]
+    fn the_rename_gate_refuses_a_taken_or_blank_name() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        doc.add_variable("has_key");
+
+        assert!(!doc.variable_name_free("has_key"), "already taken");
+        assert!(!doc.variable_name_free("paid"), "its own name is taken too");
+        assert!(!doc.variable_name_free("  "), "a blank name keys nothing");
+        assert!(doc.variable_name_free("asked"));
     }
 
     #[test]

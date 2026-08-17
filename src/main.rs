@@ -181,6 +181,11 @@ struct Editor {
     /// Name for a variable about to be declared. Outside the `sync_fields` loop for the
     /// same reason `search_input` is: it is not content of the selected node.
     var_input: Entity<TextInput>,
+    /// The variable `var_input` is renaming, or `None` when it is declaring a new one. The
+    /// panel has one field and two jobs; this is which. Never cleared on a document swap —
+    /// `vars_pane` filters a name the document no longer has, which covers the swap, an
+    /// undo and a delete in one place instead of three that can be forgotten.
+    renaming: Option<String>,
     /// What is currently loaded into the sidebar fields.
     edited: Selection,
     /// Whether this editing session already pushed an undo checkpoint.
@@ -329,6 +334,7 @@ impl Editor {
             label_input,
             search_input,
             var_input,
+            renaming: None,
             edited: Selection::None,
             text_dirty: false,
             path: None,
@@ -1388,6 +1394,13 @@ impl Editor {
 
         let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
         let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
+        // A rename the document has moved on from — undone, deleted, or in a file that has
+        // since been closed — is simply not a rename any more.
+        let renaming = self
+            .renaming
+            .clone()
+            .filter(|name| self.doc.variable(name).is_some());
+        let is_rename = renaming.is_some();
 
         div()
             .flex()
@@ -1418,6 +1431,7 @@ impl Editor {
                             .unwrap_or(variable.default);
                         let Value::Bool(on) = shown;
                         let name = variable.name.clone();
+                        let to_rename = variable.name.clone();
                         let to_remove = variable.name.clone();
 
                         div()
@@ -1445,6 +1459,25 @@ impl Editor {
                             )
                             .when(playing.is_none(), |this| {
                                 this.child(
+                                    div()
+                                        .id(("var-rename", i))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(rgb(0x6c6c78))
+                                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                                        .child("✎")
+                                        // Not an edit yet, so no checkpoint — it only aims
+                                        // the field the declare button already uses.
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.renaming = Some(to_rename.clone());
+                                            this.var_input.update(cx, |input, cx| {
+                                                input.set_content(&to_rename, cx)
+                                            });
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
                                     div()
                                         .id(("var-remove", i))
                                         .px_1()
@@ -1480,7 +1513,15 @@ impl Editor {
                 )
             })
             .when(playing.is_none(), |this| {
-                this.child(
+                this.when_some(renaming.clone(), |this, old| {
+                    this.child(
+                        div()
+                            .text_color(rgb(0x8a8a96))
+                            .truncate()
+                            .child(format!("Rename \"{old}\"")),
+                    )
+                })
+                .child(
                 div()
                     .flex()
                     .gap_2()
@@ -1488,29 +1529,65 @@ impl Editor {
                     .child(div().flex_grow().child(self.var_input.clone()))
                     // No `TextInput` in the crate binds enter, so the click is the whole
                     // affordance. A blank or duplicate name is simply refused, and the
-                    // field keeping its content is what says so.
+                    // field keeping its content is what says so — which is also how a
+                    // rename to the name it already has reads.
                     .child(
                         div()
-                            .id("var-add")
+                            .id("var-commit")
                             .px_2()
                             .rounded_sm()
                             .cursor_pointer()
                             .bg(rgb(0x2b2b33))
                             .text_color(rgb(0x8a8a96))
                             .hover(|style| style.text_color(rgb(0xd6d6dd)))
-                            .child("+")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .child(if is_rename { "✓" } else { "+" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 let name = this.var_input.read(cx).content().to_string();
                                 if !this.doc.variable_name_free(&name) {
                                     return;
                                 }
                                 this.doc.checkpoint();
-                                this.doc.add_variable(&name);
+                                match &renaming {
+                                    // Effects and checks follow it, so say how many did.
+                                    Some(old) => {
+                                        let moved = this.doc.rename_variable(old, &name);
+                                        let s = if moved == 1 { "" } else { "s" };
+                                        let name = name.trim();
+                                        this.set_status(
+                                            format!(
+                                                "Renamed \"{old}\" to \"{name}\" — {moved} reference{s}."
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                    None => {
+                                        this.doc.add_variable(&name);
+                                    }
+                                }
+                                this.renaming = None;
                                 this.var_input
                                     .update(cx, |input, cx| input.set_content("", cx));
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .when(is_rename, |this| {
+                        this.child(
+                            div()
+                                .id("var-rename-cancel")
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(rgb(0x6c6c78))
+                                .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                                .child("✗")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.renaming = None;
+                                    this.var_input
+                                        .update(cx, |input, cx| input.set_content("", cx));
+                                    cx.notify();
+                                })),
+                        )
+                    }),
                 )
             })
     }
