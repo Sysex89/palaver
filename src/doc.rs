@@ -185,6 +185,11 @@ pub struct Node {
     pub y: f32,
     pub speaker: String,
     pub text: String,
+    /// A stable external handle: what a game build looks this node up by, since `id` is
+    /// reissued by an undo. Never auto-generated and never auto-renamed, and empty is the
+    /// ordinary state — an un-aliased node is not incomplete.
+    #[serde(default)]
+    pub alias: String,
     /// Marked as a deliberate ending, so having no outgoing edges is not a fault.
     /// `default` so `.dln` files written before this field keep loading.
     #[serde(default)]
@@ -286,6 +291,9 @@ pub enum Problem {
     /// A condition node with nothing wired to one of its pins, so that branch stops the
     /// conversation. The `bool` is which pin.
     UnwiredBranch(u32, bool),
+    /// Two nodes answering to the same alias, so the handle names neither of them. Only
+    /// reachable through a bad file or a bad merge — nothing in the editor generates one.
+    DuplicateAlias(u32, String),
 }
 
 /// A leaf node is an ordinary way for a conversation to end, so most findings are
@@ -304,16 +312,18 @@ impl Problem {
             | Problem::DeadEnd(id)
             | Problem::Empty(id)
             | Problem::UnknownVar(id, _)
-            | Problem::UnwiredBranch(id, _) => Some(*id),
+            | Problem::UnwiredBranch(id, _)
+            | Problem::DuplicateAlias(id, _) => Some(*id),
             _ => None,
         }
     }
 
     pub fn severity(&self) -> Severity {
         match self {
-            Problem::DanglingEdge(_) | Problem::NoStart | Problem::UnknownVar(..) => {
-                Severity::Error
-            }
+            Problem::DanglingEdge(_)
+            | Problem::NoStart
+            | Problem::UnknownVar(..)
+            | Problem::DuplicateAlias(..) => Severity::Error,
             _ => Severity::Warning,
         }
     }
@@ -447,6 +457,23 @@ impl Doc {
                 .map(|var| Problem::UnknownVar(n.id, var.clone()))
         }));
 
+        // Empties are skipped, or every un-aliased node would collide with every other —
+        // a blank alias is the ordinary state, not an unfinished one. Raised on both
+        // offending nodes so either row jumps to a copy.
+        // ponytail: O(n²) over aliases; index them if a document ever gets large enough
+        // to notice, which the rules above would feel first.
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| !n.alias.trim().is_empty())
+                .filter(|n| {
+                    self.nodes
+                        .iter()
+                        .any(|other| other.id != n.id && other.alias.trim() == n.alias.trim())
+                })
+                .map(|n| Problem::DuplicateAlias(n.id, n.alias.trim().to_string())),
+        );
+
         // Stable, so rule order survives inside each severity band.
         found.sort_by_key(|p| p.severity());
         found
@@ -461,6 +488,7 @@ impl Doc {
             y,
             speaker: String::new(),
             text: String::new(),
+            alias: String::new(),
             end: false,
             kind: NodeKind::Speech,
             effects: Vec::new(),
@@ -614,7 +642,9 @@ impl Doc {
         self.nodes
             .iter()
             .filter(|n| {
-                n.speaker.to_lowercase().contains(&query) || n.text.to_lowercase().contains(&query)
+                n.speaker.to_lowercase().contains(&query)
+                    || n.text.to_lowercase().contains(&query)
+                    || n.alias.to_lowercase().contains(&query)
             })
             .map(|n| n.id)
             .collect()
@@ -1944,6 +1974,48 @@ mod tests {
         assert!(doc.variable_name_free("asked"));
     }
 
+    /// Both nodes are named, so whichever row the author clicks jumps to a copy of the
+    /// clash. An error, not a warning: the handle now names neither node, which is the
+    /// `DanglingEdge`/`UnknownVar` category of a bad file or a bad merge.
+    #[test]
+    fn two_nodes_sharing_an_alias_are_both_an_error() {
+        let mut doc = Doc::default();
+        let first = spoken(&mut doc, 0.0, 0.0);
+        let second = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(first).unwrap().alias = "intro".into();
+        doc.node_mut(second).unwrap().alias = "  intro  ".into();
+
+        let problems = doc.problems();
+        let clashes: Vec<&Problem> = problems
+            .iter()
+            .filter(|p| matches!(p, Problem::DuplicateAlias(..)))
+            .collect();
+
+        assert_eq!(
+            clashes.iter().filter_map(|p| p.node()).collect::<Vec<_>>(),
+            vec![first, second],
+            "named on both sides, and matched past the whitespace"
+        );
+        assert!(clashes.iter().all(|p| p.severity() == Severity::Error));
+    }
+
+    /// The rule that makes an empty alias the ordinary state rather than an unfinished
+    /// one — without the skip, every un-aliased node collides with every other.
+    #[test]
+    fn un_aliased_nodes_never_clash() {
+        let mut doc = Doc::default();
+        spoken(&mut doc, 0.0, 0.0);
+        let blank = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(blank).unwrap().alias = "   ".into();
+
+        assert!(
+            doc.problems()
+                .iter()
+                .all(|p| !matches!(p, Problem::DuplicateAlias(..))),
+            "a blank alias names nothing, so it can clash with nothing"
+        );
+    }
+
     #[test]
     fn an_undeclared_effect_is_an_error() {
         let mut doc = Doc::default();
@@ -2421,6 +2493,21 @@ mod tests {
 
         assert!(hits.len() > 1, "matched both fields, not just one");
         assert_eq!(hits, expected, "ids come back in document order");
+    }
+
+    /// An alias is the handle a game build holds, so search has to reach one the author
+    /// never typed into the dialogue itself.
+    #[test]
+    fn find_matches_an_alias() {
+        let mut doc = Doc::default();
+        let id = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(id).unwrap().alias = "blacksmith_intro".into();
+
+        assert_eq!(
+            doc.find("BLACKSMITH"),
+            vec![id],
+            "case-insensitive, like the rest"
+        );
     }
 
     #[test]

@@ -1,0 +1,269 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "x": 60.0,
+      "y": 260.0,
+      "speaker": "Innkeeper",
+      "text": "You look lost, traveler.",
+      "alias": "innkeeper_lost",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 1,
+      "x": 360.0,
+      "y": 140.0,
+      "speaker": "Player",
+      "text": "Where am I?",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 2,
+      "x": 360.0,
+      "y": 380.0,
+      "speaker": "Player",
+      "text": "None of your business.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 3,
+      "x": 660.0,
+      "y": 140.0,
+      "speaker": "Innkeeper",
+      "text": "Sern's Rest. Last inn before the pass.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 4,
+      "x": 660.0,
+      "y": 380.0,
+      "speaker": "Innkeeper",
+      "text": "Suit yourself.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 5,
+      "x": 960.0,
+      "y": 140.0,
+      "speaker": "",
+      "text": "Anything else?",
+      "alias": "",
+      "end": false,
+      "kind": "Hub",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 6,
+      "x": 1260.0,
+      "y": 20.0,
+      "speaker": "Innkeeper",
+      "text": "Two coppers a night, and the fire stays lit.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 7,
+      "x": 1260.0,
+      "y": 163.25,
+      "speaker": "Innkeeper",
+      "text": "Snowed shut since Tuesday. Nobody's crossing.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 8,
+      "x": 1560.0,
+      "y": 160.0,
+      "speaker": "",
+      "text": "",
+      "alias": "",
+      "end": false,
+      "kind": "Instruction",
+      "effects": [
+        {
+          "var": "asked_about_pass",
+          "value": {
+            "Bool": true
+          }
+        }
+      ],
+      "conditions": []
+    },
+    {
+      "id": 9,
+      "x": 1260.0,
+      "y": 300.0,
+      "speaker": "",
+      "text": "",
+      "alias": "",
+      "end": false,
+      "kind": "Condition",
+      "effects": [],
+      "conditions": [
+        {
+          "var": "asked_about_pass",
+          "want": {
+            "Bool": true
+          }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "x": 1560.0,
+      "y": 300.0,
+      "speaker": "Innkeeper",
+      "text": "Mind the drifts on the road out.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 11,
+      "x": 1560.0,
+      "y": 440.0,
+      "speaker": "Innkeeper",
+      "text": "Safe travels, then.",
+      "alias": "",
+      "end": false,
+      "kind": "Speech",
+      "effects": [],
+      "conditions": []
+    },
+    {
+      "id": 12,
+      "x": 1860.0,
+      "y": 60.0,
+      "speaker": "",
+      "text": "",
+      "alias": "",
+      "end": false,
+      "kind": "Jump",
+      "effects": [],
+      "conditions": []
+    }
+  ],
+  "edges": [
+    {
+      "from": 0,
+      "to": 1,
+      "label": "Ask",
+      "branch": false
+    },
+    {
+      "from": 0,
+      "to": 2,
+      "label": "Refuse",
+      "branch": false
+    },
+    {
+      "from": 1,
+      "to": 3,
+      "label": "",
+      "branch": false
+    },
+    {
+      "from": 2,
+      "to": 4,
+      "label": "",
+      "branch": false
+    },
+    {
+      "from": 3,
+      "to": 5,
+      "label": "",
+      "branch": false
+    },
+    {
+      "from": 5,
+      "to": 6,
+      "label": "A room for the night?",
+      "branch": false
+    },
+    {
+      "from": 5,
+      "to": 7,
+      "label": "Is the pass open?",
+      "branch": false
+    },
+    {
+      "from": 5,
+      "to": 9,
+      "label": "That's all.",
+      "branch": false
+    },
+    {
+      "from": 6,
+      "to": 12,
+      "label": "Ask something else",
+      "branch": false
+    },
+    {
+      "from": 7,
+      "to": 8,
+      "label": "Ask something else",
+      "branch": false
+    },
+    {
+      "from": 8,
+      "to": 12,
+      "label": "",
+      "branch": false
+    },
+    {
+      "from": 12,
+      "to": 5,
+      "label": "",
+      "branch": false
+    },
+    {
+      "from": 9,
+      "to": 10,
+      "label": "",
+      "branch": true
+    },
+    {
+      "from": 9,
+      "to": 11,
+      "label": "",
+      "branch": false
+    }
+  ],
+  "next_id": 13,
+  "variables": [
+    {
+      "name": "asked_about_pass",
+      "default": {
+        "Bool": false
+      }
+    }
+  ]
+}

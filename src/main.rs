@@ -175,6 +175,9 @@ struct Editor {
     focus_handle: FocusHandle,
     speaker_input: Entity<TextInput>,
     text_input: Entity<TextInput>,
+    /// The node's external handle. Node content like the two above it, so it belongs in the
+    /// `sync_fields` loop — unlike `search_input` and `var_input` below.
+    alias_input: Entity<TextInput>,
     label_input: Entity<TextInput>,
     /// Search query. Deliberately outside the `sync_fields` loop — it is not document content.
     search_input: Entity<TextInput>,
@@ -296,8 +299,9 @@ impl Editor {
 
         let speaker_input = cx.new(|cx| TextInput::new("Speaker", cx));
         let text_input = cx.new(|cx| TextInput::new("Line of dialog", cx));
+        let alias_input = cx.new(|cx| TextInput::new("Name for the game to call", cx));
         let label_input = cx.new(|cx| TextInput::new("Choice", cx));
-        for input in [&speaker_input, &text_input, &label_input] {
+        for input in [&speaker_input, &text_input, &alias_input, &label_input] {
             cx.observe(input, |this, _, cx| this.sync_fields(cx))
                 .detach();
         }
@@ -331,6 +335,7 @@ impl Editor {
             focus_handle,
             speaker_input,
             text_input,
+            alias_input,
             label_input,
             search_input,
             var_input,
@@ -587,13 +592,23 @@ impl Editor {
 
     /// Loads the selection's content into the sidebar fields, starting a fresh editing session.
     fn load_fields(&mut self, selection: Selection, cx: &mut Context<Self>) {
-        let (speaker, text, label) = match (selection.only_node(), &selection) {
+        let (speaker, text, alias, label) = match (selection.only_node(), &selection) {
             (Some(id), _) => match self.doc.node(id) {
-                Some(node) => (node.speaker.clone(), node.text.clone(), String::new()),
+                Some(node) => (
+                    node.speaker.clone(),
+                    node.text.clone(),
+                    node.alias.clone(),
+                    String::new(),
+                ),
                 None => Default::default(),
             },
             (None, Selection::Edge(index)) => match self.doc.edges.get(*index) {
-                Some(edge) => (String::new(), String::new(), edge.label.clone()),
+                Some(edge) => (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    edge.label.clone(),
+                ),
                 None => Default::default(),
             },
             _ => Default::default(),
@@ -603,6 +618,8 @@ impl Editor {
             .update(cx, |input, cx| input.set_content(&speaker, cx));
         self.text_input
             .update(cx, |input, cx| input.set_content(&text, cx));
+        self.alias_input
+            .update(cx, |input, cx| input.set_content(&alias, cx));
         self.label_input
             .update(cx, |input, cx| input.set_content(&label, cx));
         self.edited = selection;
@@ -616,17 +633,19 @@ impl Editor {
             (Some(id), _) => {
                 let speaker = self.speaker_input.read(cx).content().to_string();
                 let text = self.text_input.read(cx).content().to_string();
+                let alias = self.alias_input.read(cx).content().to_string();
 
                 let Some(node) = self.doc.node(id) else {
                     return;
                 };
-                if node.speaker == speaker && node.text == text {
+                if node.speaker == speaker && node.text == text && node.alias == alias {
                     return;
                 }
                 self.checkpoint_once();
                 if let Some(node) = self.doc.node_mut(id) {
                     node.speaker = speaker;
                     node.text = text;
+                    node.alias = alias;
                 }
             }
             (None, Selection::Edge(index)) => {
@@ -2026,6 +2045,10 @@ impl Editor {
                         let kind = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
                         this.child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
                             .child(self.kind_picker(id, cx))
+                            // Outside every kind guard on purpose: an alias is orthogonal to
+                            // `NodeKind` the way `end` is, and a game may want to enter a
+                            // conversation at a hub or a condition too.
+                            .child(field("Alias", &self.alias_input))
                             .when(kind == NodeKind::Speech, |this| {
                                 this.child(field("Speaker", &self.speaker_input))
                             })
@@ -2180,6 +2203,9 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         }
         Problem::UnwiredBranch(id, branch) => {
             format!("Nothing on the {branch} branch of: {}", label(*id))
+        }
+        Problem::DuplicateAlias(id, alias) => {
+            format!("Alias \"{alias}\" is used twice: {}", label(*id))
         }
     }
 }
