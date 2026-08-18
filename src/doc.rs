@@ -3,7 +3,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
+
+/// What a node answers to. Random rather than counted, so two branches of the same file can
+/// each add a node and still merge — see [`Doc::fresh_id`]. The alias is here to make that
+/// widening auditable rather than a find-and-replace on the bare type: `main.rs` also holds
+/// colours as a plain integer, and a blind sweep would have widened one of those too.
+pub type NodeId = u64;
 
 /// Extension of a saved dialog document.
 pub const FILE_EXT: &str = "dln";
@@ -133,13 +140,12 @@ impl View {
 const UNDO_DEPTH: usize = 50;
 
 /// Everything an undo restores: the document data, minus the history itself.
-type Snapshot = (Vec<Node>, Vec<Edge>, u32, Vec<Variable>);
+type Snapshot = (Vec<Node>, Vec<Edge>, Vec<Variable>);
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Doc {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    next_id: u32,
     /// `default` so `.dln` files written before variables existed keep loading.
     #[serde(default)]
     pub variables: Vec<Variable>,
@@ -180,7 +186,7 @@ pub enum NodeKind {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
-    pub id: u32,
+    pub id: NodeId,
     pub x: f32,
     pub y: f32,
     pub speaker: String,
@@ -253,14 +259,28 @@ pub struct Variable {
     pub default: Value,
 }
 
+/// Splits a variable name into the set it belongs to and the rest: everything before the
+/// first `.`, which the variables pane renders as a group header.
+///
+/// A display convention, not schema. The whole dotted name is still the key, so grouping
+/// changes nothing about uniqueness, renames or what a `.dln` holds — which is the entire
+/// reason sets cost nothing today. A name with no `.`, or with nothing on one side of it,
+/// belongs to no set.
+pub fn split_set(name: &str) -> (Option<&str>, &str) {
+    match name.split_once('.') {
+        Some((set, rest)) if !set.is_empty() && !rest.is_empty() => (Some(set), rest),
+        _ => (None, name),
+    }
+}
+
 /// Every variable's value at one point in a play-through. Never stored on the editor —
 /// see [`Doc::vars_along`], which recomputes it from the path instead.
 pub type VarState = HashMap<String, Value>;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Edge {
-    pub from: u32,
-    pub to: u32,
+    pub from: NodeId,
+    pub to: NodeId,
     /// The player-facing choice taken to follow this edge.
     pub label: String,
     /// Which pin of a [`NodeKind::Condition`] this leaves by, and meaningless from any
@@ -280,20 +300,24 @@ pub enum Problem {
     /// Nodes exist but every one has an incoming edge, so nothing can start.
     NoStart,
     /// Not reachable from any start node.
-    Unreachable(u32),
+    Unreachable(NodeId),
     /// No outgoing edges — the conversation stops here.
-    DeadEnd(u32),
+    DeadEnd(NodeId),
     /// Nothing in it: no dialogue on a speech node, no writes on an instruction.
-    Empty(u32),
+    Empty(NodeId),
     /// An effect or a check naming a variable nothing declares. Only reachable through a
     /// bad file — removing a variable takes both with it.
-    UnknownVar(u32, String),
+    UnknownVar(NodeId, String),
     /// A condition node with nothing wired to one of its pins, so that branch stops the
     /// conversation. The `bool` is which pin.
-    UnwiredBranch(u32, bool),
+    UnwiredBranch(NodeId, bool),
     /// Two nodes answering to the same alias, so the handle names neither of them. Only
     /// reachable through a bad file or a bad merge — nothing in the editor generates one.
-    DuplicateAlias(u32, String),
+    DuplicateAlias(NodeId, String),
+    /// A second edge between the same pair of nodes, so the player is offered one choice
+    /// twice. [`Doc::add_edge`] refuses one, so only a merge can make it — which is the
+    /// gap random ids opened by making a `.dln` auto-merge legal again.
+    DuplicateEdge(usize),
 }
 
 /// A leaf node is an ordinary way for a conversation to end, so most findings are
@@ -306,7 +330,7 @@ pub enum Severity {
 
 impl Problem {
     /// The node to jump to, when the problem has one.
-    pub fn node(&self) -> Option<u32> {
+    pub fn node(&self) -> Option<NodeId> {
         match self {
             Problem::Unreachable(id)
             | Problem::DeadEnd(id)
@@ -339,7 +363,7 @@ impl Doc {
     // ponytail: follows the first incoming edge in document order, so a node two branches
     // rejoin at walks back through whichever was drawn first. Both lead to the same
     // conversation; revisit if that stops being true.
-    pub fn start_of(&self, from: u32) -> u32 {
+    pub fn start_of(&self, from: NodeId) -> NodeId {
         let mut current = from;
         let mut seen = HashSet::from([current]);
         while let Some(edge) = self.edges.iter().find(|e| e.to == current) {
@@ -354,7 +378,7 @@ impl Doc {
     /// The choices offered at a node: where each one leads and how it is labelled, in
     /// document order. Edges pointing at a node that is gone are skipped — play must never
     /// offer a dead link.
-    pub fn choices(&self, id: u32) -> Vec<(u32, &str)> {
+    pub fn choices(&self, id: NodeId) -> Vec<(NodeId, &str)> {
         self.edges
             .iter()
             .filter(|e| e.from == id && self.node(e.to).is_some())
@@ -380,7 +404,7 @@ impl Doc {
         // A start node is one nothing links to. Several of them is not a fault: a document
         // holds as many independent conversations as the author draws, and play mode starts
         // from the top of whichever one the selection is standing in.
-        let roots: Vec<u32> = self
+        let roots: Vec<NodeId> = self
             .nodes
             .iter()
             .filter(|n| !self.edges.iter().any(|e| e.to == n.id))
@@ -392,7 +416,7 @@ impl Doc {
 
         // Walking from every root at once keeps this meaningful while the start is still
         // ambiguous, and an island cycle stays unreachable either way.
-        let mut seen: HashSet<u32> = roots.iter().copied().collect();
+        let mut seen: HashSet<NodeId> = roots.iter().copied().collect();
         let mut queue = roots;
         while let Some(id) = queue.pop() {
             for edge in self.edges.iter().filter(|e| e.from == id) {
@@ -474,14 +498,43 @@ impl Doc {
                 .map(|n| Problem::DuplicateAlias(n.id, n.alias.trim().to_string())),
         );
 
+        // Only the second and later copy is named, so the row points at the edge to delete
+        // rather than at the one that was there first.
+        found.extend(
+            self.edges
+                .iter()
+                .enumerate()
+                .filter(|(index, edge)| {
+                    self.edges[..*index]
+                        .iter()
+                        .any(|e| e.from == edge.from && e.to == edge.to)
+                })
+                .map(|(index, _)| Problem::DuplicateEdge(index)),
+        );
+
         // Stable, so rule order survives inside each severity band.
         found.sort_by_key(|p| p.severity());
         found
     }
 
-    pub fn add_node(&mut self, x: f32, y: f32) -> u32 {
-        let id = self.next_id;
-        self.next_id += 1;
+    /// An id nothing in this document already answers to. Random rather than counted: a
+    /// counter is shared state, so two branches that each add a node mint the same id and
+    /// git merges that cleanly into a document whose edges point at the wrong nodes — the
+    /// one corruption a `.dln` could suffer in silence.
+    ///
+    /// `RandomState` is OS-seeded per instance, so hashing anything at all gives a
+    /// well-distributed value; the retry is against the birthday case, not the hash.
+    fn fresh_id(&self) -> NodeId {
+        loop {
+            let id = RandomState::new().hash_one(self.nodes.len());
+            if self.node(id).is_none() {
+                return id;
+            }
+        }
+    }
+
+    pub fn add_node(&mut self, x: f32, y: f32) -> NodeId {
+        let id = self.fresh_id();
         self.nodes.push(Node {
             id,
             x,
@@ -497,23 +550,23 @@ impl Doc {
         id
     }
 
-    pub fn is_jump(&self, id: u32) -> bool {
+    pub fn is_jump(&self, id: NodeId) -> bool {
         self.node(id).is_some_and(|n| n.kind == NodeKind::Jump)
     }
 
-    pub fn is_instruction(&self, id: u32) -> bool {
+    pub fn is_instruction(&self, id: NodeId) -> bool {
         self.node(id)
             .is_some_and(|n| n.kind == NodeKind::Instruction)
     }
 
-    pub fn is_condition(&self, id: u32) -> bool {
+    pub fn is_condition(&self, id: NodeId) -> bool {
         self.node(id).is_some_and(|n| n.kind == NodeKind::Condition)
     }
 
     /// Whether every check on a condition node holds against `vars`. A node with no checks
     /// holds vacuously, which is why an empty one is reported by [`Doc::problems`] rather
     /// than silently sending everything down one branch.
-    pub fn condition_holds(&self, id: u32, vars: &VarState) -> bool {
+    pub fn condition_holds(&self, id: NodeId, vars: &VarState) -> bool {
         self.node(id)
             .is_some_and(|node| node.conditions.iter().all(|c| c.holds(vars)))
     }
@@ -522,7 +575,7 @@ impl Doc {
     /// below and the panel that renders the result cannot disagree about which nodes are
     /// authoring plumbing. A missing node counts as visible, so a broken graph halts
     /// rather than walking off the end of it.
-    pub fn pauses_play(&self, id: u32) -> bool {
+    pub fn pauses_play(&self, id: NodeId) -> bool {
         match self.node(id) {
             Some(node) => matches!(node.kind, NodeKind::Speech | NodeKind::Hub),
             None => true,
@@ -531,7 +584,7 @@ impl Doc {
 
     /// The branch a condition sends the flow down, given the variables as they stand.
     /// None when that pin has nothing wired to it, which stops the walk where it is.
-    fn condition_branch(&self, id: u32, vars: &VarState) -> Option<u32> {
+    fn condition_branch(&self, id: NodeId, vars: &VarState) -> Option<NodeId> {
         let holds = self.condition_holds(id, vars);
         self.edges
             .iter()
@@ -546,8 +599,8 @@ impl Doc {
     ///
     /// Guarded against a cycle the same way [`Doc::start_of`] is, and stops where it
     /// stands when a jump has no target.
-    fn walk_on(&self, path: &mut Vec<u32>) {
-        let mut seen: HashSet<u32> = path.iter().copied().collect();
+    fn walk_on(&self, path: &mut Vec<NodeId>) {
+        let mut seen: HashSet<NodeId> = path.iter().copied().collect();
         while let Some(&current) = path.last() {
             if self.pauses_play(current) {
                 return;
@@ -572,14 +625,14 @@ impl Doc {
 
     /// The path a play-through opens on: `seed`, plus whatever it walks through to reach
     /// the first node the player sees.
-    pub fn start_walk(&self, seed: u32) -> Vec<u32> {
+    pub fn start_walk(&self, seed: NodeId) -> Vec<NodeId> {
         let mut path = vec![seed];
         self.walk_on(&mut path);
         path
     }
 
     /// Takes the choice leading to `to` and walks on from there.
-    pub fn advance(&self, path: &mut Vec<u32>, to: u32) {
+    pub fn advance(&self, path: &mut Vec<NodeId>, to: NodeId) {
         path.push(to);
         self.walk_on(path);
     }
@@ -587,7 +640,7 @@ impl Doc {
     /// Steps back to the previous node the player actually saw, dropping the invisible run
     /// walked through to reach the current one. False when there is no earlier one — which
     /// is also what hides the Back button.
-    pub fn step_back(&self, path: &mut Vec<u32>) -> bool {
+    pub fn step_back(&self, path: &mut Vec<NodeId>) -> bool {
         // Searched by position, not by id: a conversation that loops back to a node it has
         // already visited would otherwise step back to the wrong occurrence of it.
         let Some(before) = path.len().checked_sub(1) else {
@@ -601,16 +654,16 @@ impl Doc {
     }
 
     // ponytail: O(n) node lookup, add a HashMap index past ~2k nodes.
-    pub fn node(&self, id: u32) -> Option<&Node> {
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
         self.nodes.iter().find(|n| n.id == id)
     }
 
-    pub fn node_mut(&mut self, id: u32) -> Option<&mut Node> {
+    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
     /// Topmost node containing the point, in document coordinates.
-    pub fn hit_test(&self, x: f32, y: f32) -> Option<u32> {
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         self.nodes
             .iter()
             .rev()
@@ -620,7 +673,7 @@ impl Doc {
 
     /// Topmost node whose out-port contains the point. Check this before [`Doc::hit_test`],
     /// since the port overlaps the node box.
-    pub fn port_hit_test(&self, x: f32, y: f32) -> Option<u32> {
+    pub fn port_hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         self.nodes
             .iter()
             .rev()
@@ -634,7 +687,7 @@ impl Doc {
     /// Nodes whose speaker or text contains `query`, ignoring case, in document order.
     /// A blank query matches nothing rather than everything, so an idle search box is free.
     // ponytail: node text only; extend to edge labels if choices need finding too.
-    pub fn find(&self, query: &str) -> Vec<u32> {
+    pub fn find(&self, query: &str) -> Vec<NodeId> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
             return Vec::new();
@@ -653,7 +706,7 @@ impl Doc {
     /// Ids of every node whose box touches the rectangle spanned by two document points,
     /// given in either corner order. Touching is enough — a marquee need not swallow a
     /// node whole to catch it.
-    pub fn nodes_in_rect(&self, a: (f32, f32), b: (f32, f32)) -> Vec<u32> {
+    pub fn nodes_in_rect(&self, a: (f32, f32), b: (f32, f32)) -> Vec<NodeId> {
         let (min_x, max_x) = (a.0.min(b.0), a.0.max(b.0));
         let (min_y, max_y) = (a.1.min(b.1), a.1.max(b.1));
         self.nodes
@@ -664,7 +717,7 @@ impl Doc {
     }
 
     /// Shifts every listed node by the same amount. Unknown ids are skipped.
-    pub fn move_nodes(&mut self, ids: &[u32], dx: f32, dy: f32) {
+    pub fn move_nodes(&mut self, ids: &[NodeId], dx: f32, dy: f32) {
         for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
             node.x += dx;
             node.y += dy;
@@ -672,19 +725,19 @@ impl Doc {
     }
 
     /// Removes the node and every edge touching it.
-    pub fn remove_node(&mut self, id: u32) {
+    pub fn remove_node(&mut self, id: NodeId) {
         self.nodes.retain(|n| n.id != id);
         self.edges.retain(|e| e.from != id && e.to != id);
     }
 
-    pub fn has_edge(&self, from: u32, to: u32) -> bool {
+    pub fn has_edge(&self, from: NodeId, to: NodeId) -> bool {
         self.edges.iter().any(|e| e.from == from && e.to == to)
     }
 
     /// Connects two nodes. False when the edge would be a self-loop or a duplicate, or
     /// would be a second target for a jump — a jump points at exactly one node, and a
     /// second edge would leave the canvas badge naming one of several.
-    pub fn add_edge(&mut self, from: u32, to: u32) -> bool {
+    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> bool {
         if from == to || self.has_edge(from, to) {
             return false;
         }
@@ -708,7 +761,7 @@ impl Doc {
     /// nothing is added.
     // ponytail: only avoids siblings; it can land on an unrelated node elsewhere in the
     // graph. Scan every node for a collision if that starts to bite.
-    pub fn branch_from(&mut self, from: u32) -> Option<u32> {
+    pub fn branch_from(&mut self, from: NodeId) -> Option<NodeId> {
         let parent = self.node(from)?;
         let (x, mut y) = (parent.x + NODE_W + GAP_X, parent.y);
         let lowest_child = self
@@ -815,7 +868,7 @@ impl Doc {
     }
 
     /// What this node writes to `var`, if anything.
-    pub fn effect_of(&self, id: u32, var: &str) -> Option<Value> {
+    pub fn effect_of(&self, id: NodeId, var: &str) -> Option<Value> {
         self.node(id)?
             .effects
             .iter()
@@ -826,7 +879,7 @@ impl Doc {
     /// Sets — or with `None`, clears — what this node writes to `var`. An upsert, which is
     /// what keeps at most one effect per variable per node and makes their stored order
     /// irrelevant.
-    pub fn set_effect(&mut self, id: u32, var: &str, value: Option<Value>) {
+    pub fn set_effect(&mut self, id: NodeId, var: &str, value: Option<Value>) {
         let Some(node) = self.node_mut(id) else {
             return;
         };
@@ -840,7 +893,7 @@ impl Doc {
     }
 
     /// What this node checks `var` against, if anything.
-    pub fn condition_of(&self, id: u32, var: &str) -> Option<Value> {
+    pub fn condition_of(&self, id: NodeId, var: &str) -> Option<Value> {
         self.node(id)?
             .conditions
             .iter()
@@ -849,7 +902,7 @@ impl Doc {
     }
 
     /// The [`Doc::set_effect`] of the checking side, with the same upsert rule.
-    pub fn set_condition(&mut self, id: u32, var: &str, want: Option<Value>) {
+    pub fn set_condition(&mut self, id: NodeId, var: &str, want: Option<Value>) {
         let Some(node) = self.node_mut(id) else {
             return;
         };
@@ -876,7 +929,7 @@ impl Doc {
     /// Recomputed from the path rather than carried beside it, which is what makes it
     /// impossible for the two to drift — stepping back through the path steps the
     /// variables back with it for free.
-    pub fn vars_along(&self, path: &[u32]) -> VarState {
+    pub fn vars_along(&self, path: &[NodeId]) -> VarState {
         let mut vars = self.initial_vars();
         let instructions = path
             .iter()
@@ -903,15 +956,13 @@ impl Doc {
         (
             self.nodes.clone(),
             self.edges.clone(),
-            self.next_id,
             self.variables.clone(),
         )
     }
 
-    fn restore(&mut self, (nodes, edges, next_id, variables): Snapshot) {
+    fn restore(&mut self, (nodes, edges, variables): Snapshot) {
         self.nodes = nodes;
         self.edges = edges;
-        self.next_id = next_id;
         self.variables = variables;
     }
 
@@ -1229,7 +1280,11 @@ mod tests {
         assert!(doc.redo());
         assert_eq!(doc.nodes.len(), nodes + 1);
         assert!(doc.node(added).is_some());
-        assert_eq!(doc.add_node(0.0, 0.0), added + 1, "next_id came back too");
+        assert_ne!(
+            doc.add_node(0.0, 0.0),
+            added,
+            "ids are minted, not counted, so nothing reissues one history handed back"
+        );
         assert!(!doc.redo(), "nothing left to replay");
     }
 
@@ -1272,6 +1327,72 @@ mod tests {
         assert_eq!(doc.undo.len(), UNDO_DEPTH);
     }
 
+    /// The whole reason ids stopped being counted: a counter is shared state, so two
+    /// branches of the same file each mint the same id and git merges that into a document
+    /// whose edges point at the wrong nodes.
+    #[test]
+    fn ids_are_minted_not_counted() {
+        let mut doc = Doc::default();
+        let ids: Vec<NodeId> = (0..20).map(|i| doc.add_node(i as f32, 0.0)).collect();
+
+        let unique: HashSet<NodeId> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "no collisions within a document");
+        assert!(
+            ids.windows(2).any(|w| w[1] != w[0] + 1),
+            "and not a counter wearing a hat"
+        );
+    }
+
+    /// Replaces the old caveat that ids were unstable across a history step. There is no
+    /// counter left to roll back, so an undone id is retired rather than handed out again.
+    #[test]
+    fn an_undone_id_is_never_reissued() {
+        let mut doc = Doc::default();
+        doc.checkpoint();
+        let gone = doc.add_node(0.0, 0.0);
+        assert!(doc.undo());
+
+        assert_ne!(doc.add_node(0.0, 0.0), gone);
+    }
+
+    /// The compatibility claim: every `.dln` written before this change carries a
+    /// `next_id`, and serde ignoring it is the whole migration.
+    #[test]
+    fn a_document_with_a_next_id_still_loads() {
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":0,"x":0.0,"y":0.0,"speaker":"","text":"hi"}],
+                "edges":[],"next_id":1}"#,
+        )
+        .expect("loads");
+
+        assert_eq!(doc.node(0).map(|n| n.text.as_str()), Some("hi"));
+    }
+
+    /// `add_edge` refuses one, so only a merge can make it — which is the gap random ids
+    /// opened by making a `.dln` auto-merge legal again.
+    #[test]
+    fn a_duplicated_edge_is_a_warning() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 400.0, 0.0);
+        doc.add_edge(a, b);
+        let copy = doc.edges[0].clone(); // What a line-wise merge does.
+        doc.edges.push(copy);
+
+        let problems = doc.problems();
+        let dupes: Vec<&Problem> = problems
+            .iter()
+            .filter(|p| matches!(p, Problem::DuplicateEdge(_)))
+            .collect();
+
+        assert_eq!(
+            dupes,
+            vec![&Problem::DuplicateEdge(1)],
+            "the copy is named, not the edge that was there first"
+        );
+        assert_eq!(dupes[0].severity(), Severity::Warning);
+    }
+
     #[test]
     fn add_edge_rejects_self_loops_and_duplicates() {
         let mut doc = Doc::default();
@@ -1300,7 +1421,7 @@ mod tests {
     }
 
     /// A node with text, so it is not flagged empty by accident.
-    fn spoken(doc: &mut Doc, x: f32, y: f32) -> u32 {
+    fn spoken(doc: &mut Doc, x: f32, y: f32) -> NodeId {
         let id = doc.add_node(x, y);
         doc.node_mut(id).unwrap().text = "…".into();
         id
@@ -1728,9 +1849,10 @@ mod tests {
         assert_eq!(restored.nodes[3].x, original.nodes[3].x);
         assert_eq!(restored.edges[0].label, original.edges[0].label);
 
-        // next_id survived, so new nodes cannot collide with loaded ones.
+        // Ids survive the trip, so the edges still point where they did.
+        assert_eq!(restored.nodes[3].id, original.nodes[3].id);
         let fresh = restored.add_node(0.0, 0.0);
-        assert!(original.node(fresh).is_none());
+        assert!(original.node(fresh).is_none(), "and a new one is its own");
     }
 
     #[test]
@@ -1797,8 +1919,24 @@ mod tests {
         assert_eq!(doc.variables.len(), 1, "an unknown name declares nothing");
     }
 
+    #[test]
+    fn split_set_groups_on_the_first_dot() {
+        assert_eq!(split_set("paid"), (None, "paid"));
+        assert_eq!(split_set("chapter1.paid"), (Some("chapter1"), "paid"));
+        assert_eq!(
+            split_set("a.b.c"),
+            (Some("a"), "b.c"),
+            "one level: the rest is the name, dots and all"
+        );
+
+        // Nothing on one side of the dot is a name, not a set.
+        assert_eq!(split_set(".paid"), (None, ".paid"));
+        assert_eq!(split_set("chapter1."), (None, "chapter1."));
+        assert_eq!(split_set(""), (None, ""));
+    }
+
     /// Builds an instruction node that writes `var`.
-    fn sets(doc: &mut Doc, var: &str, value: bool) -> u32 {
+    fn sets(doc: &mut Doc, var: &str, value: bool) -> NodeId {
         let id = doc.add_node(0.0, 0.0);
         doc.node_mut(id).unwrap().kind = NodeKind::Instruction;
         doc.set_effect(id, var, Some(Value::Bool(value)));
@@ -2039,7 +2177,7 @@ mod tests {
     }
 
     /// Builds a condition node checking `var`.
-    fn checks(doc: &mut Doc, var: &str, want: bool) -> u32 {
+    fn checks(doc: &mut Doc, var: &str, want: bool) -> NodeId {
         let id = doc.add_node(0.0, 0.0);
         doc.node_mut(id).unwrap().kind = NodeKind::Condition;
         doc.set_condition(id, var, Some(Value::Bool(want)));
@@ -2284,7 +2422,7 @@ mod tests {
             "nothing has set it yet"
         );
 
-        let ends: Vec<u32> = doc
+        let ends: Vec<NodeId> = doc
             .edges
             .iter()
             .filter(|e| e.from == gate.id)
@@ -2424,7 +2562,7 @@ mod tests {
     #[test]
     fn ids_are_unique() {
         let mut doc = Doc::default();
-        let ids: Vec<u32> = (0..5).map(|i| doc.add_node(i as f32, 0.0)).collect();
+        let ids: Vec<NodeId> = (0..5).map(|i| doc.add_node(i as f32, 0.0)).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -2484,7 +2622,7 @@ mod tests {
 
         // "Innkeeper" is a speaker; "inn before the pass" is inside another node's text.
         let hits = doc.find("inn");
-        let expected: Vec<u32> = doc
+        let expected: Vec<NodeId> = doc
             .nodes
             .iter()
             .filter(|n| n.speaker.contains("Innkeeper") || n.text.contains("inn"))

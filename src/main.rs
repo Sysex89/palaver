@@ -2,8 +2,9 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeKind, PORT_R, Problem, Severity, Value, View,
-    clear_backup, in_port, node_center, out_port, read_backup, with_default_extension,
+    Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, Severity, Value,
+    VarState, View, clear_backup, in_port, node_center, out_port, read_backup, split_set,
+    with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -208,7 +209,7 @@ struct Editor {
     autosave_off: bool,
     /// The play-through walked so far, last entry first — `None` when not playing. One vec
     /// carries the current node, Back and Restart.
-    play: Option<Vec<u32>>,
+    play: Option<Vec<NodeId>>,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -218,7 +219,7 @@ struct Editor {
 enum Selection {
     #[default]
     None,
-    Nodes(Vec<u32>),
+    Nodes(Vec<NodeId>),
     Edge(usize),
 }
 
@@ -235,12 +236,12 @@ enum Drag {
     /// `grab` is the cursor's offset inside the node, in document coordinates. The rest
     /// of the selection rides along, so this drags a whole group.
     Node {
-        id: u32,
+        id: NodeId,
         grab: (f32, f32),
         moved: bool,
     },
     /// Rubber band from a node's out-port to the cursor.
-    Edge { from: u32, cursor: (f32, f32) },
+    Edge { from: NodeId, cursor: (f32, f32) },
     Pan {
         start_mouse: (f32, f32),
         start_pan: (f32, f32),
@@ -254,7 +255,7 @@ enum Drag {
 
 impl Selection {
     /// The selected node ids. Empty for an edge or an empty selection.
-    fn nodes(&self) -> &[u32] {
+    fn nodes(&self) -> &[NodeId] {
         match self {
             Selection::Nodes(ids) => ids,
             _ => &[],
@@ -263,7 +264,7 @@ impl Selection {
 
     /// The one selected node, when the selection is exactly one node. Everything that
     /// edits a single node goes through this, so a multi-selection simply edits nothing.
-    fn only_node(&self) -> Option<u32> {
+    fn only_node(&self) -> Option<NodeId> {
         match self.nodes() {
             [id] => Some(*id),
             _ => None,
@@ -271,7 +272,7 @@ impl Selection {
     }
 
     /// Adds the id when absent, removes it when present — what shift-click does.
-    fn toggled(&self, id: u32) -> Selection {
+    fn toggled(&self, id: NodeId) -> Selection {
         let mut ids = self.nodes().to_vec();
         match ids.iter().position(|n| *n == id) {
             Some(at) => {
@@ -283,7 +284,7 @@ impl Selection {
     }
 
     /// A node selection, or `None` when the set came out empty.
-    fn of(ids: Vec<u32>) -> Selection {
+    fn of(ids: Vec<NodeId>) -> Selection {
         if ids.is_empty() {
             Selection::None
         } else {
@@ -935,7 +936,7 @@ impl Editor {
     /// Stepping through history can restore or drop whatever was selected, and it moves
     /// the document out from under the sidebar, so the fields always reload.
     fn after_history(&mut self, cx: &mut Context<Self>) {
-        let live: Vec<u32> = self
+        let live: Vec<NodeId> = self
             .selection
             .nodes()
             .iter()
@@ -1066,7 +1067,7 @@ impl Editor {
 
     /// The node play starts from: the selected one, or the first in the document so that a
     /// stray F5 plays something rather than nagging.
-    fn play_seed(&self) -> Option<u32> {
+    fn play_seed(&self) -> Option<NodeId> {
         self.selection
             .only_node()
             .or_else(|| self.doc.nodes.first().map(|n| n.id))
@@ -1075,7 +1076,7 @@ impl Editor {
     /// Both entry points walk on through everything the player does not see, so the path
     /// always ends on a node worth showing. The nodes walked *through* stay in it — that
     /// is what lets `Doc::vars_along` recompute the variables from the path alone.
-    fn start_play(&mut self, at: u32, window: &Window, cx: &mut Context<Self>) {
+    fn start_play(&mut self, at: NodeId, window: &Window, cx: &mut Context<Self>) {
         let path = self.doc.start_walk(at);
         self.follow(&path, window);
         self.play = Some(path);
@@ -1083,7 +1084,7 @@ impl Editor {
     }
 
     /// Advances the play-through, or ends it if the choice leads nowhere real.
-    fn play_advance(&mut self, to: u32, window: &Window, cx: &mut Context<Self>) {
+    fn play_advance(&mut self, to: NodeId, window: &Window, cx: &mut Context<Self>) {
         let Some(mut path) = self.play.take() else {
             return;
         };
@@ -1094,7 +1095,7 @@ impl Editor {
     }
 
     /// Brings the node a play-through has arrived at into view.
-    fn follow(&mut self, path: &[u32], window: &Window) {
+    fn follow(&mut self, path: &[NodeId], window: &Window) {
         if let Some(&at) = path.last() {
             self.show(at, window);
         }
@@ -1102,7 +1103,7 @@ impl Editor {
 
     /// Brings a node into view without touching the selection — which is what separates
     /// following a play-through from [`Editor::jump_to`].
-    fn show(&mut self, id: u32, window: &Window) {
+    fn show(&mut self, id: NodeId, window: &Window) {
         if let Some(node) = self.doc.node(id) {
             self.view
                 .center_on(node_center(node), Self::pane_center(window));
@@ -1110,7 +1111,7 @@ impl Editor {
     }
 
     /// Selects a node and brings it into view without changing zoom.
-    fn jump_to(&mut self, id: u32, window: &Window, cx: &mut Context<Self>) {
+    fn jump_to(&mut self, id: NodeId, window: &Window, cx: &mut Context<Self>) {
         if self.doc.node(id).is_none() {
             return;
         }
@@ -1277,7 +1278,7 @@ impl Editor {
                     .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
                     .flatten()
                     .and_then(|to| self.doc.node(to))
-                    .map(node_label);
+                    .map(|target| node_label(&self.doc, target));
                 node_box(
                     node,
                     view,
@@ -1372,7 +1373,7 @@ impl Editor {
                     this.child(div().text_color(rgb(0x6c6c78)).child("No matches."))
                 })
                 .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
-                    let label = node_label(self.doc.node(id)?);
+                    let label = node_label(&self.doc, self.doc.node(id)?);
                     Some(
                         div()
                             .id(("search-result", id))
@@ -1407,11 +1408,6 @@ impl Editor {
     /// at to what it stands at now, and goes read-only: a click that edited a default while
     /// the pane displayed a live value would be editing one thing and showing another.
     fn vars_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // ponytail: the pane does not scroll, so a long list would run off the bottom.
-        // Scrolling is the real fix; a bigger cap is not.
-        const MAX_ROWS: usize = 20;
-
-        let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
         let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
         // A rename the document has moved on from — undone, deleted, or in a file that has
         // since been closed — is simply not a rename any more.
@@ -1420,6 +1416,21 @@ impl Editor {
             .clone()
             .filter(|name| self.doc.variable(name).is_some());
         let is_rename = renaming.is_some();
+
+        // Grouped by the set in the name, in first-seen order, each group carrying the
+        // *index* into `doc.variables` — every row id and handler still keys on the whole
+        // dotted name, since that is what the document is keyed by.
+        let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+        for (i, variable) in self.doc.variables.iter().enumerate() {
+            let set = split_set(&variable.name).0;
+            match groups.iter_mut().find(|(s, _)| *s == set) {
+                Some((_, rows)) => rows.push(i),
+                None => groups.push((set, vec![i])),
+            }
+        }
+        // Nothing dotted means nothing to group, and a document that never adopted the
+        // convention must not grow a header saying so.
+        let any_sets = groups.iter().any(|(set, _)| set.is_some());
 
         div()
             .flex()
@@ -1437,100 +1448,46 @@ impl Editor {
                 Some(_) => "Variables (now)",
                 None => "Variables (start)",
             }))
-            .children(
-                self.doc
-                    .variables
-                    .iter()
-                    .take(MAX_ROWS)
-                    .enumerate()
-                    .map(|(i, variable)| {
-                        let shown = playing
-                            .as_ref()
-                            .and_then(|vars| vars.get(&variable.name).copied())
-                            .unwrap_or(variable.default);
-                        let Value::Bool(on) = shown;
-                        let name = variable.name.clone();
-                        let to_rename = variable.name.clone();
-                        let to_remove = variable.name.clone();
-
+            .child(
+                // The list scrolls, not the pane: the heading above and the declare field
+                // below stay put however many variables the document holds. `min_h(0)` is
+                // what lets a flex child shrink below its content and actually overflow.
+                div()
+                    .id("var-list")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(groups.into_iter().map(|(set, rows)| {
                         div()
                             .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id(("var-toggle", i))
-                                    .flex()
-                                    .gap_2()
-                                    .flex_grow()
-                                    .truncate()
-                                    .text_color(if on { rgb(0xf7c96a) } else { rgb(0xb8b8c4) })
-                                    .child(if on { "☑" } else { "☐" })
-                                    .child(variable.name.clone())
-                                    .when(playing.is_none(), |this| {
-                                        this.cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.doc.checkpoint();
-                                                this.doc.set_default(&name, Value::Bool(!on));
-                                                cx.notify();
-                                            }))
-                                    }),
-                            )
-                            .when(playing.is_none(), |this| {
+                            .flex_col()
+                            .gap_1()
+                            .when(any_sets, |this| {
                                 this.child(
                                     div()
-                                        .id(("var-rename", i))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .text_color(rgb(0x6c6c78))
-                                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
-                                        .child("✎")
-                                        // Not an edit yet, so no checkpoint — it only aims
-                                        // the field the declare button already uses.
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.renaming = Some(to_rename.clone());
-                                            this.var_input.update(cx, |input, cx| {
-                                                input.set_content(&to_rename, cx)
-                                            });
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id(("var-remove", i))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .text_color(rgb(0x6c6c78))
-                                        .hover(|style| style.text_color(rgb(0xff7a7a)))
-                                        .child("×")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.doc.checkpoint();
-                                            // Effects naming it go with it, so say how many.
-                                            let dropped = this.doc.remove_variable(&to_remove);
-                                            if dropped > 0 {
-                                                let s = if dropped == 1 { "" } else { "s" };
-                                                this.set_status(
-                                                    format!(
-                                                        "Removed \"{to_remove}\" and {dropped} effect{s}."
-                                                    ),
-                                                    cx,
-                                                );
-                                            }
-                                            cx.notify();
-                                        })),
+                                        .text_color(rgb(0x8a8a96))
+                                        .truncate()
+                                        .child(set.map_or_else(
+                                            || "(ungrouped)".to_string(),
+                                            str::to_string,
+                                        )),
                                 )
                             })
-                    }),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .when(any_sets, |this| this.pl_2())
+                                    .children(rows.into_iter().map(|i| {
+                                        self.var_row(i, playing.as_ref(), cx)
+                                    })),
+                            )
+                    })),
             )
-            .when(more > 0, |this| {
-                this.child(
-                    div()
-                        .text_color(rgb(0x6c6c78))
-                        .child(format!("…and {more} more")),
-                )
-            })
             .when(playing.is_none(), |this| {
                 this.when_some(renaming.clone(), |this, old| {
                     this.child(
@@ -1611,13 +1568,104 @@ impl Editor {
             })
     }
 
+    /// One row of the variables pane: the flag's state, its name, and the rename and remove
+    /// buttons. `i` is the index into `doc.variables` and is only an element id and a lookup
+    /// — every mutation below names the variable by its whole dotted name, because that, not
+    /// the position, is what the document is keyed by.
+    fn var_row(
+        &self,
+        i: usize,
+        playing: Option<&VarState>,
+        cx: &mut Context<Self>,
+        // The row owns everything it draws, so it borrows nothing back — which is what lets the
+        // grouped `.children(..)` loops below build one inside a closure.
+    ) -> impl IntoElement + use<> {
+        let variable = &self.doc.variables[i];
+        let shown = playing
+            .and_then(|vars| vars.get(&variable.name).copied())
+            .unwrap_or(variable.default);
+        let Value::Bool(on) = shown;
+        let name = variable.name.clone();
+        let to_rename = variable.name.clone();
+        let to_remove = variable.name.clone();
+        // Under a group header the set is already overhead, so the row shows only the rest.
+        let label = split_set(&variable.name).1.to_string();
+
+        div()
+            .flex()
+            .gap_2()
+            .child(
+                div()
+                    .id(("var-toggle", i))
+                    .flex()
+                    .gap_2()
+                    .flex_grow()
+                    .truncate()
+                    .text_color(if on { rgb(0xf7c96a) } else { rgb(0xb8b8c4) })
+                    .child(if on { "☑" } else { "☐" })
+                    .child(label)
+                    .when(playing.is_none(), |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.doc.checkpoint();
+                                this.doc.set_default(&name, Value::Bool(!on));
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .when(playing.is_none(), |this| {
+                this.child(
+                    div()
+                        .id(("var-rename", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("✎")
+                        // Not an edit yet, so no checkpoint — it only aims
+                        // the field the declare button already uses.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.renaming = Some(to_rename.clone());
+                            this.var_input
+                                .update(cx, |input, cx| input.set_content(&to_rename, cx));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("var-remove", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                        .child("×")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.doc.checkpoint();
+                            // Effects naming it go with it, so say how many.
+                            let dropped = this.doc.remove_variable(&to_remove);
+                            if dropped > 0 {
+                                let s = if dropped == 1 { "" } else { "s" };
+                                this.set_status(
+                                    format!("Removed \"{to_remove}\" and {dropped} effect{s}."),
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
     /// What the instructions between the previous node the player saw and the current one
     /// wrote, in the order they ran.
-    fn effects_fired(&self, path: &[u32]) -> Vec<(String, Value)> {
+    fn effects_fired(&self, path: &[NodeId]) -> Vec<(String, Value)> {
         let Some(before) = path.len().checked_sub(1) else {
             return Vec::new();
         };
-        let mut run: Vec<u32> = path[..before]
+        let mut run: Vec<NodeId> = path[..before]
             .iter()
             .rev()
             .take_while(|&&id| !self.doc.pauses_play(id))
@@ -1635,7 +1683,7 @@ impl Editor {
     /// The conversation as a reader meets it: what the current node says, and the choices
     /// leading out of it. Replaces the inspector while it is up, so the sidebar is never
     /// both an editor and a player.
-    fn play_panel(&self, path: &[u32], cx: &mut Context<Self>) -> impl IntoElement {
+    fn play_panel(&self, path: &[NodeId], cx: &mut Context<Self>) -> impl IntoElement {
         let row = |id: (&'static str, usize), label: String, color: u32| {
             div()
                 .id(id)
@@ -1826,7 +1874,7 @@ impl Editor {
     /// keeping the one-target invariant `Doc::add_edge` enforces — otherwise the extra
     /// edges would stop being drawn and the canvas would quietly lie about the graph. It
     /// is checkpointed like any other edit, so an undo brings them back.
-    fn kind_picker(&self, id: u32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn kind_picker(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
 
         // Wraps: five labels do not fit across `SIDEBAR_W`, and without this the last kind
@@ -1886,7 +1934,7 @@ impl Editor {
     /// there is no add button, no remove button, and no way to name the same variable
     /// twice. Both kinds share this so the two editors cannot drift apart — the model keeps
     /// `effects` and `conditions` apart because the *names* would lie, not the widgets.
-    fn var_rows(&self, id: u32, mode: VarRow, cx: &mut Context<Self>) -> impl IntoElement {
+    fn var_rows(&self, id: NodeId, mode: VarRow, cx: &mut Context<Self>) -> impl IntoElement {
         // ponytail: capped like the sibling panels. Past this the sidebar needs to scroll,
         // which is the actual fix rather than a bigger cap.
         const MAX_ROWS: usize = 8;
@@ -1988,7 +2036,7 @@ impl Editor {
 
     /// Marks a node as a deliberate ending, which is what keeps it out of the dead-end
     /// warnings. A discrete edit, so it checkpoints outright rather than coalescing.
-    fn end_toggle(&self, id: u32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn end_toggle(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
         let on = self.doc.node(id).is_some_and(|node| node.end);
         div()
             .id("end-toggle")
@@ -2043,32 +2091,36 @@ impl Editor {
                         // Each kind shows the fields it actually has: a jump has none of
                         // its own, and a hub has no speaker because nobody speaks at one.
                         let kind = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
-                        this.child(div().text_color(rgb(0x9ecbff)).child(format!("Node {id}")))
-                            .child(self.kind_picker(id, cx))
-                            // Outside every kind guard on purpose: an alias is orthogonal to
-                            // `NodeKind` the way `end` is, and a game may want to enter a
-                            // conversation at a hub or a condition too.
-                            .child(field("Alias", &self.alias_input))
-                            .when(kind == NodeKind::Speech, |this| {
-                                this.child(field("Speaker", &self.speaker_input))
-                            })
-                            .when(matches!(kind, NodeKind::Speech | NodeKind::Hub), |this| {
-                                let label = if kind == NodeKind::Hub {
-                                    "Label"
-                                } else {
-                                    "Text"
-                                };
-                                this.child(field(label, &self.text_input))
-                            })
-                            .when(kind == NodeKind::Instruction, |this| {
-                                this.child(self.var_rows(id, VarRow::Sets, cx))
-                            })
-                            .when(kind == NodeKind::Condition, |this| {
-                                this.child(self.var_rows(id, VarRow::Checks, cx))
-                            })
-                            .when(kind == NodeKind::Speech, |this| {
-                                this.child(self.end_toggle(id, cx))
-                            })
+                        this.child(
+                            div()
+                                .text_color(rgb(0x9ecbff))
+                                .child(node_number(&self.doc, id)),
+                        )
+                        .child(self.kind_picker(id, cx))
+                        // Outside every kind guard on purpose: an alias is orthogonal to
+                        // `NodeKind` the way `end` is, and a game may want to enter a
+                        // conversation at a hub or a condition too.
+                        .child(field("Alias", &self.alias_input))
+                        .when(kind == NodeKind::Speech, |this| {
+                            this.child(field("Speaker", &self.speaker_input))
+                        })
+                        .when(matches!(kind, NodeKind::Speech | NodeKind::Hub), |this| {
+                            let label = if kind == NodeKind::Hub {
+                                "Label"
+                            } else {
+                                "Text"
+                            };
+                            this.child(field(label, &self.text_input))
+                        })
+                        .when(kind == NodeKind::Instruction, |this| {
+                            this.child(self.var_rows(id, VarRow::Sets, cx))
+                        })
+                        .when(kind == NodeKind::Condition, |this| {
+                            this.child(self.var_rows(id, VarRow::Checks, cx))
+                        })
+                        .when(kind == NodeKind::Speech, |this| {
+                            this.child(self.end_toggle(id, cx))
+                        })
                     }
                     (None, Selection::Nodes(ids)) => this
                         .child(
@@ -2085,7 +2137,11 @@ impl Editor {
                         let index = *index;
                         let edge = self.doc.edges.get(index);
                         let title = match edge {
-                            Some(edge) => format!("Node {} → Node {}", edge.from, edge.to),
+                            Some(edge) => format!(
+                                "{} → {}",
+                                node_number(&self.doc, edge.from),
+                                node_number(&self.doc, edge.to)
+                            ),
                             None => "Edge".into(),
                         };
                         // Out of a condition this edge is a pin, not a choice: the player
@@ -2167,10 +2223,21 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
     )
 }
 
-/// How a node reads in a list: what it says, or who says it, or its id as a last resort.
-fn node_label(node: &Node) -> String {
+/// What to call a node when it has nothing to say for itself. Its *position*, not its id:
+/// ids are random `u64` and would print as nineteen digits. A position shifts when a node
+/// ahead of it is deleted, which is fine for a label — the alias is the handle that does
+/// not move, and it is deliberately empty on almost every node.
+fn node_number(doc: &Doc, id: NodeId) -> String {
+    match doc.nodes.iter().position(|n| n.id == id) {
+        Some(index) => format!("Node {}", index + 1),
+        None => "a missing node".into(),
+    }
+}
+
+/// How a node reads in a list: what it says, or who says it, or its position as a last resort.
+fn node_label(doc: &Doc, node: &Node) -> String {
     match (node.speaker.trim(), node.text.trim()) {
-        ("", "") => format!("Node {}", node.id),
+        ("", "") => node_number(doc, node.id),
         ("", text) => text.to_string(),
         (speaker, "") => speaker.to_string(),
         (speaker, text) => format!("{speaker} — {text}"),
@@ -2179,9 +2246,9 @@ fn node_label(node: &Node) -> String {
 
 /// Wording for a problem row. Lives here, not in `doc.rs`, which stays free of view text.
 fn problem_text(problem: &Problem, doc: &Doc) -> String {
-    let label = |id: u32| match doc.node(id) {
-        Some(node) => node_label(node),
-        None => format!("Node {id}"),
+    let label = |id: NodeId| match doc.node(id) {
+        Some(node) => node_label(doc, node),
+        None => node_number(doc, id),
     };
     match problem {
         Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
@@ -2207,6 +2274,16 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         Problem::DuplicateAlias(id, alias) => {
             format!("Alias \"{alias}\" is used twice: {}", label(*id))
         }
+        // Named by its ends rather than its index: two edges between the same pair is what
+        // the author has to see, and the index alone says nothing about where to look.
+        Problem::DuplicateEdge(index) => match doc.edges.get(*index) {
+            Some(edge) => format!(
+                "The same choice twice: {} → {}",
+                label(edge.from),
+                label(edge.to)
+            ),
+            None => format!("Edge {index} is a duplicate"),
+        },
     }
 }
 
