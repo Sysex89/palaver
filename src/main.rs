@@ -2,8 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, Severity, Value,
-    VarState, View, clear_backup, in_port, node_center, out_port, read_backup, split_set,
+    Cmp, Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp, Severity,
+    Value, VarState, View, clear_backup, in_port, node_center, out_port, read_backup, split_set,
     with_default_extension,
 };
 use gpui::{
@@ -190,6 +190,15 @@ struct Editor {
     /// `vars_pane` filters a name the document no longer has, which covers the swap, an
     /// undo and a delete in one place instead of three that can be forgotten.
     renaming: Option<String>,
+    /// The number editor, shared by the variables pane and the inspector's Sets/Checks rows
+    /// so there is only ever one half-typed number in the crate. Outside the `sync_fields`
+    /// loop for the same reason `var_input` is — a number being typed is not the selected
+    /// node's content, and syncing it would write every keystroke into the document.
+    value_input: Entity<TextInput>,
+    /// Whose value `value_input` holds, or `None` when nothing is being typed. Filtered
+    /// against the document at render like `renaming` is, rather than cleared at every site
+    /// that could invalidate it.
+    editing: Option<ValueTarget>,
     /// What is currently loaded into the sidebar fields.
     edited: Selection,
     /// Whether this editing session already pushed an undo checkpoint.
@@ -221,6 +230,15 @@ enum Selection {
     None,
     Nodes(Vec<NodeId>),
     Edge(usize),
+}
+
+/// Which value the shared number editor is aimed at: a variable's starting value, what an
+/// instruction writes, or what a condition compares against.
+#[derive(Clone, PartialEq)]
+enum ValueTarget {
+    Default(String),
+    Effect(NodeId, String),
+    Check(NodeId, String),
 }
 
 /// Which side of a variable a `var_rows` list is editing: what an instruction writes, or
@@ -311,7 +329,8 @@ impl Editor {
         // ask for a re-render — without this, typing would not refresh what they drive.
         let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
         let var_input = cx.new(|cx| TextInput::new("New flag", cx));
-        for input in [&search_input, &var_input] {
+        let value_input = cx.new(|cx| TextInput::new("0", cx));
+        for input in [&search_input, &var_input, &value_input] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
         }
 
@@ -340,7 +359,9 @@ impl Editor {
             label_input,
             search_input,
             var_input,
+            value_input,
             renaming: None,
+            editing: None,
             edited: Selection::None,
             text_dirty: false,
             path: None,
@@ -1568,10 +1589,99 @@ impl Editor {
             })
     }
 
-    /// One row of the variables pane: the flag's state, its name, and the rename and remove
-    /// buttons. `i` is the index into `doc.variables` and is only an element id and a lookup
-    /// — every mutation below names the variable by its whole dotted name, because that, not
-    /// the position, is what the document is keyed by.
+    /// The target the number editor is aimed at, if the document still has it. A variable or
+    /// a node that has gone — undone, deleted, or in a file that has since been closed — is
+    /// not a target any more, which is the filtering `renaming` gets and for the same reason:
+    /// one place, rather than every site that could invalidate it.
+    fn editing_target(&self) -> Option<&ValueTarget> {
+        self.editing.as_ref().filter(|target| match target {
+            ValueTarget::Default(name) => self.doc.variable(name).is_some(),
+            ValueTarget::Effect(id, _) | ValueTarget::Check(id, _) => self.doc.node(*id).is_some(),
+        })
+    }
+
+    /// Aims the number editor at `target`, starting from the number that is there now.
+    fn edit_value(&mut self, target: ValueTarget, from: i64, cx: &mut Context<Self>) {
+        self.editing = Some(target);
+        self.value_input
+            .update(cx, |input, cx| input.set_content(&from.to_string(), cx));
+        cx.notify();
+    }
+
+    /// A number as it sits in a row: click it to type a new one.
+    fn number_cell(
+        &self,
+        id: (&'static str, usize),
+        n: i64,
+        target: ValueTarget,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .id(id)
+            .px_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_color(rgb(0xf7c96a))
+            .hover(|style| style.bg(rgb(0x33333c)))
+            .child(n.to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.edit_value(target.clone(), n, cx);
+            }))
+    }
+
+    /// The number field and its commit button, drawn in place of whatever value the author
+    /// clicked. One field for the whole crate, so there is never a second half-typed number
+    /// lying around. A number that will not parse is simply refused, and the field keeping
+    /// its content is what says so — the same idiom as a duplicate variable name.
+    fn value_editor(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let target = self.editing.clone();
+        div()
+            .flex()
+            .gap_1()
+            .items_center()
+            .child(div().w(px(52.0)).child(self.value_input.clone()))
+            .child(
+                div()
+                    .id("value-commit")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(0x8a8a96))
+                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .child("✓")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(target) = target.clone() else {
+                            return;
+                        };
+                        let Ok(n) = this.value_input.read(cx).content().trim().parse::<i64>()
+                        else {
+                            return;
+                        };
+                        let value = Value::Int(n);
+                        this.doc.checkpoint();
+                        match &target {
+                            ValueTarget::Default(name) => this.doc.set_default(name, value),
+                            // The operator is not what is being edited here, so it is read
+                            // back and written straight through.
+                            ValueTarget::Effect(id, name) => {
+                                let op = this.doc.effect_of(*id, name).map_or(SetOp::Set, |e| e.op);
+                                this.doc.set_effect(*id, name, Some(value), op);
+                            }
+                            ValueTarget::Check(id, name) => {
+                                let op = this.doc.condition_of(*id, name).map_or(Cmp::Eq, |c| c.op);
+                                this.doc.set_condition(*id, name, Some(value), op);
+                            }
+                        }
+                        this.editing = None;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// One row of the variables pane: the flag's state or the number it holds, its name, and
+    /// the type, rename and remove buttons. `i` is the index into `doc.variables` and is only
+    /// an element id and a lookup — every mutation below names the variable by its whole
+    /// dotted name, because that, not the position, is what the document is keyed by.
     fn var_row(
         &self,
         i: usize,
@@ -1584,18 +1694,24 @@ impl Editor {
         let shown = playing
             .and_then(|vars| vars.get(&variable.name).copied())
             .unwrap_or(variable.default);
-        let Value::Bool(on) = shown;
         let name = variable.name.clone();
+        let to_type = variable.name.clone();
         let to_rename = variable.name.clone();
         let to_remove = variable.name.clone();
         // Under a group header the set is already overhead, so the row shows only the rest.
         let label = split_set(&variable.name).1.to_string();
+        let is_int = matches!(variable.default, Value::Int(_));
+        let editing = self
+            .editing_target()
+            .is_some_and(|target| *target == ValueTarget::Default(name.clone()));
 
         div()
             .flex()
             .gap_2()
-            .child(
-                div()
+            .items_center()
+            .child(match shown {
+                // A flag is its own control: the box shows the state and clicking it flips.
+                Value::Bool(on) => div()
                     .id(("var-toggle", i))
                     .flex()
                     .gap_2()
@@ -1612,10 +1728,64 @@ impl Editor {
                                 this.doc.set_default(&name, Value::Bool(!on));
                                 cx.notify();
                             }))
-                    }),
-            )
-            .when(playing.is_none(), |this| {
+                    })
+                    .into_any_element(),
+                // A number is typed rather than cycled, so the name and the value are two
+                // controls instead of one.
+                Value::Int(n) => div()
+                    .flex()
+                    .gap_2()
+                    .flex_grow()
+                    .truncate()
+                    .items_center()
+                    .text_color(rgb(0xb8b8c4))
+                    .child(div().flex_grow().truncate().child(label))
+                    .child(if editing {
+                        self.value_editor(cx).into_any_element()
+                    } else if playing.is_some() {
+                        // Read-only while playing, like everything else in the pane.
+                        div()
+                            .px_1()
+                            .text_color(rgb(0xf7c96a))
+                            .child(n.to_string())
+                            .into_any_element()
+                    } else {
+                        self.number_cell(("var-value", i), n, ValueTarget::Default(name), cx)
+                            .into_any_element()
+                    })
+                    .into_any_element(),
+            })
+            .when(playing.is_none() && !editing, |this| {
                 this.child(
+                    // The one place a variable's type changes. Lit when it holds a number,
+                    // since a row showing 0 says nothing about the type on its own.
+                    div()
+                        .id(("var-type", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(if is_int { rgb(0xf7c96a) } else { rgb(0x6c6c78) })
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("#")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.doc.checkpoint();
+                            let to = if is_int {
+                                Value::Bool(false)
+                            } else {
+                                Value::Int(0)
+                            };
+                            // Effects and checks are converted with it, so say how many.
+                            let moved = this.doc.retype_variable(&to_type, to);
+                            let kind = if is_int { "a flag" } else { "a number" };
+                            let s = if moved == 1 { "" } else { "s" };
+                            this.set_status(
+                                format!("\"{to_type}\" is now {kind} — {moved} reference{s}."),
+                                cx,
+                            );
+                            cx.notify();
+                        })),
+                )
+                .child(
                     div()
                         .id(("var-rename", i))
                         .px_1()
@@ -1661,7 +1831,7 @@ impl Editor {
 
     /// What the instructions between the previous node the player saw and the current one
     /// wrote, in the order they ran.
-    fn effects_fired(&self, path: &[NodeId]) -> Vec<(String, Value)> {
+    fn effects_fired(&self, path: &[NodeId]) -> Vec<(String, SetOp, Value)> {
         let Some(before) = path.len().checked_sub(1) else {
             return Vec::new();
         };
@@ -1676,7 +1846,7 @@ impl Editor {
             .filter_map(|&id| self.doc.node(id))
             .filter(|node| node.kind == NodeKind::Instruction)
             .flat_map(|node| node.effects.iter())
-            .map(|effect| (effect.var.clone(), effect.value))
+            .map(|effect| (effect.var.clone(), effect.op, effect.value))
             .collect()
     }
 
@@ -1747,11 +1917,17 @@ impl Editor {
             })
             // What the instructions walked through on the way here did. Without this the
             // only evidence is the variables panel changing in the corner of your eye.
-            .children(self.effects_fired(path).into_iter().map(|(var, value)| {
-                div()
-                    .text_color(rgb(0x8ce99a))
-                    .child(format!("{var} = {}", value_text(value)))
-            }))
+            .children(
+                self.effects_fired(path)
+                    .into_iter()
+                    .map(|(var, op, value)| {
+                        div().text_color(rgb(0x8ce99a)).child(format!(
+                            "{var} {} {}",
+                            set_text(op),
+                            value_text(value)
+                        ))
+                    }),
+            )
             .children(
                 self.doc
                     .choices(current)
@@ -1963,40 +2139,121 @@ impl Editor {
                     .take(MAX_ROWS)
                     .enumerate()
                     .map(|(i, variable)| {
-                        let current = match mode {
-                            VarRow::Sets => self.doc.effect_of(id, &variable.name),
-                            VarRow::Checks => self.doc.condition_of(id, &variable.name),
-                        };
                         let name = variable.name.clone();
+                        let int = matches!(variable.default, Value::Int(_));
+                        // What the node holds now: the value, and the operator glyph that
+                        // goes in front of it.
+                        let current: Option<(Value, &'static str)> = match mode {
+                            VarRow::Sets => self
+                                .doc
+                                .effect_of(id, &variable.name)
+                                .map(|e| (e.value, set_text(e.op))),
+                            VarRow::Checks => self
+                                .doc
+                                .condition_of(id, &variable.name)
+                                .map(|c| (c.want, cmp_text(c.op))),
+                        };
+                        // A flag is a checkbox; a number has no box to tick, so it shows the
+                        // operator there instead and the value beside the name.
                         let (glyph, color) = match current {
                             None => ("—", rgb(0x6c6c78)),
-                            Some(Value::Bool(true)) => ("☑", rgb(0x8ce99a)),
-                            Some(Value::Bool(false)) => ("☐", rgb(0xf7c96a)),
+                            Some((Value::Bool(true), _)) => ("☑", rgb(0x8ce99a)),
+                            Some((Value::Bool(false), _)) => ("☐", rgb(0xf7c96a)),
+                            Some((Value::Int(_), op)) => (op, rgb(0x8ce99a)),
                         };
+                        let number = match current {
+                            Some((Value::Int(n), _)) => Some(n),
+                            _ => None,
+                        };
+                        let target = match mode {
+                            VarRow::Sets => ValueTarget::Effect(id, name.clone()),
+                            VarRow::Checks => ValueTarget::Check(id, name.clone()),
+                        };
+                        let editing = self.editing_target().is_some_and(|aimed| *aimed == target);
 
                         div()
-                            .id(("var-row", i))
                             .flex()
                             .gap_2()
-                            .truncate()
-                            .cursor_pointer()
-                            .text_color(color)
-                            .hover(|style| style.bg(rgb(0x33333c)))
-                            .child(glyph)
-                            .child(variable.name.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let next = match current {
-                                    None => Some(Value::Bool(true)),
-                                    Some(Value::Bool(true)) => Some(Value::Bool(false)),
-                                    Some(Value::Bool(false)) => None,
-                                };
-                                this.doc.checkpoint();
-                                match mode {
-                                    VarRow::Sets => this.doc.set_effect(id, &name, next),
-                                    VarRow::Checks => this.doc.set_condition(id, &name, next),
-                                }
-                                cx.notify();
-                            }))
+                            .items_center()
+                            .child(
+                                div()
+                                    .id(("var-row", i))
+                                    .flex()
+                                    .gap_2()
+                                    .flex_grow()
+                                    .truncate()
+                                    .cursor_pointer()
+                                    .text_color(color)
+                                    .hover(|style| style.bg(rgb(0x33333c)))
+                                    .child(glyph)
+                                    .child(variable.name.clone())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.doc.checkpoint();
+                                        // One gesture per side, both ending back at cleared:
+                                        // a flag cycles its two states, a number cycles its
+                                        // operators and keeps whatever value it already had.
+                                        match mode {
+                                            VarRow::Sets => {
+                                                let now = this
+                                                    .doc
+                                                    .effect_of(id, &name)
+                                                    .map(|e| (e.value, e.op));
+                                                let next = match (int, now) {
+                                                    (false, None) => {
+                                                        Some((Value::Bool(true), SetOp::Set))
+                                                    }
+                                                    (false, Some((Value::Bool(true), _))) => {
+                                                        Some((Value::Bool(false), SetOp::Set))
+                                                    }
+                                                    (false, _) => None,
+                                                    (true, None) => {
+                                                        Some((Value::Int(0), SetOp::Set))
+                                                    }
+                                                    (true, Some((value, SetOp::Set))) => {
+                                                        Some((value, SetOp::Add))
+                                                    }
+                                                    (true, Some(_)) => None,
+                                                };
+                                                this.doc.set_effect(
+                                                    id,
+                                                    &name,
+                                                    next.map(|(value, _)| value),
+                                                    next.map_or(SetOp::Set, |(_, op)| op),
+                                                );
+                                            }
+                                            VarRow::Checks => {
+                                                let now = this
+                                                    .doc
+                                                    .condition_of(id, &name)
+                                                    .map(|c| (c.want, c.op));
+                                                let next = match (int, now) {
+                                                    (false, None) => {
+                                                        Some((Value::Bool(true), Cmp::Eq))
+                                                    }
+                                                    (false, Some((Value::Bool(true), _))) => {
+                                                        Some((Value::Bool(false), Cmp::Eq))
+                                                    }
+                                                    (false, _) => None,
+                                                    (true, None) => Some((Value::Int(0), Cmp::Eq)),
+                                                    (true, Some((want, op))) => {
+                                                        next_cmp(op).map(|op| (want, op))
+                                                    }
+                                                };
+                                                this.doc.set_condition(
+                                                    id,
+                                                    &name,
+                                                    next.map(|(want, _)| want),
+                                                    next.map_or(Cmp::Eq, |(_, op)| op),
+                                                );
+                                            }
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(editing, |this| this.child(self.value_editor(cx)))
+                            .when_some(number.filter(|_| !editing), |this, n| {
+                                this.child(self.number_cell(("var-num", i), n, target, cx))
+                            })
                     }),
             )
             .when(more > 0, |this| {
@@ -2268,6 +2525,9 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         Problem::UnknownVar(id, var) => {
             format!("Uses an undeclared variable \"{var}\": {}", label(*id))
         }
+        Problem::TypeMismatch(id, var) => {
+            format!("Wrong kind of value for \"{var}\": {}", label(*id))
+        }
         Problem::UnwiredBranch(id, branch) => {
             format!("Nothing on the {branch} branch of: {}", label(*id))
         }
@@ -2394,7 +2654,9 @@ fn node_box(
                             [] => "(sets nothing)".to_string(),
                             effects => effects
                                 .iter()
-                                .map(|e| format!("{} = {}", e.var, value_text(e.value)))
+                                .map(|e| {
+                                    format!("{} {} {}", e.var, set_text(e.op), value_text(e.value))
+                                })
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                         }),
@@ -2414,7 +2676,9 @@ fn node_box(
                             [] => "(checks nothing)".to_string(),
                             conditions => conditions
                                 .iter()
-                                .map(|c| format!("{} == {}", c.var, value_text(c.want)))
+                                .map(|c| {
+                                    format!("{} {} {}", c.var, cmp_text(c.op), value_text(c.want))
+                                })
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                         }),
@@ -2423,10 +2687,43 @@ fn node_box(
 }
 
 /// A value as the canvas and the play panel both write it.
-fn value_text(value: Value) -> &'static str {
+fn value_text(value: Value) -> String {
     match value {
-        Value::Bool(true) => "true",
-        Value::Bool(false) => "false",
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
+    }
+}
+
+/// How an instruction's write reads.
+fn set_text(op: SetOp) -> &'static str {
+    match op {
+        SetOp::Set => "=",
+        SetOp::Add => "+=",
+    }
+}
+
+/// How a condition's check reads.
+fn cmp_text(op: Cmp) -> &'static str {
+    match op {
+        Cmp::Eq => "==",
+        Cmp::Ne => "!=",
+        Cmp::Lt => "<",
+        Cmp::Le => "<=",
+        Cmp::Gt => ">",
+        Cmp::Ge => ">=",
+    }
+}
+
+/// The next comparison the inspector's click-cycle offers, ending at `None` — cleared — so
+/// the gesture matches the flag cycle beside it.
+fn next_cmp(op: Cmp) -> Option<Cmp> {
+    match op {
+        Cmp::Eq => Some(Cmp::Ne),
+        Cmp::Ne => Some(Cmp::Lt),
+        Cmp::Lt => Some(Cmp::Le),
+        Cmp::Le => Some(Cmp::Gt),
+        Cmp::Gt => Some(Cmp::Ge),
+        Cmp::Ge => None,
     }
 }
 

@@ -2,6 +2,7 @@
 //! Nothing here knows about gpui, which is what keeps it testable.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
@@ -220,6 +221,18 @@ pub struct Node {
 pub struct Effect {
     pub var: String,
     pub value: Value,
+    /// How the value lands: replaced, or added to what is there. `default` so `.dln` files
+    /// written before ints keep loading — they only ever assigned.
+    #[serde(default)]
+    pub op: SetOp,
+}
+
+/// How an [`Effect`] writes. `Add` is only meaningful on two ints; see [`apply`].
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub enum SetOp {
+    #[default]
+    Set,
+    Add,
 }
 
 /// A check a [`NodeKind::Condition`] node makes. Every one on a node must hold for the flow
@@ -228,22 +241,111 @@ pub struct Effect {
 pub struct Condition {
     pub var: String,
     pub want: Value,
+    /// How the variable is compared to `want`. `default` so files written before ints keep
+    /// loading — every check they hold is an equality.
+    #[serde(default)]
+    pub op: Cmp,
+}
+
+/// How a [`Condition`] compares. The ordering four are int-only; a flag has nothing to be
+/// less than.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub enum Cmp {
+    #[default]
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cmp {
+    /// Whether this comparison accepts the ordering the two values came out at.
+    fn allows(self, ord: Ordering) -> bool {
+        match self {
+            Cmp::Eq => ord.is_eq(),
+            Cmp::Ne => ord.is_ne(),
+            Cmp::Lt => ord.is_lt(),
+            Cmp::Le => ord.is_le(),
+            Cmp::Gt => ord.is_gt(),
+            Cmp::Ge => ord.is_ge(),
+        }
+    }
+
+    /// Whether this comparison means anything against `value`. Ordering a flag does not, so
+    /// [`Doc::problems`] reports it and [`Doc::retype_variable`] clamps it away.
+    pub fn fits(self, value: Value) -> bool {
+        matches!(value, Value::Int(_)) || matches!(self, Cmp::Eq | Cmp::Ne)
+    }
 }
 
 impl Condition {
     /// A variable nothing declares never holds, so a broken file takes the false branch
-    /// rather than deciding anything. [`Doc::problems`] reports it separately.
+    /// rather than deciding anything — and a check against the wrong type answers the same
+    /// way, since there is no ordering across types. [`Doc::problems`] reports both.
     pub fn holds(&self, vars: &VarState) -> bool {
-        vars.get(&self.var) == Some(&self.want)
+        vars.get(&self.var)
+            .and_then(|have| have.partial_cmp(&self.want))
+            .is_some_and(|ord| self.op.allows(ord))
     }
 }
 
-/// What a variable holds. One variant today, but an enum from the start: serde tags it as
-/// `{"Bool": true}`, so adding the int and string the roadmap wants is a pure addition that
-/// leaves every existing `.dln` loading unchanged.
+/// What a variable holds. Serde tags it as `{"Bool": true}`, which is why `Int` was a pure
+/// addition that left every existing `.dln` loading unchanged.
+///
+/// A variable's *type* is which variant its [`Variable::default`] holds — there is no
+/// separate type field to keep in step with the value.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Value {
     Bool(bool),
+    Int(i64),
+}
+
+/// Hand-written, not derived: a derived `PartialOrd` orders by *variant*, which would make
+/// `Bool(true) < Int(0)`. A comparison across types must have no answer rather than a wrong
+/// one — that `None` is what makes [`Condition::holds`] false on a mistyped check.
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+}
+
+impl Value {
+    /// Whether both are the same kind, which is what makes an effect or a check on a
+    /// variable legal. `discriminant` rather than a `Kind` enum: stdlib, and nothing to keep
+    /// in sync when a variant is added.
+    pub fn same_kind(self, other: Value) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+    }
+
+    /// This value as the same kind as `like`: `false`/`true` become `0`/`1`, and any
+    /// non-zero number becomes `true`. What [`Doc::retype_variable`] converts through.
+    pub fn coerce(self, like: Value) -> Value {
+        match (self, like) {
+            (Value::Bool(b), Value::Int(_)) => Value::Int(i64::from(b)),
+            (Value::Int(n), Value::Bool(_)) => Value::Bool(n != 0),
+            _ => self,
+        }
+    }
+}
+
+/// What `slot` becomes when an effect runs on it. `Add` is only meaningful on two ints;
+/// anything else leaves the slot alone rather than inventing a value, which is what
+/// [`Problem::TypeMismatch`] exists to report.
+///
+/// `saturating_add`, not `+`: a debug build must not panic because an author typed a big
+/// number.
+fn apply(slot: Value, op: SetOp, value: Value) -> Value {
+    match (op, slot, value) {
+        (SetOp::Set, _, value) => value,
+        (SetOp::Add, Value::Int(have), Value::Int(by)) => Value::Int(have.saturating_add(by)),
+        _ => slot,
+    }
 }
 
 /// A global flag the dialogue reads and writes.
@@ -308,6 +410,11 @@ pub enum Problem {
     /// An effect or a check naming a variable nothing declares. Only reachable through a
     /// bad file — removing a variable takes both with it.
     UnknownVar(NodeId, String),
+    /// An effect or a check whose value is the wrong kind for the variable it names, or
+    /// whose operator is (`+=` or `>` on a flag). Only reachable through a bad file — the
+    /// editor converts both sides together, see [`Doc::retype_variable`] — and worth an
+    /// error because such a check silently never holds.
+    TypeMismatch(NodeId, String),
     /// A condition node with nothing wired to one of its pins, so that branch stops the
     /// conversation. The `bool` is which pin.
     UnwiredBranch(NodeId, bool),
@@ -336,6 +443,7 @@ impl Problem {
             | Problem::DeadEnd(id)
             | Problem::Empty(id)
             | Problem::UnknownVar(id, _)
+            | Problem::TypeMismatch(id, _)
             | Problem::UnwiredBranch(id, _)
             | Problem::DuplicateAlias(id, _) => Some(*id),
             _ => None,
@@ -347,6 +455,7 @@ impl Problem {
             Problem::DanglingEdge(_)
             | Problem::NoStart
             | Problem::UnknownVar(..)
+            | Problem::TypeMismatch(..)
             | Problem::DuplicateAlias(..) => Severity::Error,
             _ => Severity::Warning,
         }
@@ -479,6 +588,27 @@ impl Doc {
                 .chain(conditions)
                 .filter(|var| self.variable(var).is_none())
                 .map(|var| Problem::UnknownVar(n.id, var.clone()))
+        }));
+
+        // A value or an operator that does not fit the variable's declared kind. Undeclared
+        // variables are `UnknownVar`'s to report, so they are skipped rather than counted
+        // twice.
+        found.extend(self.nodes.iter().flat_map(|n| {
+            let effects = n.effects.iter().map(|e| {
+                let fits = matches!(e.value, Value::Int(_)) || e.op == SetOp::Set;
+                (&e.var, e.value, fits)
+            });
+            let conditions = n
+                .conditions
+                .iter()
+                .map(|c| (&c.var, c.want, c.op.fits(c.want)));
+            effects
+                .chain(conditions)
+                .filter(|(var, value, fits)| {
+                    self.variable(var)
+                        .is_some_and(|declared| !fits || !declared.default.same_kind(*value))
+                })
+                .map(|(var, _, _)| Problem::TypeMismatch(n.id, var.clone()))
         }));
 
         // Empties are skipped, or every un-aliased node would collide with every other —
@@ -867,19 +997,52 @@ impl Doc {
         moved
     }
 
-    /// What this node writes to `var`, if anything.
-    pub fn effect_of(&self, id: NodeId, var: &str) -> Option<Value> {
-        self.node(id)?
-            .effects
-            .iter()
-            .find(|e| e.var == var)
-            .map(|e| e.value)
+    /// Changes what kind of value a flag holds, converting its default and every effect and
+    /// check that names it — `false`/`true` become `0`/`1`, any non-zero number becomes
+    /// `true`. Returns how many references moved.
+    ///
+    /// A find-and-replace like [`Doc::rename_variable`], and for the same reason: the name is
+    /// the key, so every reference is reachable from here. That makes this the *third*
+    /// function a new variable-naming field would have to join.
+    ///
+    /// Operators are clamped as well as values, since `gold > 5` means nothing once `gold` is
+    /// a flag: an ordering check becomes `==`, and `+=` becomes `=`.
+    pub fn retype_variable(&mut self, name: &str, to: Value) -> usize {
+        let Some(variable) = self.variables.iter_mut().find(|v| v.name == name) else {
+            return 0;
+        };
+        variable.default = variable.default.coerce(to);
+
+        let mut moved = 0;
+        for node in &mut self.nodes {
+            for effect in node.effects.iter_mut().filter(|e| e.var == name) {
+                effect.value = effect.value.coerce(to);
+                if !matches!(effect.value, Value::Int(_)) {
+                    effect.op = SetOp::Set;
+                }
+                moved += 1;
+            }
+            for check in node.conditions.iter_mut().filter(|c| c.var == name) {
+                check.want = check.want.coerce(to);
+                if !check.op.fits(check.want) {
+                    check.op = Cmp::Eq;
+                }
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// What this node writes to `var`, if anything — the whole [`Effect`], since with ints
+    /// the operator is as much of the answer as the value is.
+    pub fn effect_of(&self, id: NodeId, var: &str) -> Option<&Effect> {
+        self.node(id)?.effects.iter().find(|e| e.var == var)
     }
 
     /// Sets — or with `None`, clears — what this node writes to `var`. An upsert, which is
     /// what keeps at most one effect per variable per node and makes their stored order
     /// irrelevant.
-    pub fn set_effect(&mut self, id: NodeId, var: &str, value: Option<Value>) {
+    pub fn set_effect(&mut self, id: NodeId, var: &str, value: Option<Value>, op: SetOp) {
         let Some(node) = self.node_mut(id) else {
             return;
         };
@@ -888,21 +1051,18 @@ impl Doc {
             node.effects.push(Effect {
                 var: var.to_string(),
                 value,
+                op,
             });
         }
     }
 
     /// What this node checks `var` against, if anything.
-    pub fn condition_of(&self, id: NodeId, var: &str) -> Option<Value> {
-        self.node(id)?
-            .conditions
-            .iter()
-            .find(|c| c.var == var)
-            .map(|c| c.want)
+    pub fn condition_of(&self, id: NodeId, var: &str) -> Option<&Condition> {
+        self.node(id)?.conditions.iter().find(|c| c.var == var)
     }
 
     /// The [`Doc::set_effect`] of the checking side, with the same upsert rule.
-    pub fn set_condition(&mut self, id: NodeId, var: &str, want: Option<Value>) {
+    pub fn set_condition(&mut self, id: NodeId, var: &str, want: Option<Value>, op: Cmp) {
         let Some(node) = self.node_mut(id) else {
             return;
         };
@@ -911,6 +1071,7 @@ impl Doc {
             node.conditions.push(Condition {
                 var: var.to_string(),
                 want,
+                op,
             });
         }
     }
@@ -939,7 +1100,7 @@ impl Doc {
             // Only a declared variable. Inventing one here would paper over the broken file
             // that `problems` is about to report.
             if let Some(slot) = vars.get_mut(&effect.var) {
-                *slot = effect.value;
+                *slot = apply(*slot, effect.op, effect.value);
             }
         }
         vars
@@ -1111,11 +1272,16 @@ impl Doc {
         // condition that reads it back are both nodes you can see on the canvas.
         let noted = doc.add_node(1560.0, 160.0);
         doc.node_mut(noted).unwrap().kind = NodeKind::Instruction;
-        doc.set_effect(noted, "asked_about_pass", Some(Value::Bool(true)));
+        doc.set_effect(
+            noted,
+            "asked_about_pass",
+            Some(Value::Bool(true)),
+            SetOp::Set,
+        );
 
         let check = doc.add_node(1260.0, 300.0);
         doc.node_mut(check).unwrap().kind = NodeKind::Condition;
-        doc.set_condition(check, "asked_about_pass", Some(Value::Bool(true)));
+        doc.set_condition(check, "asked_about_pass", Some(Value::Bool(true)), Cmp::Eq);
 
         let warned = node(
             &mut doc,
@@ -1935,11 +2101,176 @@ mod tests {
         assert_eq!(split_set(""), (None, ""));
     }
 
+    #[test]
+    fn an_int_check_compares_with_its_operator() {
+        let vars = VarState::from([("gold".to_string(), Value::Int(10))]);
+        let check = |op: Cmp, want: i64| {
+            Condition {
+                var: "gold".into(),
+                want: Value::Int(want),
+                op,
+            }
+            .holds(&vars)
+        };
+
+        assert!(check(Cmp::Eq, 10));
+        assert!(!check(Cmp::Eq, 11));
+        assert!(check(Cmp::Ne, 11));
+        assert!(check(Cmp::Lt, 11) && !check(Cmp::Lt, 10));
+        assert!(check(Cmp::Le, 10) && !check(Cmp::Le, 9));
+        assert!(check(Cmp::Gt, 9) && !check(Cmp::Gt, 10));
+        assert!(check(Cmp::Ge, 10) && !check(Cmp::Ge, 11));
+    }
+
+    #[test]
+    fn a_check_across_types_never_holds() {
+        let vars = VarState::from([("gold".to_string(), Value::Int(1))]);
+        let check = |want, op| {
+            Condition {
+                var: "gold".into(),
+                want,
+                op,
+            }
+            .holds(&vars)
+        };
+
+        // `Int(1)` and `Bool(true)` have no ordering between them, so no comparison of the
+        // two has an answer — including the one a derived `PartialOrd` would have invented.
+        assert!(!check(Value::Bool(true), Cmp::Eq));
+        assert!(!check(Value::Bool(true), Cmp::Ne));
+        assert!(!check(Value::Bool(false), Cmp::Lt));
+        assert!(Value::Int(1).partial_cmp(&Value::Bool(true)).is_none());
+    }
+
+    #[test]
+    fn add_accumulates_along_the_path() {
+        let mut doc = Doc::default();
+        doc.add_variable("gold");
+        doc.retype_variable("gold", Value::Int(0));
+        doc.set_default("gold", Value::Int(5));
+
+        let mut adds = |by: i64| {
+            let id = doc.add_node(0.0, 0.0);
+            doc.node_mut(id).unwrap().kind = NodeKind::Instruction;
+            doc.set_effect(id, "gold", Some(Value::Int(by)), SetOp::Add);
+            id
+        };
+        let (first, second) = (adds(10), adds(-3));
+
+        assert_eq!(
+            doc.vars_along(&[first, second]).get("gold"),
+            Some(&Value::Int(12)),
+            "the path is the state, so every add along it has run"
+        );
+        assert_eq!(
+            doc.vars_along(&[first]).get("gold"),
+            Some(&Value::Int(15)),
+            "stepping back un-adds it"
+        );
+    }
+
+    #[test]
+    fn add_on_a_flag_leaves_it_alone() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let node = sets(&mut doc, "paid", true);
+        doc.set_effect(node, "paid", Some(Value::Bool(true)), SetOp::Add);
+
+        assert_eq!(
+            doc.vars_along(&[node]).get("paid"),
+            Some(&Value::Bool(false)),
+            "adding to a flag means nothing, so the slot keeps its default rather than \
+             taking an invented value"
+        );
+    }
+
+    #[test]
+    fn retype_converts_every_effect_and_check() {
+        let mut doc = Doc::default();
+        doc.add_variable("gold");
+        let writes = sets(&mut doc, "gold", true);
+        let reads = checks(&mut doc, "gold", false);
+
+        assert_eq!(doc.retype_variable("gold", Value::Int(0)), 2);
+        assert_eq!(
+            doc.effect_of(writes, "gold").map(|e| e.value),
+            Some(Value::Int(1)),
+            "true is 1"
+        );
+        assert_eq!(
+            doc.condition_of(reads, "gold").map(|c| c.want),
+            Some(Value::Int(0))
+        );
+        assert_eq!(doc.variable("gold").map(|v| v.default), Some(Value::Int(0)));
+
+        // Back the other way, with an operator that only means something on a number.
+        doc.set_effect(writes, "gold", Some(Value::Int(7)), SetOp::Add);
+        doc.set_condition(reads, "gold", Some(Value::Int(7)), Cmp::Gt);
+        doc.retype_variable("gold", Value::Bool(false));
+
+        assert_eq!(
+            doc.effect_of(writes, "gold").map(|e| (e.value, e.op)),
+            Some((Value::Bool(true), SetOp::Set)),
+            "any non-zero number is true, and += means nothing on a flag"
+        );
+        assert_eq!(
+            doc.condition_of(reads, "gold").map(|c| (c.want, c.op)),
+            Some((Value::Bool(true), Cmp::Eq)),
+            "there is nothing for a flag to be greater than"
+        );
+    }
+
+    #[test]
+    fn a_document_without_operators_still_loads() {
+        // Every `.dln` written before ints: no `op` on either side, no `Int` anywhere.
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":1,"x":0.0,"y":0.0,"speaker":"","text":"hi",
+                          "effects":[{"var":"paid","value":{"Bool":true}}],
+                          "conditions":[{"var":"paid","want":{"Bool":true}}]}],
+                "edges":[],"variables":[{"name":"paid","default":{"Bool":false}}]}"#,
+        )
+        .expect("loads");
+
+        assert_eq!(
+            doc.effect_of(1, "paid").map(|e| e.op),
+            Some(SetOp::Set),
+            "an old effect assigned, and nothing else"
+        );
+        assert_eq!(
+            doc.condition_of(1, "paid").map(|c| c.op),
+            Some(Cmp::Eq),
+            "an old check compared for equality, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_effect_or_check_is_reported() {
+        let mut doc = Doc::default();
+        doc.add_variable("gold");
+        doc.retype_variable("gold", Value::Int(0));
+        let writes = sets(&mut doc, "gold", true);
+
+        let problems = doc.problems();
+        let mistyped = Problem::TypeMismatch(writes, "gold".into());
+        assert!(problems.contains(&mistyped), "got {problems:?}");
+        assert_eq!(mistyped.severity(), Severity::Error);
+        assert_eq!(mistyped.node(), Some(writes), "the row clicks through");
+
+        // The operator has to fit as well as the value: nothing orders a flag.
+        doc.retype_variable("gold", Value::Bool(false));
+        assert!(!doc.problems().contains(&mistyped), "converted, so settled");
+        doc.set_condition(writes, "gold", Some(Value::Bool(true)), Cmp::Gt);
+        assert!(
+            doc.problems().contains(&mistyped),
+            "`> true` is as broken as the wrong kind of value"
+        );
+    }
+
     /// Builds an instruction node that writes `var`.
     fn sets(doc: &mut Doc, var: &str, value: bool) -> NodeId {
         let id = doc.add_node(0.0, 0.0);
         doc.node_mut(id).unwrap().kind = NodeKind::Instruction;
-        doc.set_effect(id, var, Some(Value::Bool(value)));
+        doc.set_effect(id, var, Some(Value::Bool(value)), SetOp::Set);
         id
     }
 
@@ -1949,16 +2280,19 @@ mod tests {
         doc.add_variable("paid");
         let node = sets(&mut doc, "paid", true);
 
-        doc.set_effect(node, "paid", Some(Value::Bool(false)));
+        doc.set_effect(node, "paid", Some(Value::Bool(false)), SetOp::Set);
         assert_eq!(
             doc.node(node).unwrap().effects.len(),
             1,
             "one write per variable per node, so their order can never matter"
         );
-        assert_eq!(doc.effect_of(node, "paid"), Some(Value::Bool(false)));
+        assert_eq!(
+            doc.effect_of(node, "paid").map(|e| e.value),
+            Some(Value::Bool(false))
+        );
 
-        doc.set_effect(node, "paid", None);
-        assert_eq!(doc.effect_of(node, "paid"), None);
+        doc.set_effect(node, "paid", None, SetOp::Set);
+        assert_eq!(doc.effect_of(node, "paid").map(|e| e.value), None);
         assert!(doc.node(node).unwrap().effects.is_empty());
     }
 
@@ -2003,7 +2337,7 @@ mod tests {
         let mut doc = Doc::default();
         doc.add_variable("paid");
         let speech = spoken(&mut doc, 0.0, 0.0);
-        doc.set_effect(speech, "paid", Some(Value::Bool(true)));
+        doc.set_effect(speech, "paid", Some(Value::Bool(true)), SetOp::Set);
 
         assert_eq!(
             doc.vars_along(&[speech]).get("paid"),
@@ -2036,8 +2370,14 @@ mod tests {
 
         assert!(doc.undo(), "one step, so one undo");
         assert!(doc.variable("paid").is_some());
-        assert_eq!(doc.effect_of(one, "paid"), Some(Value::Bool(true)));
-        assert_eq!(doc.effect_of(two, "paid"), Some(Value::Bool(false)));
+        assert_eq!(
+            doc.effect_of(one, "paid").map(|e| e.value),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            doc.effect_of(two, "paid").map(|e| e.value),
+            Some(Value::Bool(false))
+        );
     }
 
     /// The point of the rename: a typo can be fixed without re-ticking every node, which
@@ -2057,8 +2397,14 @@ mod tests {
         );
         assert!(doc.variable("paid").is_some());
         assert!(doc.variable("pade").is_none(), "the old key is gone");
-        assert_eq!(doc.effect_of(writes, "paid"), Some(Value::Bool(true)));
-        assert_eq!(doc.condition_of(reads, "paid"), Some(Value::Bool(true)));
+        assert_eq!(
+            doc.effect_of(writes, "paid").map(|e| e.value),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            doc.condition_of(reads, "paid").map(|c| c.want),
+            Some(Value::Bool(true))
+        );
         assert!(
             doc.problems()
                 .iter()
@@ -2095,7 +2441,10 @@ mod tests {
 
         assert_eq!(doc.rename_variable("ghost", "spectre"), 0);
         assert!(doc.variable("spectre").is_none());
-        assert_eq!(doc.effect_of(node, "paid"), Some(Value::Bool(true)));
+        assert_eq!(
+            doc.effect_of(node, "paid").map(|e| e.value),
+            Some(Value::Bool(true))
+        );
     }
 
     /// The view gates on this before it checkpoints, so a refused rename must be refusable
@@ -2180,7 +2529,7 @@ mod tests {
     fn checks(doc: &mut Doc, var: &str, want: bool) -> NodeId {
         let id = doc.add_node(0.0, 0.0);
         doc.node_mut(id).unwrap().kind = NodeKind::Condition;
-        doc.set_condition(id, var, Some(Value::Bool(want)));
+        doc.set_condition(id, var, Some(Value::Bool(want)), Cmp::Eq);
         id
     }
 
@@ -2191,6 +2540,7 @@ mod tests {
             Condition {
                 var: var.into(),
                 want: Value::Bool(want),
+                op: Cmp::Eq,
             }
             .holds(&vars)
         };
@@ -2349,8 +2699,14 @@ mod tests {
         assert!(doc.node(reads).unwrap().conditions.is_empty());
 
         assert!(doc.undo());
-        assert_eq!(doc.effect_of(writes, "paid"), Some(Value::Bool(true)));
-        assert_eq!(doc.condition_of(reads, "paid"), Some(Value::Bool(true)));
+        assert_eq!(
+            doc.effect_of(writes, "paid").map(|e| e.value),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            doc.condition_of(reads, "paid").map(|c| c.want),
+            Some(Value::Bool(true))
+        );
     }
 
     #[test]
@@ -2375,7 +2731,10 @@ mod tests {
 
         let restored = Doc::from_json(&original.to_json()).expect("round trip");
 
-        assert_eq!(restored.condition_of(gate, "paid"), Some(Value::Bool(true)));
+        assert_eq!(
+            restored.condition_of(gate, "paid").map(|c| c.want),
+            Some(Value::Bool(true))
+        );
         assert!(restored.edges[0].branch, "the pin survived");
     }
 
@@ -2407,7 +2766,7 @@ mod tests {
         let gate = of_kind(NodeKind::Condition);
         let var = &noted.effects[0].var;
         assert_eq!(
-            doc.condition_of(gate.id, var),
+            doc.condition_of(gate.id, var).map(|c| c.want),
             Some(Value::Bool(true)),
             "the condition reads what the instruction writes"
         );
@@ -2444,7 +2803,7 @@ mod tests {
         assert!(doc.problems().contains(&Problem::Empty(bare)));
 
         doc.add_variable("paid");
-        doc.set_effect(bare, "paid", Some(Value::Bool(true)));
+        doc.set_effect(bare, "paid", Some(Value::Bool(true)), SetOp::Set);
         assert!(!doc.problems().contains(&Problem::Empty(bare)));
     }
 
@@ -2456,7 +2815,10 @@ mod tests {
 
         let restored = Doc::from_json(&original.to_json()).expect("round trip");
 
-        assert_eq!(restored.effect_of(node, "paid"), Some(Value::Bool(true)));
+        assert_eq!(
+            restored.effect_of(node, "paid").map(|e| e.value),
+            Some(Value::Bool(true))
+        );
     }
 
     #[test]
