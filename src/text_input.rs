@@ -1,7 +1,7 @@
 //! Single-line text field, vendored from gpui 0.2.2's `examples/input.rs`.
 //!
 //! Upstream code: keep edits minimal so it can be re-synced against a newer gpui.
-//! Local changes: made public, added `new`/`set_content`/`bind_keys`, ctrl-based
+//! Local changes: made public, added `new`/`set_content`/`set_placeholder`/`bind_keys`, ctrl-based
 //! (rather than cmd-based) keybindings, dark styling, example harness removed.
 
 use std::ops::Range;
@@ -309,6 +309,13 @@ impl TextInput {
         }
         self.reset();
         self.content = content.to_string().into();
+        cx.notify();
+    }
+
+    /// The greyed-out hint shown while the field is empty. A setter because one field in the
+    /// editor serves several jobs and the hint is how it says which.
+    pub fn set_placeholder(&mut self, placeholder: &str, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.to_string().into();
         cx.notify();
     }
 }

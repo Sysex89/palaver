@@ -59,6 +59,24 @@ const ZOOM_STEP: f32 = 1.25;
 /// Node and label text size at 1:1, matching the `text_sm` the rest of the UI uses.
 const BASE_TEXT: f32 = 14.0;
 
+/// What `var_input` is asking for, which is the placeholder it shows: the pane's `+` declares
+/// into one list or the other, and the field is shared. One function so `Editor::new` and the
+/// tab handler cannot disagree.
+fn declare_hint(pane: SidePane) -> &'static str {
+    match pane {
+        SidePane::Variables => "New flag",
+        SidePane::Cast => "New character",
+    }
+}
+
+/// The colours a character can be tinted, cycled by clicking the swatch. Drawn from the
+/// colours already in this file, and it lives here rather than in `doc.rs` for the same
+/// reason `problem_text` does: the model stores the colour, the view chooses it. There is no
+/// colour-picker widget in the crate, and a click-cycle is the idiom everywhere else in it.
+const CAST_COLORS: [u32; 8] = [
+    0x9ecbff, 0xf7c96a, 0x8ce99a, 0xc3a6f7, 0xff7a7a, 0x7aa2f7, 0xb8b8c4, 0x9a9aa6,
+];
+
 /// How often a dirty document gets a crash copy. Also the most work a crash can cost.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 
@@ -219,6 +237,19 @@ struct Editor {
     /// The play-through walked so far, last entry first — `None` when not playing. One vec
     /// carries the current node, Back and Restart.
     play: Option<Vec<NodeId>>,
+    /// Which list the left pane is showing. Its only new state: the cast rides the container
+    /// and the text field the variables list already proved out, and a *third* pane was
+    /// rejected because `window_pos` is the one place a new one breaks every hit test.
+    pane: SidePane,
+}
+
+/// Which document-global list the left pane shows. With `Editor::renaming`, this is what
+/// says which of `var_input`'s four jobs it is doing.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum SidePane {
+    #[default]
+    Variables,
+    Cast,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -328,7 +359,7 @@ impl Editor {
         // Neither of these is document content, so they stay out of the loop above and only
         // ask for a re-render — without this, typing would not refresh what they drive.
         let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
-        let var_input = cx.new(|cx| TextInput::new("New flag", cx));
+        let var_input = cx.new(|cx| TextInput::new(declare_hint(SidePane::default()), cx));
         let value_input = cx.new(|cx| TextInput::new("0", cx));
         for input in [&search_input, &var_input, &value_input] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
@@ -371,6 +402,7 @@ impl Editor {
             closing: false,
             autosave_off: false,
             play: None,
+            pane: SidePane::default(),
         }
     }
 
@@ -1306,6 +1338,7 @@ impl Editor {
                     self.selection.nodes().contains(&node.id),
                     playing == Some(node.id),
                     jump_target,
+                    speaker_color(&self.doc, &node.speaker, 0x9ecbff),
                 )
             }))
             .children(self.doc.nodes.iter().map(|node| port_dot(node, view)))
@@ -1432,11 +1465,12 @@ impl Editor {
         let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
         // A rename the document has moved on from — undone, deleted, or in a file that has
         // since been closed — is simply not a rename any more.
-        let renaming = self
-            .renaming
-            .clone()
-            .filter(|name| self.doc.variable(name).is_some());
+        let renaming = self.renaming.clone().filter(|name| match self.pane {
+            SidePane::Variables => self.doc.variable(name).is_some(),
+            SidePane::Cast => self.doc.character(name).is_some(),
+        });
         let is_rename = renaming.is_some();
+        let cast = self.pane == SidePane::Cast;
 
         // Grouped by the set in the name, in first-seen order, each group carrying the
         // *index* into `doc.variables` — every row id and handler still keys on the whole
@@ -1465,10 +1499,47 @@ impl Editor {
             .border_r_1()
             .border_color(rgb(0x3a3a44))
             .text_color(rgb(0xd6d6dd))
-            .child(div().text_color(rgb(0x8a8a96)).child(match playing {
-                Some(_) => "Variables (now)",
-                None => "Variables (start)",
-            }))
+            // Two tabs over one list container, styled like `kind_picker` and wrapping for
+            // the same reason it does.
+            .child(
+                div().flex().flex_wrap().gap_1().children(
+                    [
+                        (
+                            SidePane::Variables,
+                            match playing {
+                                Some(_) => "Variables (now)",
+                                None => "Variables",
+                            },
+                            "pane-variables",
+                        ),
+                        (SidePane::Cast, "Cast", "pane-cast"),
+                    ]
+                    .map(|(pane, label, element_id)| {
+                        let on = pane == self.pane;
+                        div()
+                            .id(element_id)
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(if on { rgb(0x3a3a44) } else { rgb(0x2b2b33) })
+                            .text_color(if on { rgb(0xd6d6dd) } else { rgb(0x8a8a96) })
+                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                            .child(label)
+                            // A rename aimed at the list you just left would rename the wrong
+                            // thing, so switching tabs puts the shared field back to declaring.
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pane = pane;
+                                this.renaming = None;
+                                this.var_input.update(cx, |input, cx| {
+                                    input.set_content("", cx);
+                                    // The hint is how one field says which list its `+` adds to.
+                                    input.set_placeholder(declare_hint(pane), cx);
+                                });
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            )
             .child(
                 // The list scrolls, not the pane: the heading above and the declare field
                 // below stay put however many variables the document holds. `min_h(0)` is
@@ -1481,7 +1552,12 @@ impl Editor {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .children(groups.into_iter().map(|(set, rows)| {
+                    .map(|list| match self.pane {
+                        SidePane::Cast => list.children(
+                            (0..self.doc.characters.len())
+                                .map(|i| self.cast_row(i, playing.is_some(), cx)),
+                        ),
+                        SidePane::Variables => list.children(groups.into_iter().map(|(set, rows)| {
                         div()
                             .flex()
                             .flex_col()
@@ -1507,7 +1583,8 @@ impl Editor {
                                         self.var_row(i, playing.as_ref(), cx)
                                     })),
                             )
-                    })),
+                        })),
+                    }),
             )
             .when(playing.is_none(), |this| {
                 this.when_some(renaming.clone(), |this, old| {
@@ -1540,13 +1617,30 @@ impl Editor {
                             .child(if is_rename { "✓" } else { "+" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let name = this.var_input.read(cx).content().to_string();
-                                if !this.doc.variable_name_free(&name) {
+                                let free = if cast {
+                                    this.doc.character_name_free(&name)
+                                } else {
+                                    this.doc.variable_name_free(&name)
+                                };
+                                if !free {
                                     return;
                                 }
                                 this.doc.checkpoint();
-                                match &renaming {
+                                match (&renaming, cast) {
+                                    // Every line the character speaks follows the record.
+                                    (Some(old), true) => {
+                                        let moved = this.doc.rename_character(old, &name);
+                                        let s = if moved == 1 { "" } else { "s" };
+                                        let name = name.trim();
+                                        this.set_status(
+                                            format!(
+                                                "Renamed \"{old}\" to \"{name}\" — {moved} line{s}."
+                                            ),
+                                            cx,
+                                        );
+                                    }
                                     // Effects and checks follow it, so say how many did.
-                                    Some(old) => {
+                                    (Some(old), false) => {
                                         let moved = this.doc.rename_variable(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
@@ -1557,7 +1651,14 @@ impl Editor {
                                             cx,
                                         );
                                     }
-                                    None => {
+                                    // A colour off the palette, so a new cast comes out tinted
+                                    // apart without anybody picking one.
+                                    (None, true) => {
+                                        let color = CAST_COLORS
+                                            [this.doc.characters.len() % CAST_COLORS.len()];
+                                        this.doc.add_character(&name, color);
+                                    }
+                                    (None, false) => {
                                         this.doc.add_variable(&name);
                                     }
                                 }
@@ -1829,6 +1930,93 @@ impl Editor {
             })
     }
 
+    /// One row of the cast list: the character's colour, their name, and the rename and
+    /// remove buttons. The sibling of `var_row`, and `i` is an index into `doc.characters`
+    /// for the same two purposes — an element id and a lookup, with every mutation naming
+    /// the character, because the name is what the document is keyed by.
+    fn cast_row(
+        &self,
+        i: usize,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let character = &self.doc.characters[i];
+        let color = character.color;
+        let name = character.name.clone();
+        let to_recolor = name.clone();
+        let to_rename = name.clone();
+        let to_remove = name.clone();
+
+        div()
+            .flex()
+            .gap_2()
+            .items_center()
+            .child(
+                // The swatch is the colour control: clicking cycles the palette, since the
+                // crate has no picker widget and every other choice in it cycles too.
+                div()
+                    .id(("cast-color", i))
+                    .flex_none()
+                    .size_3()
+                    .rounded_sm()
+                    .bg(rgb(color))
+                    .when(!playing, |this| {
+                        this.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let at = CAST_COLORS.iter().position(|c| *c == color);
+                                let next =
+                                    CAST_COLORS[at.map_or(0, |at| (at + 1) % CAST_COLORS.len())];
+                                this.doc.checkpoint();
+                                this.doc.set_character_color(&to_recolor, next);
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_grow()
+                    .truncate()
+                    .text_color(rgb(0xb8b8c4))
+                    .child(name),
+            )
+            .when(!playing, |this| {
+                this.child(
+                    div()
+                        .id(("cast-rename", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("✎")
+                        // Not an edit yet, so no checkpoint — it only aims the shared field.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.renaming = Some(to_rename.clone());
+                            this.var_input
+                                .update(cx, |input, cx| input.set_content(&to_rename, cx));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("cast-remove", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                        .child("×")
+                        // Undeclaring only: the nodes keep saying the name, and the problem
+                        // list is what points out that nobody declared it.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.doc.checkpoint();
+                            this.doc.remove_character(&to_remove);
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
     /// What the instructions between the previous node the player saw and the current one
     /// wrote, in the order they ran.
     fn effects_fired(&self, path: &[NodeId]) -> Vec<(String, SetOp, Value)> {
@@ -1905,7 +2093,11 @@ impl Editor {
                 let speaker = node.speaker.trim();
                 let text = node.text.trim();
                 this.when(!speaker.is_empty(), |this| {
-                    this.child(div().text_color(rgb(0x8a8a96)).child(speaker.to_string()))
+                    this.child(
+                        div()
+                            .text_color(speaker_color(&self.doc, speaker, 0x8a8a96))
+                            .child(speaker.to_string()),
+                    )
                 })
                 .child(if text.is_empty() {
                     div()
@@ -2531,6 +2723,9 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         Problem::UnwiredBranch(id, branch) => {
             format!("Nothing on the {branch} branch of: {}", label(*id))
         }
+        Problem::UnknownSpeaker(id, speaker) => {
+            format!("Nobody declared \"{speaker}\": {}", label(*id))
+        }
         Problem::DuplicateAlias(id, alias) => {
             format!("Alias \"{alias}\" is used twice: {}", label(*id))
         }
@@ -2562,7 +2757,18 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
         .border_color(rgb(0x7d7d8c))
 }
 
-/// `jump_target` is the label of the node a jump points at, resolved by the caller.
+/// The colour every line a character speaks is tinted, or `fallback` when nobody declared
+/// that name — so an undeclared cast looks exactly as it did before there was one. The two
+/// places a speaker is drawn share this, and nothing else is tinted: colour on a border or an
+/// edge would make the selection and play highlights ambiguous.
+fn speaker_color(doc: &Doc, speaker: &str, fallback: u32) -> Rgba {
+    rgb(doc
+        .character(speaker.trim())
+        .map_or(fallback, |character| character.color))
+}
+
+/// `jump_target` is the label of the node a jump points at, and `speaker` the colour of its
+/// cast member, both resolved by the caller.
 ///
 /// Every kind keeps the same `NODE_W`×`NODE_H` footprint on purpose: hit-testing is
 /// arithmetic over those constants in `doc.rs`, so a box drawn smaller than it is clicked
@@ -2573,6 +2779,7 @@ fn node_box(
     selected: bool,
     playing: bool,
     jump_target: Option<String>,
+    speaker: Rgba,
 ) -> impl IntoElement {
     let (x, y) = view.to_screen((node.x, node.y));
     div()
@@ -2606,7 +2813,7 @@ fn node_box(
                     div()
                         .flex_none()
                         .w_full()
-                        .text_color(rgb(0x9ecbff))
+                        .text_color(speaker)
                         .truncate()
                         .child(node.speaker.clone()),
                 )

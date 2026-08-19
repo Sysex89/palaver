@@ -141,7 +141,7 @@ impl View {
 const UNDO_DEPTH: usize = 50;
 
 /// Everything an undo restores: the document data, minus the history itself.
-type Snapshot = (Vec<Node>, Vec<Edge>, Vec<Variable>);
+type Snapshot = (Vec<Node>, Vec<Edge>, Vec<Variable>, Vec<Character>);
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Doc {
@@ -150,6 +150,10 @@ pub struct Doc {
     /// `default` so `.dln` files written before variables existed keep loading.
     #[serde(default)]
     pub variables: Vec<Variable>,
+    /// The declared cast. `default` for the same reason `variables` is: every file written
+    /// before the cast existed loads with an empty one and looks exactly as it did.
+    #[serde(default)]
+    pub characters: Vec<Character>,
     // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
     #[serde(skip)]
     undo: Vec<Snapshot>,
@@ -361,6 +365,20 @@ pub struct Variable {
     pub default: Value,
 }
 
+/// Someone who speaks. Named `Character` rather than `Entity` because `gpui::Entity<T>` is
+/// all over `main.rs` and the two would be unreadable side by side.
+///
+/// Keyed by `name` like a [`Variable`] and unlike a [`Node`]: the name is already what every
+/// `Node::speaker` holds, so declaring a cast changed no existing file and needed no
+/// migration or fallback field. The colour is a `u32` because that is how `main.rs` writes
+/// every other one; which colour is the view's choice, stored here the way [`Problem`]
+/// stores no message text.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Character {
+    pub name: String,
+    pub color: u32,
+}
+
 /// Splits a variable name into the set it belongs to and the rest: everything before the
 /// first `.`, which the variables pane renders as a group header.
 ///
@@ -421,6 +439,10 @@ pub enum Problem {
     /// Two nodes answering to the same alias, so the handle names neither of them. Only
     /// reachable through a bad file or a bad merge — nothing in the editor generates one.
     DuplicateAlias(NodeId, String),
+    /// A speech node whose speaker nobody declared. A warning, not an error: every file
+    /// written before the cast existed has undeclared speakers and plays perfectly well —
+    /// unlike an effect naming an undeclared variable, which means nothing at all.
+    UnknownSpeaker(NodeId, String),
     /// A second edge between the same pair of nodes, so the player is offered one choice
     /// twice. [`Doc::add_edge`] refuses one, so only a merge can make it — which is the
     /// gap random ids opened by making a `.dln` auto-merge legal again.
@@ -445,7 +467,8 @@ impl Problem {
             | Problem::UnknownVar(id, _)
             | Problem::TypeMismatch(id, _)
             | Problem::UnwiredBranch(id, _)
-            | Problem::DuplicateAlias(id, _) => Some(*id),
+            | Problem::DuplicateAlias(id, _)
+            | Problem::UnknownSpeaker(id, _) => Some(*id),
             _ => None,
         }
     }
@@ -626,6 +649,17 @@ impl Doc {
                         .any(|other| other.id != n.id && other.alias.trim() == n.alias.trim())
                 })
                 .map(|n| Problem::DuplicateAlias(n.id, n.alias.trim().to_string())),
+        );
+
+        // Only a speech node has a speaker, and a blank one is the ordinary state — the
+        // same skip a blank alias gets, for the same reason.
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Speech)
+                .filter(|n| !n.speaker.trim().is_empty())
+                .filter(|n| self.character(n.speaker.trim()).is_none())
+                .map(|n| Problem::UnknownSpeaker(n.id, n.speaker.trim().to_string())),
         );
 
         // Only the second and later copy is named, so the row points at the edge to delete
@@ -1113,18 +1147,84 @@ impl Doc {
         }
     }
 
+    // ponytail: O(n) like the variable lookup, and a cast is smaller still.
+    pub fn character(&self, name: &str) -> Option<&Character> {
+        self.characters.iter().find(|c| c.name == name)
+    }
+
+    /// Whether [`Doc::add_character`] would accept this name. Separate for the reason
+    /// [`Doc::variable_name_free`] is: the view has to ask *before* it checkpoints, since a
+    /// refused add must not leave an empty undo step behind.
+    pub fn character_name_free(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty() && self.character(name).is_none()
+    }
+
+    /// Declares a character. False when the name is blank or already taken — the name is the
+    /// key, so a duplicate would make every `Node::speaker` referring to it ambiguous.
+    pub fn add_character(&mut self, name: &str, color: u32) -> bool {
+        if !self.character_name_free(name) {
+            return false;
+        }
+        self.characters.push(Character {
+            name: name.trim().to_string(),
+            color,
+        });
+        true
+    }
+
+    /// Renames the character and every node that says it, returning how many lines moved.
+    /// The same find-and-replace deal [`Doc::rename_variable`] makes, and possible for the
+    /// same reason: the name *is* the key, so there is nowhere else a reference can hide.
+    pub fn rename_character(&mut self, from: &str, to: &str) -> usize {
+        let to = to.trim();
+        let Some(character) = self.characters.iter_mut().find(|c| c.name == from) else {
+            return 0;
+        };
+        character.name = to.to_string();
+
+        let mut moved = 0;
+        for node in self
+            .nodes
+            .iter_mut()
+            .filter(|n| n.kind == NodeKind::Speech && n.speaker.trim() == from)
+        {
+            node.speaker = to.to_string();
+            moved += 1;
+        }
+        moved
+    }
+
+    /// Undeclares the character — and does nothing else. Deliberately *not* the cascade
+    /// [`Doc::remove_variable`] performs: an effect writing an undeclared variable has no
+    /// meaning, but "Innkeeper" still speaks the line whether or not anybody declared them.
+    /// [`Problem::UnknownSpeaker`] is what then says so, as a warning.
+    pub fn remove_character(&mut self, name: &str) {
+        self.characters.retain(|c| c.name != name);
+    }
+
+    /// The [`Doc::set_default`] of the cast: the colour every line this character speaks is
+    /// tinted. Unknown names are ignored.
+    pub fn set_character_color(&mut self, name: &str, color: u32) {
+        if let Some(character) = self.characters.iter_mut().find(|c| c.name == name) {
+            character.color = color;
+        }
+    }
+
     fn snapshot(&self) -> Snapshot {
         (
             self.nodes.clone(),
             self.edges.clone(),
             self.variables.clone(),
+            self.characters.clone(),
         )
     }
 
-    fn restore(&mut self, (nodes, edges, variables): Snapshot) {
+    fn restore(&mut self, (nodes, edges, variables, characters): Snapshot) {
         self.nodes = nodes;
         self.edges = edges;
         self.variables = variables;
+        self.characters = characters;
     }
 
     /// Records the current state so the next mutation can be undone. Every mutation
@@ -1224,6 +1324,11 @@ impl Doc {
                 branch: false,
             });
         };
+
+        // The cast, declared so the two speakers are tinted apart on the canvas. Keyed by
+        // the same name the nodes below already carry, which is why this needed no migration.
+        doc.add_character("Innkeeper", 0xf7c96a);
+        doc.add_character("Player", 0x8ce99a);
 
         let greet = node(
             &mut doc,
@@ -2852,6 +2957,107 @@ mod tests {
 
         assert!(doc.redo());
         assert!(doc.variable("has_key").is_none());
+    }
+
+    /// A speech node with a speaker, so the cast tests have something to move.
+    fn says(doc: &mut Doc, speaker: &str) -> NodeId {
+        let id = spoken(doc, 0.0, 0.0);
+        doc.node_mut(id).unwrap().speaker = speaker.into();
+        id
+    }
+
+    #[test]
+    fn renaming_a_character_moves_every_line() {
+        let mut doc = Doc::default();
+        doc.add_character("Innkeeper", 0xf7c96a);
+        let first = says(&mut doc, "Innkeeper");
+        let second = says(&mut doc, "Innkeeper");
+        let other = says(&mut doc, "Player");
+
+        assert_eq!(doc.rename_character("Innkeeper", "Sern"), 2);
+        assert_eq!(doc.node(first).unwrap().speaker, "Sern");
+        assert_eq!(doc.node(second).unwrap().speaker, "Sern");
+        assert_eq!(doc.node(other).unwrap().speaker, "Player", "untouched");
+        assert!(doc.character("Sern").is_some(), "the record moved too");
+        assert_eq!(doc.rename_character("nobody", "Sern"), 0);
+    }
+
+    #[test]
+    fn removing_a_character_only_undeclares() {
+        let mut doc = Doc::default();
+        doc.add_character("Innkeeper", 0xf7c96a);
+        let line = says(&mut doc, "Innkeeper");
+
+        doc.remove_character("Innkeeper");
+        assert!(doc.character("Innkeeper").is_none());
+        assert_eq!(
+            doc.node(line).unwrap().speaker,
+            "Innkeeper",
+            "the line still says it — unlike an effect, it still means something"
+        );
+    }
+
+    #[test]
+    fn character_name_free_refuses_blank_and_duplicate() {
+        let mut doc = Doc::default();
+        assert!(!doc.character_name_free("  "));
+        assert!(doc.add_character(" Innkeeper ", 0xf7c96a), "trimmed");
+        assert!(!doc.character_name_free("Innkeeper"));
+        assert!(!doc.add_character("Innkeeper", 0x8ce99a));
+        assert_eq!(doc.characters.len(), 1);
+    }
+
+    #[test]
+    fn an_undeclared_speaker_is_a_warning() {
+        let mut doc = Doc::default();
+        let line = says(&mut doc, "Innkeeper");
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(hub).unwrap().kind = NodeKind::Hub;
+
+        let unknown = Problem::UnknownSpeaker(line, "Innkeeper".into());
+        assert!(doc.problems().contains(&unknown));
+        assert_eq!(unknown.severity(), Severity::Warning);
+        assert!(
+            !doc.problems()
+                .iter()
+                .any(|p| matches!(p, Problem::UnknownSpeaker(id, _) if *id == hub)),
+            "a blank speaker is the ordinary state of every other kind"
+        );
+
+        doc.add_character("Innkeeper", 0xf7c96a);
+        assert!(!doc.problems().contains(&unknown));
+    }
+
+    #[test]
+    fn undo_restores_a_deleted_character() {
+        let mut doc = Doc::default();
+        doc.add_character("Innkeeper", 0xf7c96a);
+
+        doc.checkpoint();
+        doc.remove_character("Innkeeper");
+        assert!(doc.character("Innkeeper").is_none());
+
+        assert!(doc.undo());
+        assert_eq!(
+            doc.character("Innkeeper").map(|c| c.color),
+            Some(0xf7c96a),
+            "the colour came back with it"
+        );
+
+        assert!(doc.redo());
+        assert!(doc.character("Innkeeper").is_none());
+    }
+
+    #[test]
+    fn a_file_without_a_cast_loads() {
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":0,"x":0.0,"y":0.0,"speaker":"Innkeeper","text":"Hm."}],
+                "edges":[]}"#,
+        )
+        .expect("an old file still loads");
+
+        assert!(doc.characters.is_empty(), "an empty cast, and no migration");
+        assert_eq!(doc.nodes[0].speaker, "Innkeeper");
     }
 
     #[test]
