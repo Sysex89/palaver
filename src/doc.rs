@@ -202,6 +202,15 @@ pub enum NodeKind {
     /// Those two pins are a `bool` on the outgoing [`Edge`] rather than a second out-port,
     /// so the port geometry and the mouse map need to know nothing about this kind.
     Condition,
+    /// A box the author writes in and the player never sees: "QUEST: Missing Cat", "rewrite
+    /// this branch". A *freestanding* annotation — [`Doc::add_edge`] refuses an edge with a
+    /// note at either end, so a note is never a choice, never walked into, and never a link
+    /// in anybody's conversation. That is stricter than a jump's one-target rule on purpose:
+    /// an edge into a note would offer the player a choice that leads nowhere.
+    // ponytail: a leader arrow from a note to what it annotates is drawn, never stored —
+    // when it lands it is a `Node::pin: Option<NodeId>` painted by `edge_lines`, and
+    // `choices`/`start_of`/`advance` still never learn the word.
+    Note,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -576,9 +585,15 @@ impl Doc {
         // A start node is one nothing links to. Several of them is not a fault: a document
         // holds as many independent conversations as the author draws, and play mode starts
         // from the top of whichever one the selection is standing in.
+        // A note holds no edges by construction, so it is not a conversation anybody can
+        // start, reach or fall out of: the three graph rules below skip it as a group. Both
+        // halves matter — counting notes as roots would let a document of nothing but notes
+        // suppress `NoStart`, and skipping only the roots would report every note unreachable.
+        let in_graph = |n: &&Node| n.kind != NodeKind::Note;
         let roots: Vec<NodeId> = self
             .nodes
             .iter()
+            .filter(in_graph)
             .filter(|n| !self.edges.iter().any(|e| e.to == n.id))
             .map(|n| n.id)
             .collect();
@@ -600,6 +615,7 @@ impl Doc {
         found.extend(
             self.nodes
                 .iter()
+                .filter(in_graph)
                 .filter(|n| !seen.contains(&n.id))
                 .map(|n| Problem::Unreachable(n.id)),
         );
@@ -607,6 +623,7 @@ impl Doc {
         found.extend(
             self.nodes
                 .iter()
+                .filter(in_graph)
                 .filter(|n| !n.end && !self.edges.iter().any(|e| e.from == n.id))
                 .map(|n| Problem::DeadEnd(n.id)),
         );
@@ -617,7 +634,10 @@ impl Doc {
             self.nodes
                 .iter()
                 .filter(|n| match n.kind {
-                    NodeKind::Speech => n.text.trim().is_empty(),
+                    // A note holds text like a speech node does, so a blank one is empty
+                    // by the same rule — it is exempt from the *graph* rules above, not
+                    // from having content.
+                    NodeKind::Speech | NodeKind::Note => n.text.trim().is_empty(),
                     NodeKind::Instruction => n.effects.is_empty(),
                     NodeKind::Condition => n.conditions.is_empty(),
                     NodeKind::Hub | NodeKind::Jump => false,
@@ -768,6 +788,10 @@ impl Doc {
         self.node(id).is_some_and(|n| n.kind == NodeKind::Condition)
     }
 
+    pub fn is_note(&self, id: NodeId) -> bool {
+        self.node(id).is_some_and(|n| n.kind == NodeKind::Note)
+    }
+
     /// Whether every check on a condition node holds against `vars`. A node with no checks
     /// holds vacuously, which is why an empty one is reported by [`Doc::problems`] rather
     /// than silently sending everything down one branch.
@@ -885,7 +909,10 @@ impl Doc {
         self.nodes
             .iter()
             .rev()
-            .filter(|n| n.flow == flow)
+            // A note has no port drawn, because `add_edge` would refuse every edge it
+            // started. The drag must not begin either, or the author grabs a handle that
+            // can never land.
+            .filter(|n| n.flow == flow && n.kind != NodeKind::Note)
             .find(|n| {
                 let (px, py) = out_port(n);
                 (x - px).hypot(y - py) <= PORT_R
@@ -952,6 +979,12 @@ impl Doc {
             return false;
         }
         if self.is_jump(from) && self.edges.iter().any(|e| e.from == from) {
+            return false;
+        }
+        // A note is an annotation, not a node in the conversation: no edge may touch one at
+        // either end. This is the only gate — the canvas drag and `branch_from` both come
+        // through here.
+        if self.is_note(from) || self.is_note(to) {
             return false;
         }
         // The first edge out of a condition is its true branch: the happy path is what gets
@@ -1922,6 +1955,39 @@ mod tests {
     }
 
     #[test]
+    fn add_edge_refuses_a_note_at_either_end() {
+        let mut doc = Doc::default();
+        let line = spoken(&mut doc, 0.0, 0.0);
+        let note = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+
+        assert!(!doc.add_edge(line, note), "into a note");
+        assert!(!doc.add_edge(note, line), "out of a note");
+        assert!(doc.edges.is_empty());
+    }
+
+    #[test]
+    fn a_note_is_outside_every_graph_rule_but_not_the_empty_one() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.node_mut(b).unwrap().end = true;
+        let note = doc.add_node(0.0, 400.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+
+        // Edgeless by construction, so every graph rule would otherwise fire on it.
+        assert_eq!(
+            doc.problems(),
+            vec![Problem::Empty(note)],
+            "a blank note is empty, and nothing else"
+        );
+
+        doc.node_mut(note).unwrap().text = "rewrite this branch".into();
+        assert!(doc.problems().is_empty());
+    }
+
+    #[test]
     fn sample_has_no_errors() {
         let problems = Doc::sample().problems();
 
@@ -2328,6 +2394,9 @@ mod tests {
         let (px, py) = out_port(doc.node(a).unwrap());
 
         assert_eq!(doc.port_hit_test("", px, py), Some(a));
+        doc.node_mut(a).unwrap().kind = NodeKind::Note;
+        assert_eq!(doc.port_hit_test("", px, py), None, "a note has no port");
+        doc.node_mut(a).unwrap().kind = NodeKind::Speech;
         assert_eq!(doc.port_hit_test("", px - PORT_R + 1.0, py), Some(a));
         assert_eq!(doc.port_hit_test("", px, py + PORT_R * 2.0), None);
     }

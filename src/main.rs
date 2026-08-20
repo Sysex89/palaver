@@ -32,6 +32,7 @@ actions!(
         NewJump,
         NewInstruction,
         NewCondition,
+        NewNote,
         FocusCanvas,
         New,
         Save,
@@ -132,6 +133,7 @@ const MENUS: &[MenuSpec] = &[
             ("Condition", "Ctrl+5", |e, w, cx| {
                 e.on_new_condition(&NewCondition, w, cx)
             }),
+            ("Note", "Ctrl+6", |e, w, cx| e.on_new_note(&NewNote, w, cx)),
         ],
     ),
     (
@@ -1100,12 +1102,20 @@ impl Editor {
     /// Adds a node of `kind`, hung off the selected one when there is exactly one — a
     /// branch needs a single parent — and dropped in the middle of the view otherwise, so
     /// the command always does something rather than silently refusing.
+    fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_node(NodeKind::Note, window, cx);
+    }
+
     fn insert_node(&mut self, kind: NodeKind, window: &mut Window, cx: &mut Context<Self>) {
         // Guard before the checkpoint: one whose mutation then fails is an empty undo
         // step and a false dirty flag.
+        // A note takes no edges, so it can never branch off the selection: it always lands
+        // in the middle of the view. Without this the branch would be created and the edge
+        // silently refused, leaving the note parked where a child would have gone.
         let parent = self
             .selection
             .only_node()
+            .filter(|_| kind != NodeKind::Note)
             .filter(|id| self.doc.node(*id).is_some());
 
         self.doc.checkpoint();
@@ -1164,9 +1174,17 @@ impl Editor {
     /// that a stray F5 plays something rather than nagging. The walk itself crosses flows
     /// freely — only the seed is scoped.
     fn play_seed(&self) -> Option<NodeId> {
+        // A note is not in anybody's conversation, so seeding play from one would only ever
+        // report running out of graph.
         self.selection
             .only_node()
-            .or_else(|| self.doc.nodes_in(&self.flow).next().map(|n| n.id))
+            .filter(|id| !self.doc.is_note(*id))
+            .or_else(|| {
+                self.doc
+                    .nodes_in(&self.flow)
+                    .find(|n| n.kind != NodeKind::Note)
+                    .map(|n| n.id)
+            })
     }
 
     /// Both entry points walk on through everything the player does not see, so the path
@@ -1329,6 +1347,7 @@ impl Editor {
             .on_action(cx.listener(Self::on_new_jump))
             .on_action(cx.listener(Self::on_new_instruction))
             .on_action(cx.listener(Self::on_new_condition))
+            .on_action(cx.listener(Self::on_new_note))
             .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
@@ -1397,6 +1416,9 @@ impl Editor {
             .children(
                 self.doc
                     .nodes_in(&self.flow)
+                    // A note takes no edges, so it gets no handle to drag one from —
+                    // `Doc::port_hit_test` skips it for the same reason.
+                    .filter(|node| node.kind != NodeKind::Note)
                     .map(|node| port_dot(node, view)),
             )
             .when_some(self.marquee_rect(), |this, (origin, size)| {
@@ -2597,7 +2619,8 @@ impl Editor {
             })
     }
 
-    /// What the node is. Switching to a jump drops every outgoing edge but the first,
+    /// What the node is. Switching to a note drops every edge touching it and switching to
+    /// a jump drops every outgoing edge but the first,
     /// keeping the one-target invariant `Doc::add_edge` enforces — otherwise the extra
     /// edges would stop being drawn and the canvas would quietly lie about the graph. It
     /// is checkpointed like any other edit, so an undo brings them back.
@@ -2613,6 +2636,7 @@ impl Editor {
                 (NodeKind::Jump, "Jump", "kind-jump"),
                 (NodeKind::Instruction, "Instruction", "kind-instruction"),
                 (NodeKind::Condition, "Condition", "kind-condition"),
+                (NodeKind::Note, "Note", "kind-note"),
             ]
             .map(|(kind, label, element_id)| {
                 let on = kind == current;
@@ -2632,6 +2656,12 @@ impl Editor {
                         this.doc.checkpoint();
                         if let Some(node) = this.doc.node_mut(id) {
                             node.kind = kind;
+                        }
+                        // A note holds no edges at either end, so converting to one drops
+                        // every edge that touched it — the same lie an undrawn edge out of
+                        // a jump would be, and one undo brings them all back.
+                        if kind == NodeKind::Note {
+                            this.doc.edges.retain(|e| e.from != id && e.to != id);
                         }
                         if kind == NodeKind::Jump {
                             let mut kept = false;
@@ -2912,14 +2942,17 @@ impl Editor {
                         .when(kind == NodeKind::Speech, |this| {
                             this.child(field("Speaker", &self.speaker_input))
                         })
-                        .when(matches!(kind, NodeKind::Speech | NodeKind::Hub), |this| {
-                            let label = if kind == NodeKind::Hub {
-                                "Label"
-                            } else {
-                                "Text"
-                            };
-                            this.child(field(label, &self.text_input))
-                        })
+                        .when(
+                            matches!(kind, NodeKind::Speech | NodeKind::Hub | NodeKind::Note),
+                            |this| {
+                                let label = match kind {
+                                    NodeKind::Hub => "Label",
+                                    NodeKind::Note => "Note",
+                                    _ => "Text",
+                                };
+                                this.child(field(label, &self.text_input))
+                            },
+                        )
                         .when(kind == NodeKind::Instruction, |this| {
                             this.child(self.var_rows(id, VarRow::Sets, cx))
                         })
@@ -3250,6 +3283,24 @@ fn node_box(
                                 .join("\n"),
                         }),
                 ),
+            // Its own font, so a note never reads as a line somebody says: italic, muted,
+            // and no speaker line to share the box with. Same footprint as every other
+            // kind — hit-testing is arithmetic over `NODE_W`/`NODE_H`.
+            NodeKind::Note => this
+                .child(div().flex_none().text_color(rgb(0xf7c96a)).child("▤"))
+                .child(
+                    div()
+                        .w_full()
+                        // Its own face, not just its own colour: the bundled UI font has
+                        // no italic, so `.italic()` alone renders identically to a line of
+                        // dialogue. A serif is the one thing on the canvas that is not.
+                        .font_family("Noto Serif")
+                        .italic()
+                        .text_color(rgb(0x9a9aa6))
+                        .text_ellipsis()
+                        .line_clamp(4)
+                        .child(node.text.clone()),
+                ),
         })
 }
 
@@ -3337,6 +3388,7 @@ fn main() {
             KeyBinding::new("ctrl-3", NewJump, Some("Editor")),
             KeyBinding::new("ctrl-4", NewInstruction, Some("Editor")),
             KeyBinding::new("ctrl-5", NewCondition, Some("Editor")),
+            KeyBinding::new("ctrl-6", NewNote, Some("Editor")),
             KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),
