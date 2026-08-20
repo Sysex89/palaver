@@ -446,6 +446,13 @@ pub struct Edge {
     /// have no condition nodes, so the value never matters to them.
     #[serde(default)]
     pub branch: bool,
+    /// A once-only choice: offered until the player takes it, then spent for the rest of
+    /// the play-through. Meaningless from a node the player does not stop at — the walk
+    /// through an instruction or a jump has to take the edge it finds — which is why the
+    /// inspector only offers the toggle where [`Doc::pauses_play`]. `default` for the
+    /// reason `branch` is: an older `.dln` has none, so the value never matters to it.
+    #[serde(default)]
+    pub once: bool,
 }
 
 /// Something wrong with the document, as found by [`Doc::problems`]. Carries no message
@@ -561,6 +568,33 @@ impl Doc {
             .filter(|e| e.from == id && self.node(e.to).is_some())
             .map(|e| (e.to, e.label.as_str()))
             .collect()
+    }
+
+    /// Whether this choice is a once-only one the player has already taken on `path`.
+    /// Read back off the path rather than counted beside it, the way [`Doc::vars_along`]
+    /// recomputes the variables — so Back unspends a choice along with the flags it set,
+    /// and there is no second copy of the play state to fall out of step.
+    ///
+    /// Keyed on the *pair*, not on the target: two once-only choices landing on the same
+    /// node would otherwise spend each other.
+    pub fn spent(&self, path: &[NodeId], from: NodeId, to: NodeId) -> bool {
+        self.edges
+            .iter()
+            .any(|e| e.from == from && e.to == to && e.once)
+            && path.windows(2).any(|w| w[0] == from && w[1] == to)
+    }
+
+    /// How many times `path` has been through this node, passes the player never saw
+    /// included — the path holds every node walked, which is what makes this a filter
+    /// rather than a counter.
+    // ponytail: no caller yet. It is the primitive `NodeKind::Alt` is built on, where
+    // every pick policy but a shuffle is a function of the visit count; delete it if that
+    // never lands. The ceiling either way: visits are path-local and die with the play
+    // session, so "has the player ever seen this" across playthroughs needs a state store
+    // outside `Doc` — and the consuming engine would need one too.
+    #[allow(dead_code)]
+    pub fn visits(&self, path: &[NodeId], id: NodeId) -> usize {
+        path.iter().filter(|&&n| n == id).count()
     }
 
     /// Every fault in the document, errors first. An empty document has none at all.
@@ -827,9 +861,12 @@ impl Doc {
     /// what lets [`Doc::vars_along`] recompute the variables rather than store them.
     ///
     /// Guarded against a cycle the same way [`Doc::start_of`] is, and stops where it
-    /// stands when a jump has no target.
+    /// stands when a jump has no target. The guard covers *this* walk only — seeding it
+    /// from the whole path would make returning to a node the conversation has already
+    /// played look like a loop, and a hub reached back through a jump is the most ordinary
+    /// shape a dialogue graph has.
     fn walk_on(&self, path: &mut Vec<NodeId>) {
-        let mut seen: HashSet<NodeId> = path.iter().copied().collect();
+        let mut seen: HashSet<NodeId> = path.last().copied().into_iter().collect();
         while let Some(&current) = path.last() {
             if self.pauses_play(current) {
                 return;
@@ -995,6 +1032,7 @@ impl Doc {
             to,
             label: String::new(),
             branch,
+            once: false,
         });
         true
     }
@@ -1574,6 +1612,7 @@ impl Doc {
                 to,
                 label: label.into(),
                 branch: false,
+                once: false,
             });
         };
 
@@ -2009,6 +2048,7 @@ mod tests {
             to: 999,
             label: String::new(),
             branch: false,
+            once: false,
         });
 
         let problems = doc.problems();
@@ -2266,6 +2306,129 @@ mod tests {
         let mut path = vec![hub, away, hub, away];
         assert!(doc.step_back(&mut path));
         assert_eq!(path, vec![hub, away, hub]);
+    }
+
+    /// The once-only choice: offered until it is taken, spent afterwards. Read back off
+    /// the path, so there is no second copy of the play state.
+    /// The walk's cycle guard covers the walk, not the play-through: a conversation that
+    /// loops back to its hub through a jump must arrive, not stop dead on the jump.
+    #[test]
+    fn a_loop_back_to_a_played_node_is_not_a_cycle() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        let away = spoken(&mut doc, 300.0, 0.0);
+        let back = doc.add_node(600.0, 0.0);
+        doc.node_mut(back).unwrap().kind = NodeKind::Jump;
+        doc.add_edge(hub, away);
+        doc.add_edge(away, back);
+        doc.add_edge(back, hub);
+
+        let mut path = doc.start_walk(hub);
+        doc.advance(&mut path, away);
+        doc.advance(&mut path, back);
+
+        assert_eq!(path, vec![hub, away, back, hub], "the jump landed");
+    }
+
+    #[test]
+    fn spent_is_false_until_the_choice_is_taken() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        let away = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(hub, away);
+        doc.edges.last_mut().unwrap().once = true;
+
+        let mut path = doc.start_walk(hub);
+        assert!(!doc.spent(&path, hub, away), "not taken yet");
+
+        doc.advance(&mut path, away);
+        assert!(doc.spent(&path, hub, away));
+    }
+
+    #[test]
+    fn spent_needs_the_flag_not_just_the_traversal() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        let away = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(hub, away);
+
+        let mut path = doc.start_walk(hub);
+        doc.advance(&mut path, away);
+        assert!(
+            !doc.spent(&path, hub, away),
+            "an ordinary choice is offered again however often it is taken"
+        );
+    }
+
+    /// Keyed on the pair rather than on the target, which is the whole reason this is not
+    /// a visit count: two once-only choices into one node must not spend each other.
+    #[test]
+    fn spent_counts_the_pair_not_the_node() {
+        let mut doc = Doc::default();
+        let here = spoken(&mut doc, 0.0, 0.0);
+        let elsewhere = spoken(&mut doc, 0.0, 300.0);
+        let target = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(here, target);
+        doc.edges.last_mut().unwrap().once = true;
+        doc.add_edge(elsewhere, target);
+        doc.edges.last_mut().unwrap().once = true;
+
+        let mut path = doc.start_walk(here);
+        doc.advance(&mut path, target);
+
+        assert!(doc.spent(&path, here, target));
+        assert!(
+            !doc.spent(&path, elsewhere, target),
+            "the other way in is untaken"
+        );
+    }
+
+    /// The payoff of reading it off the path: Back rewinds a spent choice along with the
+    /// flags the run set, because there is nothing else to rewind.
+    #[test]
+    fn stepping_back_unspends_a_choice() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        let away = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(hub, away);
+        doc.edges.last_mut().unwrap().once = true;
+
+        let mut path = doc.start_walk(hub);
+        doc.advance(&mut path, away);
+        assert!(doc.step_back(&mut path));
+        assert!(!doc.spent(&path, hub, away));
+    }
+
+    #[test]
+    fn an_edge_without_once_still_loads() {
+        let doc = Doc::from_json(r#"{"nodes":[],"edges":[{"from":1,"to":2,"label":"Yes"}]}"#)
+            .expect("a pre-once document still loads");
+        assert!(!doc.edges[0].once);
+        assert!(!doc.edges[0].branch);
+    }
+
+    /// The path holds every node walked, invisible ones included — which is what makes a
+    /// visit count a filter rather than a counter kept beside it.
+    #[test]
+    fn visits_counts_nodes_the_player_never_saw() {
+        let mut doc = Doc::default();
+        let here = spoken(&mut doc, 0.0, 0.0);
+        let sets = doc.add_node(300.0, 0.0);
+        let there = spoken(&mut doc, 600.0, 0.0);
+        doc.node_mut(sets).unwrap().kind = NodeKind::Instruction;
+        doc.add_edge(here, sets);
+        doc.add_edge(sets, there);
+
+        let mut path = doc.start_walk(here);
+        doc.advance(&mut path, sets);
+
+        assert_eq!(path, vec![here, sets, there]);
+        assert_eq!(doc.visits(&path, sets), 1, "walked through, never seen");
+        assert_eq!(
+            doc.visits(&[here, sets, there, sets, here], sets),
+            2,
+            "a conversation that comes back round counts both passes"
+        );
     }
 
     #[test]

@@ -1447,7 +1447,7 @@ impl Editor {
             // though the player never chooses one, so the empty-label skip lets them past.
             .filter(|edge| {
                 !self.doc.is_jump(edge.from)
-                    && (!edge.label.is_empty() || self.doc.is_condition(edge.from))
+                    && (!edge.label.is_empty() || self.doc.is_condition(edge.from) || edge.once)
             })
             .filter_map(|edge| {
                 let (text, color) = if self.doc.is_condition(edge.from) {
@@ -1455,6 +1455,18 @@ impl Editor {
                         true => ("true".to_string(), TRUE_COLOR),
                         false => ("false".to_string(), FALSE_COLOR),
                     }
+                } else if edge.once {
+                    // Shown on the canvas as well as in the inspector, the way a condition's
+                    // branch is: a flag you have to click every edge to find is guessed at.
+                    // In front of the label, not after it: the slot is a fixed width and
+                    // a long choice is already truncated, so a marker on the end is one
+                    // you cannot see. Shown on the canvas as well as in the inspector for
+                    // the reason a condition's branch is — a flag you have to click every
+                    // edge to find is a flag that gets guessed at.
+                    (
+                        format!("(once) {}", edge.label).trim_end().to_string(),
+                        rgba(0x9a9aa6ff),
+                    )
                 } else {
                     (edge.label.clone(), rgba(0x9a9aa6ff))
                 };
@@ -2512,20 +2524,41 @@ impl Editor {
                             "" => "Continue".to_string(),
                             label => label.to_string(),
                         };
-                        row(("play-choice", i), format!("→ {label}"), 0xd6d6dd).on_click(
-                            cx.listener(move |this, _, window, cx| {
+                        // A spent once-only choice is greyed out, not dropped: `choices` is
+                        // never filtered, the canvas still draws the edge, and this is the
+                        // same place the player already diverges from the canvas by walking
+                        // through nodes it does not show. No hover and no click, so nothing
+                        // about the row offers something it will not do.
+                        if self.doc.spent(path, current, to) {
+                            return div()
+                                .px_1()
+                                .text_color(rgb(0x6c6c78))
+                                .child(format!("→ {label} (already taken)"))
+                                .into_any_element();
+                        }
+                        row(("play-choice", i), format!("→ {label}"), 0xd6d6dd)
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.play_advance(to, window, cx)
-                            }),
-                        )
+                            }))
+                            .into_any_element()
                     }),
             )
-            .when(self.doc.choices(current).is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_color(rgb(0x6c6c78))
-                        .child("End of conversation."),
-                )
-            })
+            // `all` over an empty list is true, so a leaf node still ends here — and a hub
+            // whose questions are all used up ends rather than stranding the player on a
+            // list of rows that no longer do anything.
+            .when(
+                self.doc
+                    .choices(current)
+                    .iter()
+                    .all(|&(to, _)| self.doc.spent(path, current, to)),
+                |this| {
+                    this.child(
+                        div()
+                            .text_color(rgb(0x6c6c78))
+                            .child("End of conversation."),
+                    )
+                },
+            )
             .child(
                 div()
                     .flex()
@@ -2872,6 +2905,29 @@ impl Editor {
             }))
     }
 
+    /// Marks a choice as once-only: offered until the player takes it, then greyed out for
+    /// the rest of the play-through. The sibling of `branch_toggle` — a discrete edit, so
+    /// it checkpoints outright rather than coalescing.
+    fn once_toggle(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.doc.edges.get(index).is_some_and(|edge| edge.once);
+        div()
+            .id("once-toggle")
+            .flex()
+            .gap_2()
+            .cursor_pointer()
+            .text_color(rgb(if on { 0xd6d6dd } else { 0x8a8a96 }))
+            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .child(if on { "☑ once only" } else { "☐ once only" })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.doc.edges.get(index).is_none() {
+                    return;
+                }
+                this.doc.checkpoint();
+                this.doc.edges[index].once = !this.doc.edges[index].once;
+                cx.notify();
+            }))
+    }
+
     /// Marks a node as a deliberate ending, which is what keeps it out of the dead-end
     /// warnings. A discrete edit, so it checkpoints outright rather than coalescing.
     fn end_toggle(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2996,6 +3052,13 @@ impl Editor {
                             .when(!from_condition, |this| {
                                 this.child(field("Choice", &self.label_input))
                             })
+                            // Only where the player is the one choosing. Out of an
+                            // instruction or a jump the walk has to take the edge it finds,
+                            // so a once-only flag there would be a promise nothing keeps.
+                            .when(
+                                edge.is_some_and(|edge| self.doc.pauses_play(edge.from)),
+                                |this| this.child(self.once_toggle(index, cx)),
+                            )
                     }
                     _ => this.child(
                         div()
