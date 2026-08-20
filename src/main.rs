@@ -3,14 +3,15 @@ mod text_input;
 
 use doc::{
     Cmp, Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp, Severity,
-    Value, VarState, View, clear_backup, in_port, node_center, out_port, read_backup, split_set,
-    with_default_extension,
+    Value, VarState, View, clear_backup, in_port, join_set, node_center, out_port, read_backup,
+    split_set, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, PathPromptOptions, Pixels,
-    Point, PromptLevel, Render, Rgba, ScrollWheelEvent, Window, WindowBounds, WindowHandle,
-    WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, rgba, size,
+    Point, PromptLevel, Render, Rgba, ScrollWheelEvent, SharedString, Window, WindowBounds,
+    WindowHandle, WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, rgba,
+    size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -204,11 +205,17 @@ struct Editor {
     /// Name for a variable about to be declared. Outside the `sync_fields` loop for the
     /// same reason `search_input` is: it is not content of the selected node.
     var_input: Entity<TextInput>,
-    /// The variable `var_input` is renaming, or `None` when it is declaring a new one. The
-    /// panel has one field and two jobs; this is which. Never cleared on a document swap —
-    /// `vars_pane` filters a name the document no longer has, which covers the swap, an
-    /// undo and a delete in one place instead of three that can be forgotten.
-    renaming: Option<String>,
+    /// What `var_input` is renaming, or `None` when it is declaring a new one. The panel
+    /// has one field and several jobs; this and `Editor::pane` are which. Never cleared on
+    /// a document swap — `vars_pane` filters a name the document no longer has, which
+    /// covers the swap, an undo and a delete in one place instead of three that can be
+    /// forgotten.
+    renaming: Option<Rename>,
+    /// The set the declare field is aimed at, `""` for none. It holds only the *set*, so
+    /// the field holds only the rest of the name and `doc::join_set` puts them back
+    /// together — which is the whole point of the picker: an existing set is clicked
+    /// rather than retyped. Filtered against the document at render like `renaming` is.
+    set: String,
     /// The number editor, shared by the variables pane and the inspector's Sets/Checks rows
     /// so there is only ever one half-typed number in the crate. Outside the `sync_fields`
     /// loop for the same reason `var_input` is — a number being typed is not the selected
@@ -247,8 +254,17 @@ struct Editor {
     flow: String,
 }
 
+/// What the shared `var_input` is renaming. `Editor::pane` already says which *list* an
+/// `Item` belongs to; the one ambiguity a pane cannot resolve is inside the Variables tab,
+/// where the field can hold a variable's name or the name of the set they group under.
+#[derive(Clone, PartialEq)]
+enum Rename {
+    Item(String),
+    Set(String),
+}
+
 /// Which document-global list the left pane shows. With `Editor::renaming`, this is what
-/// says which of `var_input`'s four jobs it is doing.
+/// says which of `var_input`'s jobs it is doing.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SidePane {
     #[default]
@@ -397,6 +413,7 @@ impl Editor {
             var_input,
             value_input,
             renaming: None,
+            set: String::new(),
             editing: None,
             edited: Selection::None,
             text_dirty: false,
@@ -1511,13 +1528,32 @@ impl Editor {
         let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
         // A rename the document has moved on from — undone, deleted, or in a file that has
         // since been closed — is simply not a rename any more.
-        let renaming = self.renaming.clone().filter(|name| match self.pane {
-            SidePane::Variables => self.doc.variable(name).is_some(),
-            SidePane::Cast => self.doc.character(name).is_some(),
-            SidePane::Flows => self.doc.all_flows().contains(&name.as_str()),
-        });
+        let renaming = self
+            .renaming
+            .clone()
+            .filter(|rename| match (rename, self.pane) {
+                (Rename::Set(set), _) => self.doc.all_sets().contains(&set.as_str()),
+                (Rename::Item(name), SidePane::Variables) => self.doc.variable(name).is_some(),
+                (Rename::Item(name), SidePane::Cast) => self.doc.character(name).is_some(),
+                (Rename::Item(name), SidePane::Flows) => {
+                    self.doc.all_flows().contains(&name.as_str())
+                }
+            });
         let is_rename = renaming.is_some();
+        let renaming_set = matches!(renaming, Some(Rename::Set(_)));
         let pane = self.pane;
+        // Aimed at a set the document no longer has is aimed at nothing, exactly as above.
+        let set = match self.doc.all_sets().contains(&self.set.as_str()) {
+            true => self.set.clone(),
+            false => String::new(),
+        };
+        // Owned for the same reason the flow names are: the picker chips borrow `cx`.
+        let sets: Vec<String> = self
+            .doc
+            .all_sets()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         // Owned, so the rows can borrow `cx` mutably. The main flow leads, then every other
         // canvas the document has — declared or merely stood on, so no node is unreachable.
         let flows: Vec<String> = std::iter::once(String::new())
@@ -1583,6 +1619,7 @@ impl Editor {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pane = pane;
                                 this.renaming = None;
+                                this.set = String::new();
                                 this.var_input.update(cx, |input, cx| {
                                     input.set_content("", cx);
                                     // The hint is how one field says which list its `+` adds to.
@@ -1624,14 +1661,29 @@ impl Editor {
                             .flex_col()
                             .gap_1()
                             .when(any_sets, |this| {
+                                let header = set.map(str::to_string);
                                 this.child(
                                     div()
-                                        .text_color(rgb(0x8a8a96))
-                                        .truncate()
-                                        .child(set.map_or_else(
-                                            || "(ungrouped)".to_string(),
-                                            str::to_string,
-                                        )),
+                                        .flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .flex_grow()
+                                                .text_color(rgb(0x8a8a96))
+                                                .truncate()
+                                                .child(header.clone().unwrap_or_else(|| {
+                                                    "(ungrouped)".to_string()
+                                                })),
+                                        )
+                                        // `(ungrouped)` gets none: it is not a set, so
+                                        // there is no name to rewrite.
+                                        .when_some(
+                                            header.filter(|_| playing.is_none()),
+                                            |this, name| {
+                                                this.child(self.set_rename_button(&name, cx))
+                                            },
+                                        ),
                                 )
                             })
                             .child(
@@ -1649,12 +1701,15 @@ impl Editor {
             )
             .when(playing.is_none(), |this| {
                 this.when_some(renaming.clone(), |this, old| {
-                    this.child(
-                        div()
-                            .text_color(rgb(0x8a8a96))
-                            .truncate()
-                            .child(format!("Rename \"{old}\"")),
-                    )
+                    let what = match old {
+                        Rename::Set(name) => format!("Rename set \"{name}\""),
+                        Rename::Item(name) => format!("Rename \"{name}\""),
+                    };
+                    this.child(div().text_color(rgb(0x8a8a96)).truncate().child(what))
+                })
+                // Only above the variables, and not while the field holds a set name.
+                .when(pane == SidePane::Variables && !renaming_set, |this| {
+                    this.child(self.set_picker(&set, &sets, cx))
                 })
                 .child(
                 div()
@@ -1677,19 +1732,45 @@ impl Editor {
                             .hover(|style| style.text_color(rgb(0xd6d6dd)))
                             .child(if is_rename { "✓" } else { "+" })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let name = this.var_input.read(cx).content().to_string();
-                                let free = match pane {
-                                    SidePane::Cast => this.doc.character_name_free(&name),
-                                    SidePane::Variables => this.doc.variable_name_free(&name),
-                                    SidePane::Flows => this.doc.flow_name_free(&name),
+                                let typed = this.var_input.read(cx).content().to_string();
+                                // On the variables tab the field holds only the rest of the
+                                // name; the picker holds the set. Not when it is renaming a
+                                // set, where the field *is* the set name.
+                                let name = match (pane, renaming_set) {
+                                    (SidePane::Variables, false) => join_set(&set, typed.trim()),
+                                    _ => typed,
+                                };
+                                let free = match (pane, renaming_set) {
+                                    (_, true) => this.doc.set_name_free(&name),
+                                    (SidePane::Cast, _) => this.doc.character_name_free(&name),
+                                    (SidePane::Variables, _) => {
+                                        this.doc.variable_name_free(&name)
+                                    }
+                                    (SidePane::Flows, _) => this.doc.flow_name_free(&name),
                                 };
                                 if !free {
                                     return;
                                 }
                                 this.doc.checkpoint();
                                 match (&renaming, pane) {
+                                    // Every dotted name in the set follows, and so does
+                                    // every effect and check naming one.
+                                    (Some(Rename::Set(old)), _) => {
+                                        let moved = this.doc.rename_set(old, &name);
+                                        let s = if moved == 1 { "" } else { "s" };
+                                        let name = name.trim();
+                                        if this.set == *old {
+                                            this.set = name.to_string();
+                                        }
+                                        this.set_status(
+                                            format!(
+                                                "Renamed \"{old}\" to \"{name}\" — {moved} variable{s}."
+                                            ),
+                                            cx,
+                                        );
+                                    }
                                     // Every line the character speaks follows the record.
-                                    (Some(old), SidePane::Cast) => {
+                                    (Some(Rename::Item(old)), SidePane::Cast) => {
                                         let moved = this.doc.rename_character(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
@@ -1701,7 +1782,7 @@ impl Editor {
                                         );
                                     }
                                     // Effects and checks follow it, so say how many did.
-                                    (Some(old), SidePane::Variables) => {
+                                    (Some(Rename::Item(old)), SidePane::Variables) => {
                                         let moved = this.doc.rename_variable(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
@@ -1716,7 +1797,7 @@ impl Editor {
                                     // apart without anybody picking one.
                                     // Renaming a canvas carries every node standing on it,
                                     // and the one on screen with them.
-                                    (Some(old), SidePane::Flows) => {
+                                    (Some(Rename::Item(old)), SidePane::Flows) => {
                                         let moved = this.doc.rename_flow(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
@@ -1743,6 +1824,9 @@ impl Editor {
                                     }
                                 }
                                 this.renaming = None;
+                                // The set is deliberately *not* cleared: declaring three
+                                // flags into one set should not mean clicking its chip
+                                // three times. Switching tabs and cancelling clear it.
                                 this.var_input
                                     .update(cx, |input, cx| input.set_content("", cx));
                                 cx.notify();
@@ -1760,6 +1844,7 @@ impl Editor {
                                 .child("✗")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.renaming = None;
+                                    this.set = String::new();
                                     this.var_input
                                         .update(cx, |input, cx| input.set_content("", cx));
                                     cx.notify();
@@ -1857,6 +1942,75 @@ impl Editor {
                         cx.notify();
                     })),
             )
+    }
+
+    /// The set chips above the declare field: `(none)` plus one per set the document has.
+    /// Chips rather than a dropdown because the crate has no dropdown and every other
+    /// choice in it is a chip or a cycle — `kind_picker` is the same shape.
+    ///
+    /// There is deliberately no "new set" chip: a set is still made by typing the dot once,
+    /// exactly as before. The picker is autocomplete for the sets that already exist, which
+    /// is the whole of the typo problem, not a replacement for the convention.
+    fn set_picker(
+        &self,
+        current: &str,
+        sets: &[String],
+        cx: &mut Context<Self>,
+        // Owns everything it draws, like the rows it sits under.
+    ) -> impl IntoElement + use<> {
+        let chips: Vec<String> = std::iter::once(String::new())
+            .chain(sets.iter().cloned())
+            .collect();
+        let current = current.to_string();
+
+        // Wraps for `kind_picker`'s reason: a handful of set names do not fit across
+        // `VARS_W`, and without this the last one is clipped off rather than wrapped.
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(chips.into_iter().enumerate().map(|(i, set)| {
+                let on = set == current;
+                let label = match set.is_empty() {
+                    true => "(none)".to_string(),
+                    false => set.clone(),
+                };
+                div()
+                    .id(("set-chip", i))
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(if on { rgb(0x3a3a44) } else { rgb(0x2b2b33) })
+                    .text_color(if on { rgb(0xd6d6dd) } else { rgb(0x8a8a96) })
+                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .truncate()
+                    .child(label)
+                    // Only aims the field, so no checkpoint — same as a `\u{270e}`.
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set.clone_from(&set);
+                        cx.notify();
+                    }))
+            }))
+    }
+
+    /// The `\u{270e}` on a set header. Aims the shared field at the set name rather than at
+    /// a variable's, which is the one job `Editor::pane` cannot say apart on its own.
+    fn set_rename_button(&self, set: &str, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let set = set.to_string();
+        div()
+            .id(SharedString::from(format!("set-rename-{set}")))
+            .px_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_color(rgb(0x6c6c78))
+            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .child("\u{270e}")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.renaming = Some(Rename::Set(set.clone()));
+                this.var_input
+                    .update(cx, |input, cx| input.set_content(&set, cx));
+                cx.notify();
+            }))
     }
 
     /// One row of the variables pane: the flag's state or the number it holds, its name, and
@@ -1978,9 +2132,13 @@ impl Editor {
                         // Not an edit yet, so no checkpoint — it only aims
                         // the field the declare button already uses.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.renaming = Some(to_rename.clone());
+                            // Split the way the declare field is joined, so clicking a
+                            // different chip mid-rename moves the variable between sets.
+                            let (set, rest) = split_set(&to_rename);
+                            this.set = set.unwrap_or_default().to_string();
+                            this.renaming = Some(Rename::Item(to_rename.clone()));
                             this.var_input
-                                .update(cx, |input, cx| input.set_content(&to_rename, cx));
+                                .update(cx, |input, cx| input.set_content(rest, cx));
                             cx.notify();
                         })),
                 )
@@ -2097,7 +2255,7 @@ impl Editor {
                         .child("\u{270e}")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.renaming = Some(to_rename.clone());
+                            this.renaming = Some(Rename::Item(to_rename.clone()));
                             this.var_input
                                 .update(cx, |input, cx| input.set_content(&to_rename, cx));
                             cx.notify();
@@ -2192,7 +2350,7 @@ impl Editor {
                         .child("✎")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.renaming = Some(to_rename.clone());
+                            this.renaming = Some(Rename::Item(to_rename.clone()));
                             this.var_input
                                 .update(cx, |input, cx| input.set_content(&to_rename, cx));
                             cx.notify();

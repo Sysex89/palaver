@@ -412,6 +412,16 @@ pub fn split_set(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The other half of [`split_set`]: a set and a rest joined back into the one name that is
+/// the key. An empty set means no set, so this is what lets the declare field hold only the
+/// rest while the picker holds the set — and the view never has to know the rule is a dot.
+pub fn join_set(set: &str, rest: &str) -> String {
+    match set.is_empty() {
+        true => rest.to_string(),
+        false => format!("{set}.{rest}"),
+    }
+}
+
 /// Every variable's value at one point in a play-through. Never stored on the editor —
 /// see [`Doc::vars_along`], which recomputes it from the path instead.
 pub type VarState = HashMap<String, Value>;
@@ -1032,6 +1042,82 @@ impl Doc {
             default: Value::Bool(false),
         });
         true
+    }
+
+    /// Every set the variables are grouped under, once each, in first-seen order — the
+    /// picker's contents, and [`Doc::all_flows`]'s counterpart. A set exists only because
+    /// some variable's name is dotted, so there is nothing else to list it from.
+    pub fn all_sets(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = Vec::new();
+        for variable in &self.variables {
+            if let (Some(set), _) = split_set(&variable.name)
+                && !found.contains(&set)
+            {
+                found.push(set);
+            }
+        }
+        found
+    }
+
+    /// Whether [`Doc::rename_set`] would accept this as a new set name. The pre-checkpoint
+    /// check [`Doc::variable_name_free`] is, for the same empty-undo-step reason. A dot is
+    /// refused because a set is everything *before* the first one — `a.b` as a set name
+    /// would not survive the round trip through [`split_set`].
+    pub fn set_name_free(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty() && !name.contains('.') && !self.all_sets().contains(&name)
+    }
+
+    /// Renames the set every dotted name in it carries, and every effect and check naming
+    /// one, returning how many *variables* moved. The fourth find-and-replace in this file
+    /// after [`Doc::rename_variable`], [`Doc::rename_character`] and [`Doc::rename_flow`];
+    /// a fifth name-keyed thing has to join all four.
+    ///
+    /// Refused — `0`, nothing changed — when either name is blank or when any resulting
+    /// name would collide with a variable outside the set. Renaming `chapter1` onto an
+    /// existing `shop` would merge two sets and could mint two `shop.paid`, and a name is
+    /// the key, so a duplicate would make every reference to it ambiguous.
+    pub fn rename_set(&mut self, from: &str, to: &str) -> usize {
+        let to = to.trim();
+        if from.is_empty() || to.is_empty() || to.contains('.') {
+            return 0;
+        }
+
+        // Every rename this would perform, as (old, new). Computed before anything is
+        // written, so a refusal leaves the document untouched.
+        let renames: Vec<(String, String)> = self
+            .variables
+            .iter()
+            .filter_map(|v| match split_set(&v.name) {
+                (Some(set), rest) if set == from => Some((v.name.clone(), join_set(to, rest))),
+                _ => None,
+            })
+            .collect();
+        if renames.is_empty() {
+            return 0;
+        }
+        let collides = renames.iter().any(|(old, new)| {
+            self.variables
+                .iter()
+                .any(|v| v.name == *new && v.name != *old)
+        });
+        if collides {
+            return 0;
+        }
+
+        for (old, new) in &renames {
+            if let Some(variable) = self.variables.iter_mut().find(|v| v.name == *old) {
+                variable.name.clone_from(new);
+            }
+            for node in &mut self.nodes {
+                let effects = node.effects.iter_mut().map(|e| &mut e.var);
+                let conditions = node.conditions.iter_mut().map(|c| &mut c.var);
+                for var in effects.chain(conditions).filter(|var| *var == old) {
+                    var.clone_from(new);
+                }
+            }
+        }
+        renames.len()
     }
 
     /// Removes the flag and every effect that writes it, returning how many effects went
@@ -3626,5 +3712,120 @@ mod tests {
         let back = Doc::from_json(&doc.to_json()).expect("round trips");
         assert_eq!(back.flows, vec!["chapter1".to_string()]);
         assert_eq!(back.nodes[0].flow, "chapter1");
+    }
+
+    /// A variable in a set, for the tests below.
+    fn declared(doc: &mut Doc, name: &str) {
+        assert!(doc.add_variable(name), "{name} is free");
+    }
+
+    /// The two halves of the one convention. Round-tripping the shapes `split_set` refuses
+    /// matters most: neither may grow or lose a dot on the way through.
+    #[test]
+    fn join_set_is_the_inverse_of_split_set() {
+        for name in ["paid", "chapter1.paid", "a.b.c", ".paid", "chapter1."] {
+            let (set, rest) = split_set(name);
+            assert_eq!(
+                join_set(set.unwrap_or(""), rest),
+                name,
+                "round trip of {name}"
+            );
+        }
+        assert_eq!(join_set("", "paid"), "paid");
+        assert_eq!(join_set("chapter1", "paid"), "chapter1.paid");
+    }
+
+    #[test]
+    fn all_sets_lists_each_set_once_in_first_seen_order() {
+        let mut doc = Doc::default();
+        declared(&mut doc, "chapter1.paid");
+        declared(&mut doc, "loose");
+        declared(&mut doc, "shop.open");
+        declared(&mut doc, "chapter1.gold");
+        // Neither side of the dot may be empty, so these belong to no set.
+        declared(&mut doc, ".odd");
+        declared(&mut doc, "odd.");
+
+        assert_eq!(doc.all_sets(), vec!["chapter1", "shop"]);
+    }
+
+    /// The fourth find-and-replace: the declarations and every reference move together.
+    #[test]
+    fn renaming_a_set_moves_every_variable_in_it() {
+        let mut doc = Doc::default();
+        declared(&mut doc, "chapter1.paid");
+        declared(&mut doc, "chapter1.gold");
+        let id = doc.add_node(0.0, 0.0);
+        doc.set_effect(id, "chapter1.paid", Some(Value::Bool(true)), SetOp::Set);
+        doc.set_condition(id, "chapter1.gold", Some(Value::Bool(true)), Cmp::Eq);
+
+        assert_eq!(doc.rename_set("chapter1", "prologue"), 2);
+
+        assert_eq!(doc.all_sets(), vec!["prologue"]);
+        assert!(doc.variable("prologue.paid").is_some());
+        assert!(doc.variable("chapter1.paid").is_none());
+        let node = doc.node(id).unwrap();
+        assert_eq!(node.effects[0].var, "prologue.paid");
+        assert_eq!(node.conditions[0].var, "prologue.gold");
+    }
+
+    #[test]
+    fn renaming_a_set_leaves_other_sets_and_ungrouped_variables_alone() {
+        let mut doc = Doc::default();
+        declared(&mut doc, "chapter1.paid");
+        declared(&mut doc, "shop.open");
+        declared(&mut doc, "loose");
+
+        assert_eq!(doc.rename_set("chapter1", "prologue"), 1);
+
+        assert!(doc.variable("shop.open").is_some());
+        assert!(doc.variable("loose").is_some());
+    }
+
+    /// A name is the key, so a rename that would mint a duplicate is refused outright
+    /// rather than silently merging two sets.
+    #[test]
+    fn renaming_a_set_onto_an_existing_name_is_refused() {
+        let mut doc = Doc::default();
+        declared(&mut doc, "chapter1.paid");
+        declared(&mut doc, "shop.paid");
+
+        assert_eq!(doc.rename_set("chapter1", "shop"), 0);
+        assert!(doc.variable("chapter1.paid").is_some(), "nothing changed");
+        assert!(doc.variable("shop.paid").is_some());
+
+        // Blank on either side, a dot in the new name, and a set nothing is in.
+        assert_eq!(doc.rename_set("chapter1", "   "), 0);
+        assert_eq!(doc.rename_set("", "prologue"), 0);
+        assert_eq!(doc.rename_set("chapter1", "a.b"), 0);
+        assert_eq!(doc.rename_set("nosuchset", "prologue"), 0);
+    }
+
+    /// The pre-checkpoint guard, so a refused rename leaves no empty undo step.
+    #[test]
+    fn set_name_free_refuses_a_taken_name_a_blank_and_a_dot() {
+        let mut doc = Doc::default();
+        declared(&mut doc, "chapter1.paid");
+
+        assert!(!doc.set_name_free("chapter1"));
+        assert!(!doc.set_name_free("   "));
+        assert!(!doc.set_name_free("a.b"));
+        assert!(doc.set_name_free("prologue"));
+    }
+
+    /// No schema changed, so `Snapshot` needed no new arm — this is the test that says so.
+    #[test]
+    fn undo_restores_a_renamed_set() {
+        let mut doc = Doc::default();
+        declared(&mut doc, "chapter1.paid");
+        let id = doc.add_node(0.0, 0.0);
+        doc.set_effect(id, "chapter1.paid", Some(Value::Bool(true)), SetOp::Set);
+
+        doc.checkpoint();
+        assert_eq!(doc.rename_set("chapter1", "prologue"), 1);
+
+        assert!(doc.undo());
+        assert!(doc.variable("chapter1.paid").is_some());
+        assert_eq!(doc.node(id).unwrap().effects[0].var, "chapter1.paid");
     }
 }
