@@ -16,11 +16,14 @@ pub type NodeId = u64;
 /// Extension of a saved dialog document.
 pub const FILE_EXT: &str = "dln";
 
-/// Gives the path the document extension unless it already has one.
-pub fn with_default_extension(path: PathBuf) -> PathBuf {
+/// Extension of a Fluent translation file, written by [`Doc::export_ftl`].
+pub const FTL_EXT: &str = "ftl";
+
+/// Gives the path an extension unless it already has one.
+pub fn with_default_extension(path: PathBuf, ext: &str) -> PathBuf {
     match path.extension() {
         Some(_) => path,
-        None => path.with_extension(FILE_EXT),
+        None => path.with_extension(ext),
     }
 }
 
@@ -1553,6 +1556,66 @@ impl Doc {
     pub fn load(path: &Path) -> Result<Doc, String> {
         let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         Doc::from_json(&json).map_err(|e| e.to_string())
+    }
+
+    /// The document's translatable strings as a Fluent (`.ftl`) file, for a game build to
+    /// load. Keyed on [`NodeId`] rather than [`Node::alias`]: an alias is optional and
+    /// author-renamable, so a translation keyed on one breaks the first time somebody edits
+    /// it, while an id is random, stable and never reissued. An edge is keyed by its
+    /// endpoints rather than its index, which any edge removal invalidates. A Fluent
+    /// identifier cannot start with a digit, hence the prefixes.
+    ///
+    /// A note is author-facing and must never reach a translator. Speaker names stay out
+    /// too: a display name with a space in it is not an identifier, and it is already the
+    /// key [`Doc::rename_character`] finds and replaces.
+    pub fn to_ftl(&self) -> String {
+        let mut out = String::new();
+        for node in &self.nodes {
+            // An empty value is a parse error in FTL, and a blank node is already
+            // `Problem::Empty` — the document says so somewhere the author can read it.
+            if node.kind != NodeKind::Note && !node.text.is_empty() {
+                out += &Self::ftl_entry(&format!("node-{}", node.id), &node.text);
+            }
+        }
+        // No note filter needed here: `add_edge` refuses an edge with a note at either end.
+        for edge in &self.edges {
+            if !edge.label.is_empty() {
+                out += &Self::ftl_entry(&format!("edge-{}-{}", edge.from, edge.to), &edge.label);
+            }
+        }
+        out
+    }
+
+    /// One `key = value`. A value holding a newline becomes a block value — the key alone,
+    /// then every line indented — because an FTL value ends at the first unindented line;
+    /// blank lines are indented for the same reason. A brace opens a placeable, so text
+    /// carrying one is escaped, and in a *single* pass: chaining two `replace` calls would
+    /// mangle the braces the first one inserted.
+    fn ftl_entry(key: &str, value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for c in value.chars() {
+            match c {
+                '{' => escaped.push_str("{\"{\"}"),
+                '}' => escaped.push_str("{\"}\"}"),
+                _ => escaped.push(c),
+            }
+        }
+
+        if !escaped.contains('\n') {
+            return format!("{key} = {escaped}\n");
+        }
+        let mut out = format!("{key} =\n");
+        for line in escaped.lines() {
+            out += &format!("    {line}\n");
+        }
+        out
+    }
+
+    /// Writes [`Doc::to_ftl`]. Deliberately takes `&self`, which is the compiler saying an
+    /// export is not a save: it must not clear `dirty`, drop the crash copy, or become the
+    /// document's own path.
+    pub fn export_ftl(&self, path: &Path) -> Result<(), String> {
+        std::fs::write(path, self.to_ftl()).map_err(|e| e.to_string())
     }
 
     /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
@@ -3517,7 +3580,7 @@ mod tests {
 
     #[test]
     fn default_extension_only_fills_a_gap() {
-        let ext = |p: &str| with_default_extension(PathBuf::from(p));
+        let ext = |p: &str| with_default_extension(PathBuf::from(p), FILE_EXT);
 
         assert_eq!(ext("/tmp/scene"), PathBuf::from("/tmp/scene.dln"));
         assert_eq!(ext("/tmp/scene.dln"), PathBuf::from("/tmp/scene.dln"));
@@ -4059,5 +4122,100 @@ mod tests {
         assert!(doc.undo());
         assert!(doc.variable("chapter1.paid").is_some());
         assert_eq!(doc.node(id).unwrap().effects[0].var, "chapter1.paid");
+    }
+
+    /// The key is the id, never the alias: an alias is optional and the author may rename it
+    /// whenever they like, and a translation keyed on one breaks the first time they do.
+    #[test]
+    fn ftl_keys_a_node_by_id_not_alias() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "Good evening.".into();
+        doc.node_mut(a).unwrap().alias = "intro".into();
+
+        assert_eq!(doc.to_ftl(), format!("node-{a} = Good evening.\n"));
+    }
+
+    /// By its endpoints, not its index — `Selection::Edge(usize)` is invalidated by any edge
+    /// removal, and a translation key has to outlive one.
+    #[test]
+    fn ftl_keys_an_edge_by_its_endpoints() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 400.0, 0.0);
+        let c = spoken(&mut doc, 400.0, 200.0);
+        doc.add_edge(a, b);
+        doc.add_edge(a, c);
+        doc.edges[0].label = "Yes".into();
+        doc.edges[1].label = "No".into();
+
+        let key = format!("edge-{a}-{c} = No\n");
+        assert!(doc.to_ftl().contains(&key));
+
+        doc.edges.remove(0);
+        assert!(
+            doc.to_ftl().contains(&key),
+            "the key survives losing an earlier edge"
+        );
+    }
+
+    #[test]
+    fn ftl_skips_notes_and_empty_strings() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "Spoken.".into();
+        let note = doc.add_node(400.0, 0.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        doc.node_mut(note).unwrap().text = "Rewrite this later.".into();
+        let blank = doc.add_node(800.0, 0.0);
+
+        let ftl = doc.to_ftl();
+        assert_eq!(ftl, format!("node-{a} = Spoken.\n"));
+        assert!(
+            !ftl.contains("Rewrite"),
+            "author-facing text must never reach a translator"
+        );
+        assert!(
+            !ftl.contains(&format!("node-{blank}")),
+            "an empty value does not parse as FTL"
+        );
+    }
+
+    /// A display name with a space in it is not a Fluent identifier, and it is already the
+    /// key `rename_character` finds and replaces.
+    #[test]
+    fn ftl_leaves_speaker_names_out() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().speaker = "Innkeeper".into();
+        doc.node_mut(a).unwrap().text = "Ale?".into();
+
+        assert!(!doc.to_ftl().contains("Innkeeper"));
+    }
+
+    /// An FTL value ends at the first unindented line, so a multi-line one becomes a block —
+    /// blank lines included, or the value would stop halfway through.
+    #[test]
+    fn ftl_indents_a_multi_line_value() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "One.\n\nTwo.".into();
+
+        assert_eq!(
+            doc.to_ftl(),
+            format!("node-{a} =\n    One.\n    \n    Two.\n")
+        );
+    }
+
+    /// A brace opens a placeable. Escaping with two chained `replace` calls would re-escape
+    /// the braces the first one inserted, which is why the pass is single.
+    #[test]
+    fn ftl_escapes_a_brace() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "a {b} c".into();
+
+        let expected = format!("node-{a} = ") + "a {\"{\"}b{\"}\"} c\n";
+        assert_eq!(doc.to_ftl(), expected);
     }
 }

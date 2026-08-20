@@ -2,9 +2,9 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp, Severity,
-    Value, VarState, View, clear_backup, in_port, join_set, node_center, out_port, read_backup,
-    split_set, with_default_extension,
+    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp,
+    Severity, Value, VarState, View, clear_backup, in_port, join_set, node_center, out_port,
+    read_backup, split_set, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -37,6 +37,7 @@ actions!(
         New,
         Save,
         SaveAs,
+        ExportFluent,
         Open,
         Play,
         PlayFromHere,
@@ -98,6 +99,9 @@ const MENUS: &[MenuSpec] = &[
             ("Save", "Ctrl+S", |e, w, cx| e.on_save(&Save, w, cx)),
             ("Save As…", "Ctrl+Shift+S", |e, w, cx| {
                 e.on_save_as(&SaveAs, w, cx)
+            }),
+            ("Export Fluent…", "", |e, w, cx| {
+                e.on_export_fluent(&ExportFluent, w, cx)
             }),
         ],
     ),
@@ -601,6 +605,43 @@ impl Editor {
         .detach();
     }
 
+    /// Writes the translatable strings out for a game build. Deliberately not a save: it
+    /// leaves `self.path`, the dirty flag and the crash copy alone, so exporting never
+    /// re-points the editor at the `.ftl`.
+    fn on_export_fluent(&mut self, _: &ExportFluent, _: &mut Window, cx: &mut Context<Self>) {
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let suggested = PathBuf::from(self.file_name())
+            .with_extension(FTL_EXT)
+            .to_string_lossy()
+            .into_owned();
+        let response = cx.prompt_for_new_path(&directory, Some(&suggested));
+
+        cx.spawn(async move |this, cx| {
+            match response.await {
+                Ok(Ok(Some(path))) => {
+                    this.update(cx, |this, cx| {
+                        let path = with_default_extension(path, FTL_EXT);
+                        let status = match this.doc.export_ftl(&path) {
+                            Ok(()) => format!("Exported {}", document_name(Some(&path))),
+                            Err(error) => format!("Export failed: {error}"),
+                        };
+                        this.set_status(status, cx);
+                    })
+                    .ok();
+                }
+                // Cancelled — nothing to report.
+                Ok(Ok(None)) | Err(_) => {}
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.set_status(format!("Export dialog failed: {error}"), cx)
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
     fn on_open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
         if !self.doc.is_dirty() {
             return self.open_dialog(cx);
@@ -652,7 +693,7 @@ impl Editor {
 
     fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // A path typed without an extension in the dialog still becomes a .dln file.
-        let path = with_default_extension(path);
+        let path = with_default_extension(path, FILE_EXT);
         match self.doc.save(&path) {
             Ok(()) => {
                 // The work is on disk under its own name now; the crash copy is redundant.
@@ -1352,6 +1393,7 @@ impl Editor {
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
+            .on_action(cx.listener(Self::on_export_fluent))
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_play))
             .on_action(cx.listener(Self::on_play_from_here))
