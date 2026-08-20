@@ -141,7 +141,15 @@ impl View {
 const UNDO_DEPTH: usize = 50;
 
 /// Everything an undo restores: the document data, minus the history itself.
-type Snapshot = (Vec<Node>, Vec<Edge>, Vec<Variable>, Vec<Character>);
+// ponytail: a five-tuple is at the edge of readable; make it a struct if a sixth
+// field joins.
+type Snapshot = (
+    Vec<Node>,
+    Vec<Edge>,
+    Vec<Variable>,
+    Vec<Character>,
+    Vec<String>,
+);
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Doc {
@@ -154,6 +162,13 @@ pub struct Doc {
     /// before the cast existed loads with an empty one and looks exactly as it did.
     #[serde(default)]
     pub characters: Vec<Character>,
+    /// The declared canvases. A flow is a named view onto this one flat node list, not a
+    /// nested graph: `Node::flow` says which canvas draws a node, and crossing between two
+    /// of them is what [`NodeKind::Jump`] already does. `default` for the reason
+    /// `characters` is — a file written before flows existed loads with none, every node
+    /// sitting in the unnamed main flow, and looks exactly as it did.
+    #[serde(default)]
+    pub flows: Vec<String>,
     // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
     #[serde(skip)]
     undo: Vec<Snapshot>,
@@ -201,6 +216,10 @@ pub struct Node {
     /// ordinary state — an un-aliased node is not incomplete.
     #[serde(default)]
     pub alias: String,
+    /// Which canvas draws this node. Empty is the main flow and the ordinary state; it is
+    /// what every node in a file written before flows existed loads as.
+    #[serde(default)]
+    pub flow: String,
     /// Marked as a deliberate ending, so having no outgoing edges is not a fault.
     /// `default` so `.dln` files written before this field keep loading.
     #[serde(default)]
@@ -447,6 +466,12 @@ pub enum Problem {
     /// twice. [`Doc::add_edge`] refuses one, so only a merge can make it — which is the
     /// gap random ids opened by making a `.dln` auto-merge legal again.
     DuplicateEdge(usize),
+    /// An ordinary edge whose two ends sit on different canvases. Authoring cannot make
+    /// one — a drag needs both ends visible, so both are in one flow — and nothing draws
+    /// it, so it is a lie about the graph in the way a jump's second target would be. Only
+    /// a hand-edit or a merge produces one, which is the category `DanglingEdge` is in.
+    /// A jump's edge is exempt: crossing flows is exactly what the kind is for.
+    CrossFlowEdge(usize),
 }
 
 /// A leaf node is an ordinary way for a conversation to end, so most findings are
@@ -479,7 +504,8 @@ impl Problem {
             | Problem::NoStart
             | Problem::UnknownVar(..)
             | Problem::TypeMismatch(..)
-            | Problem::DuplicateAlias(..) => Severity::Error,
+            | Problem::DuplicateAlias(..)
+            | Problem::CrossFlowEdge(_) => Severity::Error,
             _ => Severity::Warning,
         }
     }
@@ -528,8 +554,12 @@ impl Doc {
         }
 
         for (index, edge) in self.edges.iter().enumerate() {
-            if self.node(edge.from).is_none() || self.node(edge.to).is_none() {
+            let (Some(from), Some(to)) = (self.node(edge.from), self.node(edge.to)) else {
                 found.push(Problem::DanglingEdge(index));
+                continue;
+            };
+            if from.flow != to.flow && from.kind != NodeKind::Jump {
+                found.push(Problem::CrossFlowEdge(index));
             }
         }
 
@@ -706,6 +736,7 @@ impl Doc {
             speaker: String::new(),
             text: String::new(),
             alias: String::new(),
+            flow: String::new(),
             end: false,
             kind: NodeKind::Speech,
             effects: Vec::new(),
@@ -826,21 +857,25 @@ impl Doc {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
-    /// Topmost node containing the point, in document coordinates.
-    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+    /// Topmost node of one flow containing the point, in document coordinates. Scoped
+    /// because only that flow's nodes are drawn: a node on another canvas that happens to
+    /// sit under the cursor must not be clickable through this one.
+    pub fn hit_test(&self, flow: &str, x: f32, y: f32) -> Option<NodeId> {
         self.nodes
             .iter()
             .rev()
+            .filter(|n| n.flow == flow)
             .find(|n| x >= n.x && x < n.x + NODE_W && y >= n.y && y < n.y + NODE_H)
             .map(|n| n.id)
     }
 
     /// Topmost node whose out-port contains the point. Check this before [`Doc::hit_test`],
     /// since the port overlaps the node box.
-    pub fn port_hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+    pub fn port_hit_test(&self, flow: &str, x: f32, y: f32) -> Option<NodeId> {
         self.nodes
             .iter()
             .rev()
+            .filter(|n| n.flow == flow)
             .find(|n| {
                 let (px, py) = out_port(n);
                 (x - px).hypot(y - py) <= PORT_R
@@ -870,11 +905,12 @@ impl Doc {
     /// Ids of every node whose box touches the rectangle spanned by two document points,
     /// given in either corner order. Touching is enough — a marquee need not swallow a
     /// node whole to catch it.
-    pub fn nodes_in_rect(&self, a: (f32, f32), b: (f32, f32)) -> Vec<NodeId> {
+    pub fn nodes_in_rect(&self, flow: &str, a: (f32, f32), b: (f32, f32)) -> Vec<NodeId> {
         let (min_x, max_x) = (a.0.min(b.0), a.0.max(b.0));
         let (min_y, max_y) = (a.1.min(b.1), a.1.max(b.1));
         self.nodes
             .iter()
+            .filter(|n| n.flow == flow)
             .filter(|n| n.x < max_x && n.x + NODE_W > min_x && n.y < max_y && n.y + NODE_H > min_y)
             .map(|n| n.id)
             .collect()
@@ -939,7 +975,13 @@ impl Doc {
             y = lowest_child + NODE_H + GAP_Y;
         }
 
+        let flow = parent.flow.clone();
         let id = self.add_node(x, y);
+        // Branching lands on the canvas the parent is drawn on, so Tab never creates a node
+        // the author cannot see.
+        if let Some(node) = self.node_mut(id) {
+            node.flow = flow;
+        }
         // A fresh id is neither a self-loop nor a duplicate, so this cannot fail.
         self.add_edge(from, id);
         Some(id)
@@ -951,12 +993,18 @@ impl Doc {
         }
     }
 
-    /// Index of the first edge whose line passes near the point.
-    pub fn edge_at(&self, x: f32, y: f32) -> Option<usize> {
+    /// Index of the first edge of one flow whose line passes near the point. An edge is in
+    /// a flow only when *both* its ends are — the same test the canvas draws it by, so the
+    /// author can never click a line that is not there. The index is still into the whole
+    /// `edges` vec, which is what keeps `Selection::Edge` a bare index.
+    pub fn edge_at(&self, flow: &str, x: f32, y: f32) -> Option<usize> {
         self.edges.iter().position(|e| {
             let (Some(from), Some(to)) = (self.node(e.from), self.node(e.to)) else {
                 return false;
             };
+            if from.flow != flow || to.flow != flow {
+                return false;
+            }
             distance_to_segment((x, y), out_port(from), in_port(to)) <= EDGE_HIT_TOL
         })
     }
@@ -1211,20 +1259,105 @@ impl Doc {
         }
     }
 
+    /// The nodes one canvas draws, in document order. The single filter the whole feature
+    /// is built out of: the node list stays flat and globally id'd, and a flow is only a
+    /// view onto it.
+    pub fn nodes_in<'a>(&'a self, flow: &'a str) -> impl Iterator<Item = &'a Node> {
+        self.nodes.iter().filter(move |n| n.flow == flow)
+    }
+
+    /// Every flow the document has, in declaration order and then first-use order: the
+    /// declared ones unioned with whatever `Node::flow` values the nodes actually carry.
+    /// The union is why there is no `UnknownFlow` problem — a node can never end up on a
+    /// canvas the author has no way to open, even out of a hand-edited file.
+    pub fn all_flows(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = self.flows.iter().map(String::as_str).collect();
+        for node in &self.nodes {
+            if !node.flow.is_empty() && !found.contains(&node.flow.as_str()) {
+                found.push(&node.flow);
+            }
+        }
+        found
+    }
+
+    /// Whether [`Doc::add_flow`] would accept this name. Separate for the reason
+    /// [`Doc::variable_name_free`] is: a refused add must not leave an empty undo step.
+    pub fn flow_name_free(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty() && !self.all_flows().contains(&name)
+    }
+
+    /// Declares an empty canvas. False when the name is blank or taken — the name is the
+    /// key, as a variable's and a character's are.
+    pub fn add_flow(&mut self, name: &str) -> bool {
+        if !self.flow_name_free(name) {
+            return false;
+        }
+        self.flows.push(name.trim().to_string());
+        true
+    }
+
+    /// Renames the canvas and every node standing on it, returning how many moved. The
+    /// third find-and-replace in this file after [`Doc::rename_variable`] and
+    /// [`Doc::rename_character`]; a fourth name-keyed field has to join all three.
+    pub fn rename_flow(&mut self, from: &str, to: &str) -> usize {
+        let to = to.trim();
+        if from.is_empty() || !self.flow_name_free(to) {
+            return 0;
+        }
+        for flow in self.flows.iter_mut().filter(|f| *f == from) {
+            *flow = to.to_string();
+        }
+        let mut moved = 0;
+        for node in self.nodes.iter_mut().filter(|n| n.flow == from) {
+            node.flow = to.to_string();
+            moved += 1;
+        }
+        moved
+    }
+
+    /// Undeclares the canvas and returns its nodes to the main flow, reporting how many
+    /// came back. A third removal policy, deliberately: [`Doc::remove_variable`]'s cascade
+    /// would delete the nodes outright, and [`Doc::remove_character`]'s undeclare-only
+    /// would strand them on a canvas nothing lists. One checkpoint, so one undo puts the
+    /// flow and its nodes back together.
+    pub fn remove_flow(&mut self, name: &str) -> usize {
+        if name.is_empty() {
+            return 0;
+        }
+        self.flows.retain(|f| f != name);
+        let mut moved = 0;
+        for node in self.nodes.iter_mut().filter(|n| n.flow == name) {
+            node.flow.clear();
+            moved += 1;
+        }
+        moved
+    }
+
+    /// Moves every listed node to a canvas, the way [`Doc::move_nodes`] shifts them.
+    /// Unknown ids are skipped. This is how a graph that got too big is split up.
+    pub fn move_to_flow(&mut self, ids: &[NodeId], flow: &str) {
+        for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
+            node.flow = flow.to_string();
+        }
+    }
+
     fn snapshot(&self) -> Snapshot {
         (
             self.nodes.clone(),
             self.edges.clone(),
             self.variables.clone(),
             self.characters.clone(),
+            self.flows.clone(),
         )
     }
 
-    fn restore(&mut self, (nodes, edges, variables, characters): Snapshot) {
+    fn restore(&mut self, (nodes, edges, variables, characters, flows): Snapshot) {
         self.nodes = nodes;
         self.edges = edges;
         self.variables = variables;
         self.characters = characters;
+        self.flows = flows;
     }
 
     /// Records the current state so the next mutation can be undone. Every mutation
@@ -1492,18 +1625,18 @@ mod tests {
         let under = doc.add_node(100.0, 100.0);
         let over = doc.add_node(150.0, 120.0);
 
-        assert_eq!(doc.hit_test(110.0, 110.0), Some(under));
+        assert_eq!(doc.hit_test("", 110.0, 110.0), Some(under));
         assert_eq!(
-            doc.hit_test(160.0, 130.0),
+            doc.hit_test("", 160.0, 130.0),
             Some(over),
             "later node is on top"
         );
         assert_eq!(
-            doc.hit_test(100.0 + NODE_W, 110.0),
+            doc.hit_test("", 100.0 + NODE_W, 110.0),
             None,
             "right edge is exclusive"
         );
-        assert_eq!(doc.hit_test(0.0, 0.0), None);
+        assert_eq!(doc.hit_test("", 0.0, 0.0), None);
     }
 
     #[test]
@@ -1686,9 +1819,13 @@ mod tests {
 
         // The line runs from a's right edge to b's left edge, both at NODE_H / 2.
         let midpoint = ((NODE_W + 400.0) / 2.0, NODE_H / 2.0);
-        assert_eq!(doc.edge_at(midpoint.0, midpoint.1), Some(0));
-        assert_eq!(doc.edge_at(midpoint.0, midpoint.1 + 50.0), None);
-        assert_eq!(doc.edge_at(-100.0, NODE_H / 2.0), None, "before the start");
+        assert_eq!(doc.edge_at("", midpoint.0, midpoint.1), Some(0));
+        assert_eq!(doc.edge_at("", midpoint.0, midpoint.1 + 50.0), None);
+        assert_eq!(
+            doc.edge_at("", -100.0, NODE_H / 2.0),
+            None,
+            "before the start"
+        );
     }
 
     /// A node with text, so it is not flagged empty by accident.
@@ -2007,11 +2144,11 @@ mod tests {
 
         // Starts inside the first node and stops just past the second's left edge.
         assert_eq!(
-            doc.nodes_in_rect((10.0, 10.0), (310.0, 20.0)),
+            doc.nodes_in_rect("", (10.0, 10.0), (310.0, 20.0)),
             vec![first, second]
         );
         assert!(
-            doc.nodes_in_rect((NODE_W + 10.0, 10.0), (290.0, 20.0))
+            doc.nodes_in_rect("", (NODE_W + 10.0, 10.0), (290.0, 20.0))
                 .is_empty(),
             "the gap between two nodes touches neither"
         );
@@ -2022,9 +2159,9 @@ mod tests {
         let doc = Doc::sample();
         let corner = ((0.0, 0.0), (700.0, 300.0));
 
-        let dragged_down = doc.nodes_in_rect(corner.0, corner.1);
+        let dragged_down = doc.nodes_in_rect("", corner.0, corner.1);
         assert!(!dragged_down.is_empty(), "the band caught something");
-        assert_eq!(doc.nodes_in_rect(corner.1, corner.0), dragged_down);
+        assert_eq!(doc.nodes_in_rect("", corner.1, corner.0), dragged_down);
     }
 
     #[test]
@@ -2104,9 +2241,9 @@ mod tests {
         let a = doc.add_node(10.0, 10.0);
         let (px, py) = out_port(doc.node(a).unwrap());
 
-        assert_eq!(doc.port_hit_test(px, py), Some(a));
-        assert_eq!(doc.port_hit_test(px - PORT_R + 1.0, py), Some(a));
-        assert_eq!(doc.port_hit_test(px, py + PORT_R * 2.0), None);
+        assert_eq!(doc.port_hit_test("", px, py), Some(a));
+        assert_eq!(doc.port_hit_test("", px - PORT_R + 1.0, py), Some(a));
+        assert_eq!(doc.port_hit_test("", px, py + PORT_R * 2.0), None);
     }
 
     #[test]
@@ -3256,5 +3393,238 @@ mod tests {
 
         assert_eq!(view.zoom, MAX_ZOOM);
         assert!(close(view.to_screen(under_cursor), anchor));
+    }
+
+    /// A node standing on a canvas, for the flow tests below.
+    fn on_flow(doc: &mut Doc, flow: &str, x: f32, y: f32) -> NodeId {
+        let id = doc.add_node(x, y);
+        doc.node_mut(id).unwrap().flow = flow.to_string();
+        id
+    }
+
+    /// The claim the whole design rests on: a file written before flows existed loads with
+    /// every node in the unnamed main flow and looks exactly as it did.
+    #[test]
+    fn a_document_without_flows_still_loads() {
+        let doc = Doc::from_json(
+            r#"{"nodes":[{"id":7,"x":0.0,"y":0.0,"speaker":"Innkeeper","text":"Hm?"}],
+                "edges":[]}"#,
+        )
+        .expect("loads");
+
+        assert!(doc.flows.is_empty());
+        assert_eq!(doc.node(7).unwrap().flow, "");
+        assert_eq!(doc.nodes_in("").count(), 1);
+    }
+
+    /// `Snapshot` has to carry the flows, or a whole class of edit quietly stops being
+    /// undoable — the failure `undo_restores_a_deleted_variable` was written to catch.
+    #[test]
+    fn undo_restores_a_deleted_flow() {
+        let mut doc = Doc::default();
+        doc.checkpoint();
+        assert!(doc.add_flow("chapter1"));
+        let id = on_flow(&mut doc, "chapter1", 0.0, 0.0);
+
+        doc.checkpoint();
+        assert_eq!(doc.remove_flow("chapter1"), 1);
+        assert!(doc.flows.is_empty());
+        assert_eq!(doc.node(id).unwrap().flow, "");
+
+        assert!(doc.undo());
+        assert_eq!(doc.flows, vec!["chapter1".to_string()]);
+        assert_eq!(doc.node(id).unwrap().flow, "chapter1");
+    }
+
+    /// Only one canvas is drawn, so only one canvas may be clicked: a node on another one
+    /// under the cursor must not be reachable through it.
+    #[test]
+    fn hit_test_ignores_a_node_in_another_flow() {
+        let mut doc = Doc::default();
+        let here = on_flow(&mut doc, "", 100.0, 100.0);
+        // Deliberately on top of it, which is the case the scoping exists for.
+        let elsewhere = on_flow(&mut doc, "chapter1", 100.0, 100.0);
+
+        assert_eq!(doc.hit_test("", 110.0, 110.0), Some(here));
+        assert_eq!(doc.hit_test("chapter1", 110.0, 110.0), Some(elsewhere));
+        assert_eq!(doc.hit_test("nowhere", 110.0, 110.0), None);
+    }
+
+    #[test]
+    fn port_hit_test_is_scoped_to_one_flow() {
+        let mut doc = Doc::default();
+        let elsewhere = on_flow(&mut doc, "chapter1", 100.0, 100.0);
+        let (px, py) = out_port(doc.node(elsewhere).unwrap());
+
+        assert_eq!(doc.port_hit_test("", px, py), None);
+        assert_eq!(doc.port_hit_test("chapter1", px, py), Some(elsewhere));
+    }
+
+    #[test]
+    fn nodes_in_rect_is_scoped_to_one_flow() {
+        let mut doc = Doc::default();
+        let here = on_flow(&mut doc, "", 100.0, 100.0);
+        on_flow(&mut doc, "chapter1", 120.0, 120.0);
+
+        let caught = doc.nodes_in_rect("", (0.0, 0.0), (1000.0, 1000.0));
+        assert_eq!(caught, vec![here]);
+    }
+
+    /// An edge is on the canvas both its ends stand on — the same test the view draws it
+    /// by, so a line is never hit where it is not drawn.
+    #[test]
+    fn edge_at_skips_an_edge_crossing_flows() {
+        let mut doc = Doc::default();
+        let from = on_flow(&mut doc, "", 0.0, 0.0);
+        let to = on_flow(&mut doc, "chapter1", 400.0, 0.0);
+        assert!(doc.add_edge(from, to));
+
+        let (ax, ay) = out_port(doc.node(from).unwrap());
+        let (bx, by) = in_port(doc.node(to).unwrap());
+        let mid = ((ax + bx) / 2.0, (ay + by) / 2.0);
+
+        assert_eq!(doc.edge_at("", mid.0, mid.1), None);
+        assert_eq!(doc.edge_at("chapter1", mid.0, mid.1), None);
+
+        // Both ends on one canvas and it is clickable again.
+        doc.node_mut(to).unwrap().flow.clear();
+        assert_eq!(doc.edge_at("", mid.0, mid.1), Some(0));
+    }
+
+    /// The third find-and-replace in this file, after a variable's and a character's.
+    #[test]
+    fn renaming_a_flow_moves_every_node_in_it() {
+        let mut doc = Doc::default();
+        doc.add_flow("chapter1");
+        let a = on_flow(&mut doc, "chapter1", 0.0, 0.0);
+        let b = on_flow(&mut doc, "chapter1", 0.0, 200.0);
+        let other = on_flow(&mut doc, "shop", 0.0, 400.0);
+
+        assert_eq!(doc.rename_flow("chapter1", "prologue"), 2);
+        assert_eq!(doc.flows, vec!["prologue".to_string()]);
+        assert_eq!(doc.node(a).unwrap().flow, "prologue");
+        assert_eq!(doc.node(b).unwrap().flow, "prologue");
+        assert_eq!(doc.node(other).unwrap().flow, "shop");
+    }
+
+    #[test]
+    fn a_flow_cannot_be_renamed_onto_a_name_in_use() {
+        let mut doc = Doc::default();
+        doc.add_flow("chapter1");
+        doc.add_flow("shop");
+
+        assert_eq!(doc.rename_flow("chapter1", "shop"), 0);
+        assert_eq!(doc.rename_flow("chapter1", "   "), 0);
+        assert_eq!(doc.flows, vec!["chapter1".to_string(), "shop".to_string()]);
+    }
+
+    /// Neither `remove_variable`'s cascade nor `remove_character`'s undeclare-only: the
+    /// nodes come back rather than being deleted or stranded.
+    #[test]
+    fn removing_a_flow_returns_its_nodes_to_the_main_one() {
+        let mut doc = Doc::default();
+        doc.add_flow("chapter1");
+        let id = on_flow(&mut doc, "chapter1", 0.0, 0.0);
+
+        assert_eq!(doc.remove_flow("chapter1"), 1);
+        assert!(doc.flows.is_empty());
+        assert_eq!(doc.nodes.len(), 1, "the node is not deleted with the flow");
+        assert_eq!(doc.node(id).unwrap().flow, "");
+    }
+
+    /// So Tab and Ctrl+1–5 never create a node on a canvas the author cannot see.
+    #[test]
+    fn branch_from_inherits_the_parent_flow() {
+        let mut doc = Doc::default();
+        let parent = on_flow(&mut doc, "chapter1", 0.0, 0.0);
+
+        let child = doc.branch_from(parent).expect("branches");
+        assert_eq!(doc.node(child).unwrap().flow, "chapter1");
+    }
+
+    #[test]
+    fn move_to_flow_carries_a_whole_selection() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.add_node(0.0, 200.0);
+        let stays = doc.add_node(0.0, 400.0);
+
+        doc.move_to_flow(&[a, b], "chapter1");
+
+        assert_eq!(doc.nodes_in("chapter1").count(), 2);
+        assert_eq!(doc.node(stays).unwrap().flow, "");
+    }
+
+    /// Declared flows and flows merely stood on, so a hand-edited file cannot strand a
+    /// node on a canvas nothing lists — which is why there is no `UnknownFlow` problem.
+    #[test]
+    fn all_flows_unions_the_declared_with_the_used() {
+        let mut doc = Doc::default();
+        doc.add_flow("empty");
+        on_flow(&mut doc, "undeclared", 0.0, 0.0);
+        on_flow(&mut doc, "", 0.0, 200.0);
+
+        assert_eq!(doc.all_flows(), vec!["empty", "undeclared"]);
+        assert!(!doc.flow_name_free("undeclared"));
+        assert!(!doc.flow_name_free("empty"));
+        assert!(doc.flow_name_free("shop"));
+    }
+
+    /// The whole reason flows cost the walk nothing: a jump crosses canvases, and
+    /// `start_walk`/`advance` resolve ids globally without knowing flows exist.
+    #[test]
+    fn a_jump_may_target_another_flow() {
+        let mut doc = Doc::default();
+        let here = on_flow(&mut doc, "", 0.0, 0.0);
+        let hop = on_flow(&mut doc, "", 300.0, 0.0);
+        let there = on_flow(&mut doc, "chapter1", 600.0, 0.0);
+        doc.node_mut(hop).unwrap().kind = NodeKind::Jump;
+        assert!(doc.add_edge(here, hop));
+        assert!(doc.add_edge(hop, there));
+
+        let mut path = doc.start_walk(here);
+        assert_eq!(path.last(), Some(&here));
+        doc.advance(&mut path, hop);
+        // Walked straight through the jump and onto the other canvas.
+        assert_eq!(path.last(), Some(&there));
+    }
+
+    /// Authoring cannot make one — a drag needs both ends visible — so only a hand-edit or
+    /// a merge does, and nothing draws it.
+    #[test]
+    fn a_non_jump_edge_across_flows_is_a_problem() {
+        let mut doc = Doc::default();
+        let from = on_flow(&mut doc, "", 0.0, 0.0);
+        let to = on_flow(&mut doc, "chapter1", 300.0, 0.0);
+        assert!(doc.add_edge(from, to));
+
+        assert!(doc.problems().contains(&Problem::CrossFlowEdge(0)));
+        assert_eq!(Problem::CrossFlowEdge(0).severity(), Severity::Error);
+    }
+
+    #[test]
+    fn a_jump_across_flows_is_not_a_problem() {
+        let mut doc = Doc::default();
+        let from = on_flow(&mut doc, "", 0.0, 0.0);
+        let to = on_flow(&mut doc, "chapter1", 300.0, 0.0);
+        doc.node_mut(from).unwrap().kind = NodeKind::Jump;
+        assert!(doc.add_edge(from, to));
+
+        assert!(
+            !doc.problems()
+                .iter()
+                .any(|p| matches!(p, Problem::CrossFlowEdge(_)))
+        );
+    }
+
+    #[test]
+    fn flows_round_trip() {
+        let mut doc = Doc::default();
+        doc.add_flow("chapter1");
+        on_flow(&mut doc, "chapter1", 10.0, 20.0);
+
+        let back = Doc::from_json(&doc.to_json()).expect("round trips");
+        assert_eq!(back.flows, vec!["chapter1".to_string()]);
+        assert_eq!(back.nodes[0].flow, "chapter1");
     }
 }

@@ -66,6 +66,7 @@ fn declare_hint(pane: SidePane) -> &'static str {
     match pane {
         SidePane::Variables => "New flag",
         SidePane::Cast => "New character",
+        SidePane::Flows => "New flow",
     }
 }
 
@@ -241,6 +242,9 @@ struct Editor {
     /// and the text field the variables list already proved out, and a *third* pane was
     /// rejected because `window_pos` is the one place a new one breaks every hit test.
     pane: SidePane,
+    /// Which canvas is on screen. A flow is a *view* onto the one flat node list, so this
+    /// is editor state and never serialized — the whole feature is this filter plus a tab.
+    flow: String,
 }
 
 /// Which document-global list the left pane shows. With `Editor::renaming`, this is what
@@ -250,6 +254,7 @@ enum SidePane {
     #[default]
     Variables,
     Cast,
+    Flows,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -403,6 +408,7 @@ impl Editor {
             autosave_off: false,
             play: None,
             pane: SidePane::default(),
+            flow: String::new(),
         }
     }
 
@@ -537,8 +543,9 @@ impl Editor {
         self.doc = doc;
         self.view = View::default();
         self.drag = None;
-        // Node ids belong to the document that is going away.
+        // Node ids — and flow names — belong to the document that is going away.
         self.play = None;
+        self.flow = String::new();
         self.path = path;
         self.status = None;
         self.select(Selection::None, cx);
@@ -767,6 +774,12 @@ impl Editor {
             .filter_map(|(index, e)| {
                 let from = self.doc.node(e.from)?;
                 let to = self.doc.node(e.to)?;
+                // An edge belongs to the canvas both its ends stand on — the same test
+                // `Doc::edge_at` clicks it by, so a line is never drawn where it cannot be
+                // hit, nor hit where it is not drawn.
+                if from.flow != self.flow || to.flow != self.flow {
+                    return None;
+                }
                 let color = match (self.selection == Selection::Edge(index), e.branch) {
                     (true, _) => ACCENT_COLOR,
                     _ if !self.doc.is_condition(e.from) => EDGE_COLOR,
@@ -828,12 +841,12 @@ impl Editor {
         let (x, y) = self.doc_pos(ev.position);
 
         // The port sits on top of the node box, so it is tested first.
-        if let Some(from) = self.doc.port_hit_test(x, y) {
+        if let Some(from) = self.doc.port_hit_test(&self.flow, x, y) {
             self.drag = Some(Drag::Edge {
                 from,
                 cursor: (x, y),
             });
-        } else if let Some(id) = self.doc.hit_test(x, y) {
+        } else if let Some(id) = self.doc.hit_test(&self.flow, x, y) {
             if ev.modifiers.shift {
                 // Toggling is an edit to the set, not a grab, so no drag starts.
                 self.select(self.selection.toggled(id), cx);
@@ -855,7 +868,7 @@ impl Editor {
             if ev.click_count == 2 {
                 window.focus(&self.text_input.read(cx).focus_handle(cx));
             }
-        } else if let Some(index) = self.doc.edge_at(x, y) {
+        } else if let Some(index) = self.doc.edge_at(&self.flow, x, y) {
             self.select(Selection::Edge(index), cx);
             self.drag = None;
         } else if ev.click_count == 2 {
@@ -883,7 +896,7 @@ impl Editor {
         match self.drag.take() {
             Some(Drag::Edge { from, .. }) => {
                 let (x, y) = self.doc_pos(ev.position);
-                if let Some(to) = self.doc.hit_test(x, y)
+                if let Some(to) = self.doc.hit_test(&self.flow, x, y)
                     && from != to
                     && !self.doc.has_edge(from, to)
                 {
@@ -894,7 +907,7 @@ impl Editor {
             }
             Some(Drag::Marquee { start, cursor }) => {
                 let mut ids = self.selection.nodes().to_vec();
-                for id in self.doc.nodes_in_rect(start, cursor) {
+                for id in self.doc.nodes_in_rect(&self.flow, start, cursor) {
                     if !ids.contains(&id) {
                         ids.push(id);
                     }
@@ -998,6 +1011,10 @@ impl Editor {
             .collect();
         let selection = Selection::of(live);
         self.selection = selection.clone();
+        // A flow an undo removed would leave the author on a canvas nothing lists.
+        if !self.flow.is_empty() && !self.doc.all_flows().contains(&self.flow.as_str()) {
+            self.flow.clear();
+        }
         self.load_fields(selection, cx);
         cx.notify();
     }
@@ -1084,7 +1101,15 @@ impl Editor {
                 // Centred on the view rather than parked at its origin, so the node lands
                 // where you are already looking.
                 let (x, y) = self.view.to_doc(Self::pane_center(window));
-                self.doc.add_node(x - NODE_W / 2.0, y - NODE_H / 2.0)
+                let id = self.doc.add_node(x - NODE_W / 2.0, y - NODE_H / 2.0);
+                // Onto the canvas being looked at. The branch arm needs no equivalent:
+                // `branch_from` inherits the parent's, and switching canvas drops the
+                // selection, so a parent is always on this one.
+                let flow = self.flow.clone();
+                if let Some(node) = self.doc.node_mut(id) {
+                    node.flow = flow;
+                }
+                id
             }
         };
         if let Some(node) = self.doc.node_mut(id) {
@@ -1118,12 +1143,13 @@ impl Editor {
         cx.notify();
     }
 
-    /// The node play starts from: the selected one, or the first in the document so that a
-    /// stray F5 plays something rather than nagging.
+    /// The node play starts from: the selected one, or the first on the current canvas so
+    /// that a stray F5 plays something rather than nagging. The walk itself crosses flows
+    /// freely — only the seed is scoped.
     fn play_seed(&self) -> Option<NodeId> {
         self.selection
             .only_node()
-            .or_else(|| self.doc.nodes.first().map(|n| n.id))
+            .or_else(|| self.doc.nodes_in(&self.flow).next().map(|n| n.id))
     }
 
     /// Both entry points walk on through everything the player does not see, so the path
@@ -1156,8 +1182,12 @@ impl Editor {
 
     /// Brings a node into view without touching the selection — which is what separates
     /// following a play-through from [`Editor::jump_to`].
+    /// Switching the canvas lives here rather than in each caller: `jump_to` and `follow`
+    /// both come through, so a search hit, a problem row and a play-through that walks into
+    /// another flow all cross canvases without an arm of their own.
     fn show(&mut self, id: NodeId, window: &Window) {
         if let Some(node) = self.doc.node(id) {
+            self.flow.clone_from(&node.flow);
             self.view
                 .center_on(node_center(node), Self::pane_center(window));
         }
@@ -1181,8 +1211,14 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = format!(
-            "papugai — {}{}",
+            "papugai — {}{}{}",
             self.file_name(),
+            // Omitted on the main flow, so a document that never made one reads as it did.
+            if self.flow.is_empty() {
+                String::new()
+            } else {
+                format!(" › {}", self.flow)
+            },
             if self.doc.is_dirty() { "*" } else { "" }
         );
         if title != self.title {
@@ -1325,7 +1361,7 @@ impl Editor {
                 .size_full(),
             )
             .children(self.edge_labels())
-            .children(self.doc.nodes.iter().map(|node| {
+            .children(self.doc.nodes_in(&self.flow).map(|node| {
                 let playing = self.play.as_ref().and_then(|path| path.last().copied());
                 let jump_target = (node.kind == NodeKind::Jump)
                     .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
@@ -1341,7 +1377,11 @@ impl Editor {
                     speaker_color(&self.doc, &node.speaker, 0x9ecbff),
                 )
             }))
-            .children(self.doc.nodes.iter().map(|node| port_dot(node, view)))
+            .children(
+                self.doc
+                    .nodes_in(&self.flow)
+                    .map(|node| port_dot(node, view)),
+            )
             .when_some(self.marquee_rect(), |this, (origin, size)| {
                 this.child(
                     div()
@@ -1379,8 +1419,14 @@ impl Editor {
                 } else {
                     (edge.label.clone(), rgba(0x9a9aa6ff))
                 };
-                let from = out_port(self.doc.node(edge.from)?);
-                let to = in_port(self.doc.node(edge.to)?);
+                let (from_node, to_node) = (self.doc.node(edge.from)?, self.doc.node(edge.to)?);
+                // Skipped for the reason `edge_lines` skips it, and through the same test so
+                // the two cannot drift.
+                if from_node.flow != self.flow || to_node.flow != self.flow {
+                    return None;
+                }
+                let from = out_port(from_node);
+                let to = in_port(to_node);
                 let mid = self.screen_pos(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
                 let width = self.view.scale(W);
                 Some(
@@ -1468,9 +1514,15 @@ impl Editor {
         let renaming = self.renaming.clone().filter(|name| match self.pane {
             SidePane::Variables => self.doc.variable(name).is_some(),
             SidePane::Cast => self.doc.character(name).is_some(),
+            SidePane::Flows => self.doc.all_flows().contains(&name.as_str()),
         });
         let is_rename = renaming.is_some();
-        let cast = self.pane == SidePane::Cast;
+        let pane = self.pane;
+        // Owned, so the rows can borrow `cx` mutably. The main flow leads, then every other
+        // canvas the document has — declared or merely stood on, so no node is unreachable.
+        let flows: Vec<String> = std::iter::once(String::new())
+            .chain(self.doc.all_flows().into_iter().map(str::to_string))
+            .collect();
 
         // Grouped by the set in the name, in first-seen order, each group carrying the
         // *index* into `doc.variables` — every row id and handler still keys on the whole
@@ -1513,6 +1565,7 @@ impl Editor {
                             "pane-variables",
                         ),
                         (SidePane::Cast, "Cast", "pane-cast"),
+                        (SidePane::Flows, "Flows", "pane-flows"),
                     ]
                     .map(|(pane, label, element_id)| {
                         let on = pane == self.pane;
@@ -1556,6 +1609,14 @@ impl Editor {
                         SidePane::Cast => list.children(
                             (0..self.doc.characters.len())
                                 .map(|i| self.cast_row(i, playing.is_some(), cx)),
+                        ),
+                        SidePane::Flows => list.children(
+                            flows
+                                .iter()
+                                .cloned()
+                                .enumerate()
+                                .map(|(i, flow)| self.flow_row(i, flow, playing.is_some(), cx))
+                                .collect::<Vec<_>>(),
                         ),
                         SidePane::Variables => list.children(groups.into_iter().map(|(set, rows)| {
                         div()
@@ -1617,18 +1678,18 @@ impl Editor {
                             .child(if is_rename { "✓" } else { "+" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let name = this.var_input.read(cx).content().to_string();
-                                let free = if cast {
-                                    this.doc.character_name_free(&name)
-                                } else {
-                                    this.doc.variable_name_free(&name)
+                                let free = match pane {
+                                    SidePane::Cast => this.doc.character_name_free(&name),
+                                    SidePane::Variables => this.doc.variable_name_free(&name),
+                                    SidePane::Flows => this.doc.flow_name_free(&name),
                                 };
                                 if !free {
                                     return;
                                 }
                                 this.doc.checkpoint();
-                                match (&renaming, cast) {
+                                match (&renaming, pane) {
                                     // Every line the character speaks follows the record.
-                                    (Some(old), true) => {
+                                    (Some(old), SidePane::Cast) => {
                                         let moved = this.doc.rename_character(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
@@ -1640,7 +1701,7 @@ impl Editor {
                                         );
                                     }
                                     // Effects and checks follow it, so say how many did.
-                                    (Some(old), false) => {
+                                    (Some(old), SidePane::Variables) => {
                                         let moved = this.doc.rename_variable(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
@@ -1653,13 +1714,32 @@ impl Editor {
                                     }
                                     // A colour off the palette, so a new cast comes out tinted
                                     // apart without anybody picking one.
-                                    (None, true) => {
+                                    // Renaming a canvas carries every node standing on it,
+                                    // and the one on screen with them.
+                                    (Some(old), SidePane::Flows) => {
+                                        let moved = this.doc.rename_flow(old, &name);
+                                        let s = if moved == 1 { "" } else { "s" };
+                                        let name = name.trim();
+                                        if this.flow == *old {
+                                            this.flow = name.to_string();
+                                        }
+                                        this.set_status(
+                                            format!(
+                                                "Renamed \"{old}\" to \"{name}\" — {moved} node{s}."
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                    (None, SidePane::Cast) => {
                                         let color = CAST_COLORS
                                             [this.doc.characters.len() % CAST_COLORS.len()];
                                         this.doc.add_character(&name, color);
                                     }
-                                    (None, false) => {
+                                    (None, SidePane::Variables) => {
                                         this.doc.add_variable(&name);
+                                    }
+                                    (None, SidePane::Flows) => {
+                                        this.doc.add_flow(&name);
                                     }
                                 }
                                 this.renaming = None;
@@ -1924,6 +2004,127 @@ impl Editor {
                                     cx,
                                 );
                             }
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
+    /// A row of the Flows list: the canvas name, how many nodes stand on it, and the
+    /// controls. Clicking the name switches the canvas; `→` moves the selection onto it,
+    /// which is the affordance the whole feature exists for — it is how a graph that got
+    /// too big gets split up. The main flow is `""`: it is always present, so it can be
+    /// neither renamed nor removed.
+    fn flow_row(
+        &self,
+        i: usize,
+        flow: String,
+        playing: bool,
+        cx: &mut Context<Self>,
+        // Owns everything it draws and borrows nothing back, like its two sibling rows.
+    ) -> impl IntoElement + use<> {
+        let on = self.flow == flow;
+        let count = self.doc.nodes_in(&flow).count();
+        let main = flow.is_empty();
+        let selected = self.selection.nodes().len();
+        let (to_show, to_rename, to_remove, to_move) =
+            (flow.clone(), flow.clone(), flow.clone(), flow.clone());
+
+        div()
+            .flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .id(("flow-name", i))
+                    .flex_grow()
+                    .truncate()
+                    .cursor_pointer()
+                    .text_color(if on { rgb(0xd6d6dd) } else { rgb(0xb8b8c4) })
+                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .child(if main { "(main)".to_string() } else { flow })
+                    // Only the view moves, so no checkpoint: which canvas you are looking
+                    // at is not a document edit. The selection goes, though — nodes on the
+                    // canvas you left are neither drawn nor hit-testable, so leaving them
+                    // selected would let the inspector edit an invisible node and `Tab`
+                    // branch off one, which is the only way to author a `CrossFlowEdge`.
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.flow != to_show {
+                            this.flow.clone_from(&to_show);
+                            this.select(Selection::None, cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(0x6c6c78))
+                    .child(count.to_string()),
+            )
+            .when(!playing && selected > 0 && !on, |this| {
+                this.child(
+                    div()
+                        .id(("flow-move", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("→")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let ids = this.selection.nodes().to_vec();
+                            let count = ids.len();
+                            this.doc.checkpoint();
+                            this.doc.move_to_flow(&ids, &to_move);
+                            let s = if count == 1 { "" } else { "s" };
+                            // The nodes just left this canvas, so nothing is selected on it.
+                            this.select(Selection::None, cx);
+                            this.set_status(format!("Moved {count} node{s}."), cx);
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!playing && !main, |this| {
+                this.child(
+                    div()
+                        .id(("flow-rename", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("\u{270e}")
+                        // Not an edit yet, so no checkpoint — it only aims the shared field.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.renaming = Some(to_rename.clone());
+                            this.var_input
+                                .update(cx, |input, cx| input.set_content(&to_rename, cx));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("flow-remove", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                        .child("\u{d7}")
+                        // The nodes come back to the main flow rather than going with it:
+                        // deleting a canvas must not delete what is drawn on it.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.doc.checkpoint();
+                            let moved = this.doc.remove_flow(&to_remove);
+                            if this.flow == *to_remove {
+                                this.flow.clear();
+                            }
+                            let s = if moved == 1 { "" } else { "s" };
+                            this.set_status(
+                                format!("Removed \"{to_remove}\" — {moved} node{s} moved."),
+                                cx,
+                            );
                             cx.notify();
                         })),
                 )
@@ -2700,6 +2901,7 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         None => node_number(doc, id),
     };
     match problem {
+        Problem::CrossFlowEdge(_) => "Edge between two flows".to_string(),
         Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
         Problem::NoStart => "No start node — every node is linked to".into(),
         Problem::Unreachable(id) => format!("Unreachable: {}", label(*id)),
