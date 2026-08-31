@@ -587,19 +587,6 @@ impl Doc {
             && path.windows(2).any(|w| w[0] == from && w[1] == to)
     }
 
-    /// How many times `path` has been through this node, passes the player never saw
-    /// included — the path holds every node walked, which is what makes this a filter
-    /// rather than a counter.
-    // ponytail: no caller yet. It is the primitive `NodeKind::Alt` is built on, where
-    // every pick policy but a shuffle is a function of the visit count; delete it if that
-    // never lands. The ceiling either way: visits are path-local and die with the play
-    // session, so "has the player ever seen this" across playthroughs needs a state store
-    // outside `Doc` — and the consuming engine would need one too.
-    #[allow(dead_code)]
-    pub fn visits(&self, path: &[NodeId], id: NodeId) -> usize {
-        path.iter().filter(|&&n| n == id).count()
-    }
-
     /// Every fault in the document, errors first. An empty document has none at all.
     // ponytail: rebuilt from scratch on every call, which is once per frame. A cache
     // would need invalidating on every edit, undo and load; revisit past a few thousand nodes.
@@ -2468,30 +2455,6 @@ mod tests {
             .expect("a pre-once document still loads");
         assert!(!doc.edges[0].once);
         assert!(!doc.edges[0].branch);
-    }
-
-    /// The path holds every node walked, invisible ones included — which is what makes a
-    /// visit count a filter rather than a counter kept beside it.
-    #[test]
-    fn visits_counts_nodes_the_player_never_saw() {
-        let mut doc = Doc::default();
-        let here = spoken(&mut doc, 0.0, 0.0);
-        let sets = doc.add_node(300.0, 0.0);
-        let there = spoken(&mut doc, 600.0, 0.0);
-        doc.node_mut(sets).unwrap().kind = NodeKind::Instruction;
-        doc.add_edge(here, sets);
-        doc.add_edge(sets, there);
-
-        let mut path = doc.start_walk(here);
-        doc.advance(&mut path, sets);
-
-        assert_eq!(path, vec![here, sets, there]);
-        assert_eq!(doc.visits(&path, sets), 1, "walked through, never seen");
-        assert_eq!(
-            doc.visits(&[here, sets, there, sets, here], sets),
-            2,
-            "a conversation that comes back round counts both passes"
-        );
     }
 
     #[test]
