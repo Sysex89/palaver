@@ -92,6 +92,66 @@ pub const GAP_X: f32 = 100.0;
 /// Vertical gap between siblings sharing a parent.
 pub const GAP_Y: f32 = 30.0;
 
+/// A flow's box on the flow map. The map is laid out in *pane* pixels and ignores the
+/// canvas's pan and zoom: it is a table of contents, not a place anything is drawn at.
+pub const MAP_W: f32 = 180.0;
+pub const MAP_H: f32 = 64.0;
+/// Room between boxes for an arrow and its count.
+const MAP_GAP_X: f32 = 150.0;
+const MAP_GAP_Y: f32 = 110.0;
+const MAP_MARGIN: f32 = 40.0;
+
+/// How many columns a map of `n` flows is laid out in: the smallest square that holds
+/// them, so the grid grows in both directions rather than running off one edge.
+fn map_cols(n: usize) -> usize {
+    (1..).find(|c| c * c >= n).unwrap_or(1)
+}
+
+/// Top-left corner of the `i`th of `n` boxes on the flow map, in pane pixels. A fixed
+/// grid in [`Doc::all_flows`] order, main flow first — never a force simulation, so a
+/// flow is always where it was last time.
+// ponytail: past a few dozen flows the grid runs off the pane, and the map neither
+// scrolls nor zooms. Give it the canvas's `View` if a project ever gets there.
+pub fn map_cell(i: usize, n: usize) -> (f32, f32) {
+    let cols = map_cols(n);
+    let (col, row) = (i % cols, i / cols);
+    (
+        MAP_MARGIN + col as f32 * (MAP_W + MAP_GAP_X),
+        MAP_MARGIN + row as f32 * (MAP_H + MAP_GAP_Y),
+    )
+}
+
+/// Which of `n` map boxes, if any, a pane point falls in — the flow map's whole hit test,
+/// so the canvas's own (`hit_test`, `edge_at`…) never learns the map exists.
+pub fn map_hit(n: usize, x: f32, y: f32) -> Option<usize> {
+    (0..n).find(|&i| {
+        let (bx, by) = map_cell(i, n);
+        x >= bx && x <= bx + MAP_W && y >= by && y <= by + MAP_H
+    })
+}
+
+/// Where a ray from the middle of a `w`×`h` box towards `toward` crosses its border — so
+/// an arrow between two boxes starts and ends at their edges rather than under them.
+pub fn box_exit(center: (f32, f32), w: f32, h: f32, toward: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (toward.0 - center.0, toward.1 - center.1);
+    if dx == 0.0 && dy == 0.0 {
+        return center;
+    }
+    // The ray leaves by whichever side it reaches first.
+    let tx = if dx == 0.0 {
+        f32::INFINITY
+    } else {
+        (w / 2.0) / dx.abs()
+    };
+    let ty = if dy == 0.0 {
+        f32::INFINITY
+    } else {
+        (h / 2.0) / dy.abs()
+    };
+    let t = tx.min(ty);
+    (center.0 + dx * t, center.1 + dy * t)
+}
+
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 3.0;
 
@@ -1758,6 +1818,41 @@ impl Doc {
             }
         }
         found
+    }
+
+    /// Every flow the map draws a box for: the main one first, then [`Doc::all_flows`].
+    /// The same list, in the same order, as the Flows tab.
+    pub fn map_flows(&self) -> Vec<&str> {
+        std::iter::once("").chain(self.all_flows()).collect()
+    }
+
+    /// The flow map's arrows: for each ordered pair of flows, how many jumps on the first
+    /// land on a node on the second. Computed from the jump edges every time and never
+    /// stored — the map is a picture of the graph, not a second copy of it. A jump that
+    /// lands on its own canvas crosses nothing and is not counted; a jump pointing at
+    /// nothing has nowhere to draw an arrow to. Ordered by [`Doc::map_flows`], source then
+    /// target, so the map draws the same way every frame.
+    pub fn flow_links(&self) -> Vec<(String, String, usize)> {
+        let mut links: Vec<(String, String, usize)> = Vec::new();
+        for edge in self.edges.iter().filter(|e| self.is_jump(e.from)) {
+            let (Some(from), Some(to)) = (self.node(edge.from), self.node(edge.to)) else {
+                continue;
+            };
+            if from.flow == to.flow {
+                continue;
+            }
+            match links
+                .iter_mut()
+                .find(|(a, b, _)| *a == from.flow && *b == to.flow)
+            {
+                Some((_, _, count)) => *count += 1,
+                None => links.push((from.flow.clone(), to.flow.clone(), 1)),
+            }
+        }
+        let flows = self.map_flows();
+        let at = |flow: &str| flows.iter().position(|f| *f == flow);
+        links.sort_by_key(|(a, b, _)| (at(a), at(b)));
+        links
     }
 
     /// Whether [`Doc::add_flow`] would accept this name. Separate for the reason
@@ -5561,5 +5656,80 @@ mod tests {
             (doc.to_ftl(), doc.to_screenplay(), doc.problems().len())
         );
         assert!(doc.mentions(&Ref::Tag("draft".into())).is_empty());
+    }
+
+    /// A jump node on `flow` pointing at `to`.
+    fn jump_on(doc: &mut Doc, flow: &str, to: NodeId) -> NodeId {
+        let jump = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(jump).unwrap();
+        node.kind = NodeKind::Jump;
+        node.flow = flow.to_string();
+        doc.add_edge(jump, to);
+        jump
+    }
+
+    #[test]
+    fn flow_links_count_the_jumps_between_flows() {
+        let mut doc = Doc::default();
+        let tavern = doc.add_node(0.0, 0.0);
+        let cellar = doc.add_node(0.0, 0.0);
+        doc.move_to_flow(&[cellar], "cellar");
+        let street = doc.add_node(0.0, 0.0);
+        doc.move_to_flow(&[street], "street");
+        doc.add_flow("empty");
+
+        jump_on(&mut doc, "", cellar);
+        jump_on(&mut doc, "", cellar);
+        jump_on(&mut doc, "cellar", tavern);
+        jump_on(&mut doc, "street", cellar);
+        // Lands on its own canvas: nothing crosses.
+        jump_on(&mut doc, "street", street);
+        // An ordinary edge that crosses is a `CrossFlowEdge`, not a jump, and not drawn.
+        let loose = doc.add_node(0.0, 0.0);
+        doc.add_edge(loose, cellar);
+        // A jump with no target has nowhere to point.
+        let dangling = doc.add_node(0.0, 0.0);
+        doc.node_mut(dangling).unwrap().kind = NodeKind::Jump;
+
+        // Declared flows first, then the ones nodes merely stand on — `all_flows`'s order.
+        assert_eq!(doc.map_flows(), ["", "empty", "cellar", "street"]);
+        assert_eq!(
+            doc.flow_links(),
+            [
+                ("".to_string(), "cellar".to_string(), 2),
+                ("cellar".to_string(), "".to_string(), 1),
+                ("street".to_string(), "cellar".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_map_grid_is_square_and_hit_by_its_boxes() {
+        // Five flows fit a 3×2 grid: three across, then two.
+        assert_eq!(map_cell(0, 5), (MAP_MARGIN, MAP_MARGIN));
+        assert_eq!(map_cell(2, 5).1, MAP_MARGIN);
+        assert_eq!(map_cell(3, 5), (MAP_MARGIN, MAP_MARGIN + MAP_H + MAP_GAP_Y));
+        assert_eq!(map_cols(1), 1);
+        assert_eq!(map_cols(4), 2);
+        assert_eq!(map_cols(5), 3);
+
+        let (x, y) = map_cell(4, 5);
+        assert_eq!(map_hit(5, x + 1.0, y + 1.0), Some(4));
+        assert_eq!(map_hit(5, x + MAP_W + 1.0, y), None);
+        assert_eq!(map_hit(5, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn box_exit_lands_on_the_border() {
+        // Straight right leaves by the right side, straight down by the bottom.
+        assert_eq!(box_exit((0.0, 0.0), 100.0, 40.0, (500.0, 0.0)), (50.0, 0.0));
+        assert_eq!(
+            box_exit((0.0, 0.0), 100.0, 40.0, (0.0, -500.0)),
+            (0.0, -20.0)
+        );
+        // A shallow diagonal still leaves by the side it reaches first.
+        let (x, y) = box_exit((0.0, 0.0), 100.0, 40.0, (200.0, 20.0));
+        assert_eq!((x, y), (50.0, 5.0));
+        assert_eq!(box_exit((3.0, 4.0), 10.0, 10.0, (3.0, 4.0)), (3.0, 4.0));
     }
 }
