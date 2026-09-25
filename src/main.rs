@@ -2,9 +2,9 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp,
-    Severity, Value, VarState, View, clear_backup, in_port, join_set, node_center, out_port,
-    read_backup, split_set, with_default_extension,
+    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem,
+    SCRIPT_EXT, SetOp, Severity, Value, VarState, View, clear_backup, in_port, join_set,
+    node_center, out_port, read_backup, split_set, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -38,6 +38,7 @@ actions!(
         Save,
         SaveAs,
         ExportFluent,
+        ExportScreenplay,
         Open,
         Play,
         PlayFromHere,
@@ -102,6 +103,9 @@ const MENUS: &[MenuSpec] = &[
             }),
             ("Export Fluent…", "", |e, w, cx| {
                 e.on_export_fluent(&ExportFluent, w, cx)
+            }),
+            ("Export Screenplay…", "", |e, w, cx| {
+                e.on_export_screenplay(&ExportScreenplay, w, cx)
             }),
         ],
     ),
@@ -605,13 +609,33 @@ impl Editor {
         .detach();
     }
 
-    /// Writes the translatable strings out for a game build. Deliberately not a save: it
-    /// leaves `self.path`, the dirty flag and the crash copy alone, so exporting never
-    /// re-points the editor at the `.ftl`.
+    /// Writes the translatable strings out for a game build.
     fn on_export_fluent(&mut self, _: &ExportFluent, _: &mut Window, cx: &mut Context<Self>) {
+        self.export(FTL_EXT, Doc::export_ftl, cx);
+    }
+
+    /// Writes the dialogue out as a script for a table read or a recording session.
+    fn on_export_screenplay(
+        &mut self,
+        _: &ExportScreenplay,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.export(SCRIPT_EXT, Doc::export_screenplay, cx);
+    }
+
+    /// Asks where, then runs `write` there. Deliberately not a save: it leaves `self.path`,
+    /// the dirty flag and the crash copy alone, so exporting never re-points the editor at
+    /// the file it wrote — and `write` takes `&Doc`, so it could not if it tried.
+    fn export(
+        &mut self,
+        ext: &'static str,
+        write: fn(&Doc, &std::path::Path) -> Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let suggested = PathBuf::from(self.file_name())
-            .with_extension(FTL_EXT)
+            .with_extension(ext)
             .to_string_lossy()
             .into_owned();
         let response = cx.prompt_for_new_path(&directory, Some(&suggested));
@@ -620,8 +644,8 @@ impl Editor {
             match response.await {
                 Ok(Ok(Some(path))) => {
                     this.update(cx, |this, cx| {
-                        let path = with_default_extension(path, FTL_EXT);
-                        let status = match this.doc.export_ftl(&path) {
+                        let path = with_default_extension(path, ext);
+                        let status = match write(&this.doc, &path) {
                             Ok(()) => format!("Exported {}", document_name(Some(&path))),
                             Err(error) => format!("Export failed: {error}"),
                         };
@@ -1394,6 +1418,7 @@ impl Editor {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
             .on_action(cx.listener(Self::on_export_fluent))
+            .on_action(cx.listener(Self::on_export_screenplay))
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_play))
             .on_action(cx.listener(Self::on_play_from_here))
@@ -1441,17 +1466,17 @@ impl Editor {
             .children(self.edge_labels())
             .children(self.doc.nodes_in(&self.flow).map(|node| {
                 let playing = self.play.as_ref().and_then(|path| path.last().copied());
-                let jump_target = (node.kind == NodeKind::Jump)
+                let target = (node.kind == NodeKind::Jump)
                     .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
                     .flatten()
-                    .and_then(|to| self.doc.node(to))
-                    .map(|target| node_label(&self.doc, target));
+                    .and_then(|to| self.doc.node(to));
                 node_box(
                     node,
                     view,
                     self.selection.nodes().contains(&node.id),
                     playing == Some(node.id),
-                    jump_target,
+                    target.map(|target| node_label(&self.doc, target)),
+                    target.map(|target| JumpPreview::of(&self.doc, target)),
                     speaker_color(&self.doc, &node.speaker, 0x9ecbff),
                 )
             }))
@@ -1556,11 +1581,57 @@ impl Editor {
         let hits = self.doc.find(&query);
         let more = hits.len().saturating_sub(MAX_ROWS);
 
+        // An idle search box lists the bookmarks instead: every aliased node, the author's
+        // own landmarks. Beneath the field rather than in a panel of their own, since "take
+        // me somewhere" is the question both answer.
+        let bookmarks = match query.trim() {
+            "" => self.doc.bookmarks(),
+            _ => Vec::new(),
+        };
+        let more_marks = bookmarks.len().saturating_sub(MAX_ROWS);
+
         div()
             .flex()
             .flex_col()
             .gap_1()
             .child(self.search_input.clone())
+            .when(!bookmarks.is_empty(), |this| {
+                this.child(div().text_color(rgb(0x8a8a96)).child("Bookmarks"))
+                    .children(bookmarks.iter().take(MAX_ROWS).filter_map(|&id| {
+                        let node = self.doc.node(id)?;
+                        Some(
+                            div()
+                                .id(("bookmark", id))
+                                .flex()
+                                .gap_2()
+                                .px_1()
+                                .rounded_sm()
+                                .hover(|style| style.bg(rgb(0x33333c)))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(0xc3a6f7))
+                                        .child(node.alias.trim().to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_color(rgb(0x6c6c78))
+                                        .child(node_label(&self.doc, node)),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.jump_to(id, window, cx)
+                                })),
+                        )
+                    }))
+                    .when(more_marks > 0, |this| {
+                        this.child(
+                            div()
+                                .text_color(rgb(0x6c6c78))
+                                .child(format!("…and {more_marks} more")),
+                        )
+                    })
+            })
             .when(!query.trim().is_empty(), |this| {
                 this.when(hits.is_empty(), |this| {
                     this.child(div().text_color(rgb(0x6c6c78)).child("No matches."))
@@ -2590,8 +2661,8 @@ impl Editor {
                     .map(|(var, op, value)| {
                         div().text_color(rgb(0x8ce99a)).child(format!(
                             "{var} {} {}",
-                            set_text(op),
-                            value_text(value)
+                            op.symbol(),
+                            value
                         ))
                     }),
             )
@@ -2843,11 +2914,11 @@ impl Editor {
                             VarRow::Sets => self
                                 .doc
                                 .effect_of(id, &variable.name)
-                                .map(|e| (e.value, set_text(e.op))),
+                                .map(|e| (e.value, e.op.symbol())),
                             VarRow::Checks => self
                                 .doc
                                 .condition_of(id, &variable.name)
-                                .map(|c| (c.want, cmp_text(c.op))),
+                                .map(|c| (c.want, c.op.symbol())),
                         };
                         // A flag is a checkbox; a number has no box to tick, so it shows the
                         // operator there instead and the value beside the name.
@@ -3305,8 +3376,70 @@ fn speaker_color(doc: &Doc, speaker: &str, fallback: u32) -> Rgba {
         .map_or(fallback, |character| character.color))
 }
 
-/// `jump_target` is the label of the node a jump points at, and `speaker` the colour of its
-/// cast member, both resolved by the caller.
+/// What hovering a jump shows of where it lands: who speaks there, the first line of what
+/// they say, and which canvas it is on — the three things the box's one-line `↪ target`
+/// has no room for, and the last of which is the reason to look before following it.
+#[derive(Clone)]
+struct JumpPreview {
+    speaker: Option<(String, Rgba)>,
+    line: String,
+    flow: String,
+}
+
+impl JumpPreview {
+    fn of(doc: &Doc, target: &Node) -> JumpPreview {
+        let speaker = match (target.kind, target.speaker.trim()) {
+            (NodeKind::Speech, name) if !name.is_empty() => {
+                Some((name.to_string(), speaker_color(doc, name, 0x9ecbff)))
+            }
+            _ => None,
+        };
+        let line = match target.text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            Some(line) => line.to_string(),
+            None => node_label(doc, target),
+        };
+        let flow = match target.flow.as_str() {
+            "" => "(main)".to_string(),
+            flow => flow.to_string(),
+        };
+        JumpPreview {
+            speaker,
+            line,
+            flow: format!("on {flow}"),
+        }
+    }
+}
+
+impl Render for JumpPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .bg(rgb(0x2b2b33))
+            .border_1()
+            .border_color(rgb(0xc3a6f7))
+            .rounded_md()
+            .shadow_md()
+            .text_sm()
+            .when_some(self.speaker.clone(), |this, (name, color)| {
+                this.child(div().text_color(color).child(name))
+            })
+            .child(
+                div()
+                    .text_color(rgb(0xd6d6dd))
+                    .line_clamp(3)
+                    .child(self.line.clone()),
+            )
+            .child(div().text_color(rgb(0x6c6c78)).child(self.flow.clone()))
+    }
+}
+
+/// `jump_target` is the label of the node a jump points at, `preview` what hovering it
+/// shows, and `speaker` the colour of its
+/// cast member, all resolved by the caller.
 ///
 /// Every kind keeps the same `NODE_W`×`NODE_H` footprint on purpose: hit-testing is
 /// arithmetic over those constants in `doc.rs`, so a box drawn smaller than it is clicked
@@ -3317,10 +3450,17 @@ fn node_box(
     selected: bool,
     playing: bool,
     jump_target: Option<String>,
+    preview: Option<JumpPreview>,
     speaker: Rgba,
 ) -> impl IntoElement {
     let (x, y) = view.to_screen((node.x, node.y));
     div()
+        .id(("node", node.id))
+        // View-only, like everything a hover does: it never selects and never switches the
+        // canvas, so a glance at where a jump lands costs nothing.
+        .when_some(preview, |this, preview| {
+            this.tooltip(move |_, cx| cx.new(|_| preview.clone()).into())
+        })
         .absolute()
         .left(px(x))
         .top(px(y))
@@ -3399,9 +3539,7 @@ fn node_box(
                             [] => "(sets nothing)".to_string(),
                             effects => effects
                                 .iter()
-                                .map(|e| {
-                                    format!("{} {} {}", e.var, set_text(e.op), value_text(e.value))
-                                })
+                                .map(|e| format!("{} {} {}", e.var, e.op.symbol(), e.value))
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                         }),
@@ -3421,9 +3559,7 @@ fn node_box(
                             [] => "(checks nothing)".to_string(),
                             conditions => conditions
                                 .iter()
-                                .map(|c| {
-                                    format!("{} {} {}", c.var, cmp_text(c.op), value_text(c.want))
-                                })
+                                .map(|c| format!("{} {} {}", c.var, c.op.symbol(), c.want))
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                         }),
@@ -3447,34 +3583,6 @@ fn node_box(
                         .child(node.text.clone()),
                 ),
         })
-}
-
-/// A value as the canvas and the play panel both write it.
-fn value_text(value: Value) -> String {
-    match value {
-        Value::Bool(b) => b.to_string(),
-        Value::Int(n) => n.to_string(),
-    }
-}
-
-/// How an instruction's write reads.
-fn set_text(op: SetOp) -> &'static str {
-    match op {
-        SetOp::Set => "=",
-        SetOp::Add => "+=",
-    }
-}
-
-/// How a condition's check reads.
-fn cmp_text(op: Cmp) -> &'static str {
-    match op {
-        Cmp::Eq => "==",
-        Cmp::Ne => "!=",
-        Cmp::Lt => "<",
-        Cmp::Le => "<=",
-        Cmp::Gt => ">",
-        Cmp::Ge => ">=",
-    }
 }
 
 /// The next comparison the inspector's click-cycle offers, ending at `None` — cleared — so

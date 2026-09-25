@@ -19,6 +19,9 @@ pub const FILE_EXT: &str = "dln";
 /// Extension of a Fluent translation file, written by [`Doc::export_ftl`].
 pub const FTL_EXT: &str = "ftl";
 
+/// Extension of a screenplay, written by [`Doc::export_screenplay`].
+pub const SCRIPT_EXT: &str = "md";
+
 /// Gives the path an extension unless it already has one.
 pub fn with_default_extension(path: PathBuf, ext: &str) -> PathBuf {
     match path.extension() {
@@ -270,6 +273,17 @@ pub enum SetOp {
     Add,
 }
 
+impl SetOp {
+    /// How the write reads, on the canvas and in a screenplay alike — one spelling, so the
+    /// script an actor holds matches the box the author drew.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            SetOp::Set => "=",
+            SetOp::Add => "+=",
+        }
+    }
+}
+
 /// A check a [`NodeKind::Condition`] node makes. Every one on a node must hold for the flow
 /// to take its true branch. One per variable, like an effect.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -296,6 +310,18 @@ pub enum Cmp {
 }
 
 impl Cmp {
+    /// How the check reads, shared for the reason [`SetOp::symbol`] is.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Cmp::Eq => "==",
+            Cmp::Ne => "!=",
+            Cmp::Lt => "<",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Ge => ">=",
+        }
+    }
+
     /// Whether this comparison accepts the ordering the two values came out at.
     fn allows(self, ord: Ordering) -> bool {
         match self {
@@ -346,6 +372,15 @@ impl PartialOrd for Value {
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
             _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Value::Bool(b) => b.fmt(f),
+            Value::Int(n) => n.fmt(f),
         }
     }
 }
@@ -1646,6 +1681,218 @@ impl Doc {
         std::fs::write(path, self.to_ftl()).map_err(|e| e.to_string())
     }
 
+    /// Every node with an alias, sorted by it: the author's own landmarks. No `starred`
+    /// flag, because an alias already *is* a hand-placed name for a place worth coming back
+    /// to, and a second field would be a second way of saying the same thing. Case-folded so
+    /// `Intro` does not sort after `zebra`.
+    pub fn bookmarks(&self) -> Vec<NodeId> {
+        let mut marked: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|n| !n.alias.trim().is_empty())
+            .collect();
+        marked.sort_by_cached_key(|n| n.alias.trim().to_lowercase());
+        marked.into_iter().map(|n| n.id).collect()
+    }
+
+    /// The document as a linear Markdown script, one section per flow, for table reads and
+    /// voice-over sessions. An export, like [`Doc::to_ftl`]: the pure half, with the write
+    /// beside it.
+    ///
+    /// A branching graph cannot be one line of text, so it is cut into numbered *blocks*, the
+    /// way a gamebook is. A block runs on while there is exactly one unlabelled way forward
+    /// into a node nothing else leads to; anything else — a choice, a condition, a jump, a
+    /// node several branches rejoin at — ends it and names where to go (`→ §3`). A node is
+    /// therefore written exactly once and referenced from everywhere else, which is also what
+    /// makes a cycle finite.
+    ///
+    /// Blocks are numbered breadth-first from each flow's roots — nodes nothing on the same
+    /// flow leads to, so a flow entered only by a jump starts where the jump lands — and then
+    /// from anything left over in document order, which catches a loop with no way in. So
+    /// the numbers only ever rise down the page, and every block is reachable from a
+    /// reference to it. Notes are author-facing and never written, for the reason `to_ftl`
+    /// leaves them out; `add_edge` keeps them out of every block anyway.
+    pub fn to_screenplay(&self) -> String {
+        let (sections, number) = self.script_blocks();
+        // Every block start is numbered by `script_blocks`; the `?` is for a node it could
+        // not reach, which would be a bug there rather than something to panic a save over.
+        let reference = |from: &Node, to: NodeId| {
+            let to = self.through_jumps(to);
+            let n = number.get(&to).map_or("?".to_string(), usize::to_string);
+            match self.node(to) {
+                Some(target) if target.flow != from.flow => {
+                    format!("§{n} ({})", flow_title(&target.flow))
+                }
+                _ => format!("§{n}"),
+            }
+        };
+
+        let mut out = String::new();
+        for (flow, blocks) in sections {
+            out += &format!("## {}\n", flow_title(flow));
+            for chain in blocks {
+                out += &format!("\n### §{}", number.get(&chain[0]).unwrap_or(&0));
+                // The author's own name for the place, if it has one: an alias, or what a
+                // hub is labelled. A reader turning to §4 sees where they have landed.
+                if let Some(first) = self.node(chain[0]) {
+                    let hub = if first.kind == NodeKind::Hub {
+                        first.text.trim()
+                    } else {
+                        ""
+                    };
+                    match (first.alias.trim(), hub) {
+                        ("", "") => {}
+                        ("", name) | (name, _) => out += &format!(" · {name}"),
+                    }
+                }
+                out += "\n";
+                for &id in &chain {
+                    let Some(node) = self.node(id) else { continue };
+                    out += &script_line(node);
+                }
+                let Some(last) = chain.last().and_then(|&id| self.node(id)) else {
+                    continue;
+                };
+                let exits = self.edges.iter().filter(|e| e.from == last.id);
+                let exits: Vec<&Edge> = exits.filter(|e| self.node(e.to).is_some()).collect();
+                match (last.kind, exits.as_slice()) {
+                    (NodeKind::Jump, [edge]) => {
+                        out += &format!("\n→ {}\n", reference(last, edge.to));
+                    }
+                    (NodeKind::Jump, _) => out += "\n→ nowhere\n",
+                    (_, []) => {}
+                    (NodeKind::Condition, exits) => {
+                        out += "\n";
+                        for edge in exits {
+                            out += &format!("- {} → {}\n", edge.branch, reference(last, edge.to));
+                        }
+                    }
+                    (_, [edge]) if edge.label.trim().is_empty() => {
+                        out += &format!("\n→ {}\n", reference(last, edge.to));
+                    }
+                    (_, exits) => {
+                        out += "\n";
+                        for edge in exits {
+                            let label = match edge.label.trim() {
+                                "" => "*(continue)*",
+                                label => label,
+                            };
+                            let once = if edge.once { "(once) " } else { "" };
+                            out += &format!("- {once}{label} → {}\n", reference(last, edge.to));
+                        }
+                    }
+                }
+            }
+            out += "\n";
+        }
+        out
+    }
+
+    /// The blocks [`Doc::to_screenplay`] writes, grouped by flow in [`Doc::all_flows`] order,
+    /// and the number each block's first node is referenced by. Split out so every number
+    /// exists before the first reference to it is written.
+    fn script_blocks(&self) -> (Vec<ScriptSection<'_>>, HashMap<NodeId, usize>) {
+        let incoming = |id: NodeId| self.edges.iter().filter(|e| e.to == id).count();
+        let flow_of = |id: NodeId| self.node(id).map(|n| n.flow.as_str());
+        // The one way a block runs on: a single unlabelled edge, into a node on the same
+        // canvas that nothing else leads to. Jumps and conditions always end a block — the
+        // first because its edge is a reference by definition, the second because a branch
+        // is two ways forward even when one pin is unwired.
+        let runs_on = |node: &Node| -> Option<NodeId> {
+            if matches!(node.kind, NodeKind::Jump | NodeKind::Condition) {
+                return None;
+            }
+            let exits: Vec<&Edge> = self.edges.iter().filter(|e| e.from == node.id).collect();
+            match exits.as_slice() {
+                [edge]
+                    if edge.label.trim().is_empty()
+                        && flow_of(edge.to) == Some(node.flow.as_str())
+                        && incoming(edge.to) == 1 =>
+                {
+                    Some(edge.to)
+                }
+                _ => None,
+            }
+        };
+
+        let mut number: HashMap<NodeId, usize> = HashMap::new();
+        let mut sections = Vec::new();
+        let mut flows: Vec<&str> = vec![""];
+        flows.extend(self.all_flows());
+        for flow in flows {
+            let on_flow = || self.nodes_in(flow).filter(|n| n.kind != NodeKind::Note);
+            let roots = on_flow().filter(|n| {
+                !self
+                    .edges
+                    .iter()
+                    .any(|e| e.to == n.id && flow_of(e.from) == Some(flow))
+            });
+            let mut seeds: Vec<NodeId> = roots.map(|n| n.id).collect();
+            // Anything left over starts a block of its own, except a jump: every reference
+            // to one already points through it, so it has nothing left to say.
+            seeds.extend(on_flow().filter(|n| n.kind != NodeKind::Jump).map(|n| n.id));
+
+            let mut written: HashSet<NodeId> = HashSet::new();
+            let mut blocks = Vec::new();
+            for seed in seeds {
+                if written.contains(&seed) {
+                    continue;
+                }
+                let mut queue = std::collections::VecDeque::from([seed]);
+                let next = number.len() + 1;
+                number.entry(seed).or_insert(next);
+                while let Some(start) = queue.pop_front() {
+                    let mut chain = Vec::new();
+                    let mut at = Some(start);
+                    while let Some(id) = at.filter(|id| written.insert(*id)) {
+                        chain.push(id);
+                        let Some(node) = self.node(id) else { break };
+                        at = runs_on(node);
+                        if at.is_none() {
+                            // Everything this block ends at on the same canvas is a block of
+                            // its own; one on another canvas is numbered when its flow is.
+                            for edge in self.edges.iter().filter(|e| e.from == id) {
+                                let to = self.through_jumps(edge.to);
+                                if flow_of(to) == Some(flow) && !number.contains_key(&to) {
+                                    number.insert(to, number.len() + 1);
+                                    queue.push_back(to);
+                                }
+                            }
+                        }
+                    }
+                    if !chain.is_empty() {
+                        blocks.push(chain);
+                    }
+                }
+            }
+            if !blocks.is_empty() {
+                sections.push((flow, blocks));
+            }
+        }
+        (sections, number)
+    }
+
+    /// Where a script reference to `id` should point: through any jumps to what they land
+    /// on, since a block that says nothing but "→ §4" is a page turn with no page. Stops at
+    /// a jump with no target and guards a ring of jumps with a visited set, as `start_of`
+    /// guards a cycle.
+    fn through_jumps(&self, id: NodeId) -> NodeId {
+        let mut at = id;
+        let mut seen = HashSet::from([at]);
+        while self.is_jump(at) {
+            match self.choices(at).first() {
+                Some(&(to, _)) if seen.insert(to) => at = to,
+                _ => break,
+            }
+        }
+        at
+    }
+
+    /// Writes [`Doc::to_screenplay`]. `&self` for the reason [`Doc::export_ftl`] takes it.
+    pub fn export_screenplay(&self, path: &Path) -> Result<(), String> {
+        std::fs::write(path, self.to_screenplay()).map_err(|e| e.to_string())
+    }
+
     /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
     /// title keeps its `*` and the close guard keeps asking.
     pub fn write_backup(&self, origin: Option<&Path>) -> Result<(), String> {
@@ -1802,6 +2049,53 @@ impl Doc {
         doc.add_edge(check, farewell);
         doc
     }
+}
+
+/// One flow of a screenplay: its name, and its blocks in print order, each a run of nodes
+/// written one after another.
+type ScriptSection<'a> = (&'a str, Vec<Vec<NodeId>>);
+
+/// A flow's heading in a script: the main flow has no name of its own.
+fn flow_title(flow: &str) -> &str {
+    if flow.is_empty() { "Main" } else { flow }
+}
+
+/// One node as a screenplay writes it, blank line first. Speech is the speaker in capitals
+/// over the line, as a script sets it; logic is a stage direction in brackets, so a reader
+/// can see *why* the path went where it did without reading it aloud. A hub says nothing —
+/// its choices, written after the block, are all it is.
+fn script_line(node: &Node) -> String {
+    let body = match node.kind {
+        NodeKind::Speech => {
+            let text = node.text.trim().lines().collect::<Vec<_>>().join("  \n");
+            let mut out = match node.speaker.trim() {
+                "" => text,
+                speaker => format!("**{}**  \n{text}", speaker.to_uppercase()),
+            };
+            if node.end {
+                out += "\n\n*(end)*";
+            }
+            out
+        }
+        NodeKind::Instruction if !node.effects.is_empty() => {
+            let sets: Vec<String> = node
+                .effects
+                .iter()
+                .map(|e| format!("{} {} {}", e.var, e.op.symbol(), e.value))
+                .collect();
+            format!("*[{}]*", sets.join(", "))
+        }
+        NodeKind::Condition => {
+            let checks: Vec<String> = node
+                .conditions
+                .iter()
+                .map(|c| format!("{} {} {}", c.var, c.op.symbol(), c.want))
+                .collect();
+            format!("*[if {}]*", checks.join(" and "))
+        }
+        _ => return String::new(),
+    };
+    format!("\n{body}\n")
 }
 
 fn distance_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -4286,5 +4580,95 @@ mod tests {
         assert_eq!(doc.stats(|n| n.speaker == "Mara").lines, 2);
         assert_eq!(doc.stats(|n| n.flow == "cellar").lines, 1);
         assert_eq!(doc.stats(|n| n.flow.is_empty()).lines, 2);
+    }
+
+    fn said(doc: &mut Doc, x: f32, text: &str) -> NodeId {
+        let id = doc.add_node(x, 0.0);
+        doc.node_mut(id).unwrap().text = text.into();
+        id
+    }
+
+    #[test]
+    fn bookmarks_are_aliased_nodes_sorted_by_alias() {
+        let mut doc = Doc::default();
+        let b = said(&mut doc, 0.0, "b");
+        let none = said(&mut doc, 400.0, "none");
+        let a = said(&mut doc, 800.0, "a");
+        doc.node_mut(b).unwrap().alias = "zebra".into();
+        doc.node_mut(a).unwrap().alias = "Intro".into();
+        doc.node_mut(none).unwrap().alias = "   ".into();
+
+        assert_eq!(doc.bookmarks(), vec![a, b]);
+    }
+
+    /// A single unlabelled edge runs on in the same block; a choice ends it, and every
+    /// target gets a number of its own, rising down the page.
+    #[test]
+    fn screenplay_runs_lines_on_and_numbers_branches() {
+        let script = Doc::sample().to_screenplay();
+        assert!(script.starts_with("## Main\n\n### §1\n\n**INNKEEPER**  \nYou look lost"));
+        assert!(script.contains("- Ask → §2\n- Refuse → §3\n"));
+        assert!(
+            script.contains("### §2\n\n**PLAYER**  \nWhere am I?\n\n**INNKEEPER**  \nSern's Rest.")
+        );
+        assert!(script.contains("### §4 · Anything else?\n"));
+        assert!(script.contains("*[if asked_about_pass == true]*\n\n- true → §9\n- false → §10\n"));
+    }
+
+    /// A reference to a jump is a reference to what it lands on, and the jump itself
+    /// never becomes a block that says nothing but where to turn.
+    #[test]
+    fn screenplay_points_through_jumps() {
+        let script = Doc::sample().to_screenplay();
+        assert!(script.contains("- Ask something else → §4\n"));
+        assert!(script.contains("*[asked_about_pass = true]*\n\n→ §4\n"));
+        assert!(!script.contains("### §11"));
+    }
+
+    /// A loop nothing enters is still written, once, and closes on a reference.
+    #[test]
+    fn screenplay_writes_a_cycle_once() {
+        let mut doc = Doc::default();
+        let a = said(&mut doc, 0.0, "round");
+        let b = said(&mut doc, 400.0, "and round");
+        doc.add_edge(a, b);
+        doc.add_edge(b, a);
+
+        let script = doc.to_screenplay();
+        assert_eq!(script.matches("and round").count(), 1);
+        assert_eq!(script.matches("\nround").count(), 1);
+        assert!(script.contains("and round\n\n→ §1\n"));
+    }
+
+    /// Author-facing text never reaches a script, and an empty flow has no section.
+    #[test]
+    fn screenplay_leaves_notes_out() {
+        let mut doc = Doc::default();
+        said(&mut doc, 0.0, "spoken");
+        let note = said(&mut doc, 400.0, "rewrite this");
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        doc.add_flow("empty");
+
+        let script = doc.to_screenplay();
+        assert!(script.contains("spoken"));
+        assert!(!script.contains("rewrite this"));
+        assert!(!script.contains("## empty"));
+    }
+
+    /// A jump into another flow names it, and the flow it lands in starts at the landing.
+    #[test]
+    fn screenplay_crosses_flows_by_name() {
+        let mut doc = Doc::default();
+        let here = said(&mut doc, 0.0, "down we go");
+        let jump = doc.add_node(400.0, 0.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let there = said(&mut doc, 800.0, "the cellar");
+        doc.node_mut(there).unwrap().flow = "cellar".into();
+        doc.add_edge(here, jump);
+        doc.add_edge(jump, there);
+
+        let script = doc.to_screenplay();
+        assert!(script.contains("down we go\n\n→ §2 (cellar)\n"));
+        assert!(script.contains("## cellar\n\n### §2\n\nthe cellar\n"));
     }
 }
