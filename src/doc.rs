@@ -410,6 +410,13 @@ pub struct Character {
     pub color: u32,
 }
 
+/// What [`Doc::stats`] returns: spoken lines and the words in them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Count {
+    pub lines: usize,
+    pub words: usize,
+}
+
 /// Splits a variable name into the set it belongs to and the rest: everything before the
 /// first `.`, which the variables pane renders as a group header.
 ///
@@ -1609,6 +1616,27 @@ impl Doc {
             out += &format!("    {line}\n");
         }
         out
+    }
+
+    /// How much dialogue the nodes `keep` accepts hold: one line per `Speech` node with
+    /// something in it, and its whitespace-separated words — what voice-over budgeting and
+    /// casting ask first. Speech only, so a hub's label, an instruction and a note are never
+    /// counted: a note is left out for the reason [`Doc::to_ftl`] leaves it out, since
+    /// nobody records author-facing text. A blank line is not a line, which is already
+    /// `Problem::Empty`'s business.
+    ///
+    /// ponytail: a full scan per call, and the view makes one per cast or flow row every
+    /// frame. Fine at the size a hand-authored graph reaches; cache per checkpoint if a
+    /// thousand-row cast ever stutters.
+    pub fn stats(&self, keep: impl Fn(&Node) -> bool) -> Count {
+        let mut count = Count::default();
+        for node in &self.nodes {
+            if node.kind == NodeKind::Speech && !node.text.trim().is_empty() && keep(node) {
+                count.lines += 1;
+                count.words += node.text.split_whitespace().count();
+            }
+        }
+        count
     }
 
     /// Writes [`Doc::to_ftl`]. Deliberately takes `&self`, which is the compiler saying an
@@ -4217,5 +4245,46 @@ mod tests {
 
         let expected = format!("node-{a} = ") + "a {\"{\"}b{\"}\"} c\n";
         assert_eq!(doc.to_ftl(), expected);
+    }
+
+    #[test]
+    fn stats_count_spoken_lines_and_their_words() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "Good  evening,\ntraveller.".into();
+        let b = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(b).unwrap().text = "Ale?".into();
+
+        assert_eq!(doc.stats(|_| true), Count { lines: 2, words: 4 });
+    }
+
+    /// Nobody records a note, a hub's label or a blank line, so none of them is a line.
+    #[test]
+    fn stats_count_speech_only() {
+        let mut doc = Doc::default();
+        spoken(&mut doc, 0.0, 0.0);
+        for (i, kind) in [NodeKind::Note, NodeKind::Hub].into_iter().enumerate() {
+            let id = spoken(&mut doc, 400.0 * (i + 1) as f32, 0.0);
+            doc.node_mut(id).unwrap().kind = kind;
+        }
+        let blank = doc.add_node(0.0, 400.0);
+        doc.node_mut(blank).unwrap().text = "  ".into();
+
+        assert_eq!(doc.stats(|_| true), Count { lines: 1, words: 1 });
+    }
+
+    #[test]
+    fn stats_filter_by_speaker_and_flow() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().speaker = "Mara".into();
+        let b = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(b).unwrap().speaker = "Mara".into();
+        doc.node_mut(b).unwrap().flow = "cellar".into();
+        spoken(&mut doc, 800.0, 0.0);
+
+        assert_eq!(doc.stats(|n| n.speaker == "Mara").lines, 2);
+        assert_eq!(doc.stats(|n| n.flow == "cellar").lines, 1);
+        assert_eq!(doc.stats(|n| n.flow.is_empty()).lines, 2);
     }
 }

@@ -1775,6 +1775,37 @@ impl Editor {
                         })),
                     }),
             )
+            // The foot: the whole cast's dialogue on the Cast tab, the open canvas's on the
+            // Flows tab — the one a click on a flow row has just switched to.
+            .map(|this| {
+                let (whose, count) = match pane {
+                    SidePane::Variables => return this,
+                    SidePane::Cast => ("Whole cast".to_string(), self.doc.stats(|_| true)),
+                    SidePane::Flows => {
+                        let flow = self.flow.as_str();
+                        let whose = if flow.is_empty() { "(main)" } else { flow };
+                        (format!("On {whose}"), self.doc.stats(|node| node.flow == flow))
+                    }
+                };
+                let plural = |n: usize, one: &str| match n {
+                    1 => format!("1 {one}"),
+                    _ => format!("{n} {one}s"),
+                };
+                this.child(
+                    div()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(rgb(0x3a3a44))
+                        .text_color(rgb(0x6c6c78))
+                        // Two lines, since a flow name and both counts overflow the pane.
+                        .child(div().truncate().child(whose))
+                        .child(div().truncate().child(format!(
+                            "{} · {}",
+                            plural(count.lines, "line"),
+                            plural(count.words, "word")
+                        ))),
+                )
+            })
             .when(playing.is_none(), |this| {
                 this.when_some(renaming.clone(), |this, old| {
                     let what = match old {
@@ -2378,6 +2409,7 @@ impl Editor {
         let character = &self.doc.characters[i];
         let color = character.color;
         let name = character.name.clone();
+        let lines = self.doc.stats(|node| node.speaker == name).lines;
         let to_recolor = name.clone();
         let to_rename = name.clone();
         let to_remove = name.clone();
@@ -2413,6 +2445,14 @@ impl Editor {
                     .truncate()
                     .text_color(rgb(0xb8b8c4))
                     .child(name),
+            )
+            // Lines spoken, the number casting asks first; the flow row's node count is its
+            // sibling. Words go at the foot of the tab, where there is width for them.
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(0x6c6c78))
+                    .child(lines.to_string()),
             )
             .when(!playing, |this| {
                 this.child(
