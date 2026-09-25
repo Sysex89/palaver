@@ -2,9 +2,9 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, Ref,
-    SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, clear_backup, in_port, join_set,
-    node_center, out_port, read_backup, split_set, with_default_extension,
+    Cmp, Doc, FILE_EXT, FTL_EXT, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem,
+    Ref, SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, clear_backup, in_port, join_set,
+    node_center, out_port, read_backup, snippet, split_set, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -1957,9 +1957,20 @@ impl Editor {
                                         let moved = this.doc.rename_character(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
+                                        // The rename rewrites who speaks, never what is said,
+                                        // so say how much prose still has the old name in it.
+                                        let left = this
+                                            .doc
+                                            .mentions(&Ref::Character(old.clone()))
+                                            .len();
+                                        let still = match left {
+                                            0 => String::new(),
+                                            1 => format!(" 1 line still says \"{old}\"."),
+                                            n => format!(" {n} lines still say \"{old}\"."),
+                                        };
                                         this.set_status(
                                             format!(
-                                                "Renamed \"{old}\" to \"{name}\" — {moved} line{s}."
+                                                "Renamed \"{old}\" to \"{name}\" — {moved} line{s}.{still}"
                                             ),
                                             cx,
                                         );
@@ -2492,7 +2503,13 @@ impl Editor {
         let name = character.name.clone();
         let target = Ref::Character(name.clone());
         let used_by = self.used_by_toggle(("cast-refs", i), &target, cx);
-        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(self.used_by_list(&target, cx))
+                .children(self.mentions_list(&target, cx))
+        });
         let to_recolor = name.clone();
         let to_rename = name.clone();
         let to_remove = name.clone();
@@ -2708,6 +2725,95 @@ impl Editor {
                         .child(format!("…and {more} more")),
                 )
             })
+    }
+
+    /// "Mentioned in": the prose that names `target` without a link to it, from
+    /// [`Doc::mentions`] — `None` when there is none, so a heading never sits over an empty
+    /// list. Each row shows the text around the name, since the name is the point and a
+    /// line truncated from its start could hide it. It never offers to fix a row: clicking
+    /// goes to it, and the author edits the line.
+    fn mentions_list(
+        &self,
+        target: &Ref,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        const MAX_ROWS: usize = 12;
+
+        let name = match target {
+            Ref::Character(name) => name.clone(),
+            Ref::Node(id) => self.doc.node(*id)?.alias.trim().to_string(),
+            _ => return None,
+        };
+        let found = self.doc.mentions(target);
+        if found.is_empty() {
+            return None;
+        }
+        let more = found.len().saturating_sub(MAX_ROWS);
+        let rows: Vec<_> = found
+            .into_iter()
+            .take(MAX_ROWS)
+            .enumerate()
+            .filter_map(|(row, at)| {
+                let (text, node) = match at {
+                    Mention::Node(id) => (self.doc.node(id)?.text.as_str(), id),
+                    Mention::Edge(index) => {
+                        let edge = self.doc.edges.get(index)?;
+                        (edge.label.as_str(), edge.from)
+                    }
+                };
+                let quote = snippet(text, &name);
+                let label = match at {
+                    Mention::Node(_) => quote,
+                    Mention::Edge(_) => format!("choice · {quote}"),
+                };
+                Some(
+                    div()
+                        .id(("mention", row))
+                        .px_1()
+                        .rounded_sm()
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(rgb(0x9a9aa6))
+                        .hover(|style| style.bg(rgb(0x33333c)).text_color(rgb(0xd6d6dd)))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| match at {
+                            Mention::Node(id) => this.jump_to(id, window, cx),
+                            // A choice is found on the canvas at the node it leaves, and
+                            // selected as itself so the Choice field is right there.
+                            Mention::Edge(index) => {
+                                this.show(node, window);
+                                this.select(Selection::Edge(index), cx);
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
+            .collect();
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(div().text_color(rgb(0x8a8a96)).child("Mentioned in"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .ml_3()
+                        .mb_1()
+                        .pl_1()
+                        .border_l_1()
+                        .border_color(rgb(0x3a3a44))
+                        .children(rows)
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .text_color(rgb(0x6c6c78))
+                                    .child(format!("…and {more} more")),
+                            )
+                        }),
+                ),
+        )
     }
 
     /// What the instructions between the previous node the player saw and the current one
@@ -3323,6 +3429,8 @@ impl Editor {
                             this.child(div().text_color(rgb(0x8a8a96)).child("Linked from"))
                                 .child(self.used_by_list(&Ref::Node(id), cx))
                         })
+                        // Only an aliased node has a name prose could use.
+                        .children(self.mentions_list(&Ref::Node(id), cx))
                     }
                     (None, Selection::Nodes(ids)) => this
                         .child(
