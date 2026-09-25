@@ -480,6 +480,63 @@ pub enum Use {
     LeadsHere,
 }
 
+/// Where [`Doc::mentions`] found a name in prose. A choice label is text a rename cannot
+/// reach just as a line is, so an edge is a place too — by index, like
+/// `Selection::Edge`, since the list is rebuilt every frame and never outlives an edit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mention {
+    Node(NodeId),
+    Edge(usize),
+}
+
+/// Where `name` first occurs in `text` as a whole word, ignoring case, as a *char* index —
+/// or `None`. Whole-word means the characters either side are not letters, digits or `_`,
+/// so "Mara" is found in "Ask Mara." and "Mara's key" but not in "Marathon"; a name with a
+/// space in it ("Old Tom") matches as a phrase. A blank name is found nowhere.
+pub fn find_word(text: &str, name: &str) -> Option<usize> {
+    let name: Vec<char> = name.trim().to_lowercase().chars().collect();
+    if name.is_empty() {
+        return None;
+    }
+    // Char-wise rather than on the lowercased string, since lowercasing can change a
+    // string's byte length and an index into one would not fit the other.
+    let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    (0..text.len().saturating_sub(name.len() - 1)).find(|&at| {
+        text[at..].starts_with(&name)
+            && !word(at.checked_sub(1).and_then(|b| text.get(b)))
+            && !word(text.get(at + name.len()))
+    })
+}
+
+/// The part of `text` around where `name` is found, on one line: a few words of lead-in,
+/// then the rest. A row truncates at its end, so starting at the text's own start would
+/// hide a name that comes late in a long line — the one thing the row is there to show.
+pub fn snippet(text: &str, name: &str) -> String {
+    /// How much lead-in to keep, in chars.
+    const LEAD: usize = 12;
+
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(at) = find_word(&flat, name) else {
+        return flat;
+    };
+    match at.checked_sub(LEAD) {
+        Some(start) if start > 0 => {
+            let rest: String = flat.chars().skip(start).collect();
+            // Start on a word, so the lead-in never opens mid-word — but only by skipping
+            // within the lead-in: with no space before the name ("—Mara"), the next one is
+            // after it, and skipping to it would cut the name off.
+            let name_at = rest.char_indices().nth(LEAD).map_or(rest.len(), |(b, _)| b);
+            let rest = match rest[..name_at].find(' ') {
+                Some(space) => &rest[space + 1..],
+                None => rest.as_str(),
+            };
+            format!("…{rest}")
+        }
+        _ => flat,
+    }
+}
+
 /// Splits a variable name into the set it belongs to and the rest: everything before the
 /// first `.`, which the variables pane renders as a group header.
 ///
@@ -1752,6 +1809,52 @@ impl Doc {
                 }
             }
         }
+        found
+    }
+
+    /// Every place whose *prose* names `target` without being linked to it — Obsidian's
+    /// unlinked mentions. For a character that is any text naming them that they do not
+    /// speak ("Ask Mara about the key", said by the Innkeeper); for a node, any text naming
+    /// its alias from a node that has no edge to it. Nodes first, in document order, then
+    /// choice labels.
+    ///
+    /// It exists chiefly because [`Doc::rename_character`] rewrites `Node::speaker` and
+    /// never `text`, deliberately — a blind replace inside prose would corrupt it — so after
+    /// renaming Mara this, asked about the *old* name, is the list of lines the rename could
+    /// not reach. That is also why a character is matched by name alone, declared or not:
+    /// the old name is not declared any more. It reports and never fixes; the author edits
+    /// the line.
+    ///
+    /// Notes are scanned too — a note about Mara is exactly what an author renaming her
+    /// wants to find. A hub's label is text like any other. Variables and flows have no
+    /// prose that names them, so they are mentioned nowhere.
+    pub fn mentions(&self, target: &Ref) -> Vec<Mention> {
+        let (name, linked) = match target {
+            Ref::Character(name) => (name.trim(), self.references(target)),
+            Ref::Node(id) => match self.node(*id) {
+                Some(node) => (node.alias.trim(), self.references(target)),
+                None => return Vec::new(),
+            },
+            Ref::Variable(_) | Ref::Flow(_) => return Vec::new(),
+        };
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let linked = |id: NodeId| linked.iter().any(|&(at, _)| at == id);
+        let own = |id: NodeId| *target == Ref::Node(id);
+
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|n| !linked(n.id) && !own(n.id) && find_word(&n.text, name).is_some());
+        let mut found: Vec<Mention> = nodes.map(|n| Mention::Node(n.id)).collect();
+        // A choice leading to the node it names is already a link, so it is not "unlinked".
+        let edges = self
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| *target != Ref::Node(e.to) && find_word(&e.label, name).is_some());
+        found.extend(edges.map(|(index, _)| Mention::Edge(index)));
         found
     }
 
@@ -4860,5 +4963,100 @@ mod tests {
             doc.references(&Ref::Node(target)),
             [(a, Use::LeadsHere), (jump, Use::LeadsHere)]
         );
+    }
+
+    #[test]
+    fn find_word_is_whole_word_and_case_insensitive() {
+        assert_eq!(find_word("Ask Mara about the key.", "mara"), Some(4));
+        assert_eq!(find_word("mara's key", "Mara"), Some(0));
+        assert_eq!(find_word("the Marathon", "Mara"), None);
+        assert_eq!(find_word("Tamara", "Mara"), None);
+        assert_eq!(find_word("mara_2", "Mara"), None);
+        assert_eq!(find_word("Old Tom said so", "old tom"), Some(0));
+        assert_eq!(find_word("anything", "  "), None);
+        // A char index, not a byte one: the accented letter before it is two bytes.
+        assert_eq!(find_word("é Mara", "Mara"), Some(2));
+    }
+
+    fn line(doc: &mut Doc, x: f32, speaker: &str, text: &str) -> NodeId {
+        let id = said(doc, x, text);
+        doc.node_mut(id).unwrap().speaker = speaker.into();
+        id
+    }
+
+    /// The lines naming a character they do not speak, notes included, and the choice
+    /// labels naming them too — and nothing that merely contains the name.
+    #[test]
+    fn mentions_of_a_character_are_the_prose_naming_them() {
+        let mut doc = Doc::default();
+        let ask = line(&mut doc, 0.0, "Innkeeper", "Ask Mara about the key.");
+        let own = line(&mut doc, 400.0, "Mara", "I'm Mara.");
+        let race = line(&mut doc, 800.0, "Innkeeper", "The Marathon is Tuesday.");
+        let note = said(&mut doc, 1200.0, "mara needs a second scene");
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        doc.add_edge(ask, own);
+        doc.add_edge(ask, race);
+        doc.edges[1].label = "Where's Mara?".into();
+
+        assert_eq!(
+            doc.mentions(&Ref::Character("Mara".into())),
+            [Mention::Node(ask), Mention::Node(note), Mention::Edge(1)]
+        );
+    }
+
+    /// The use it exists for: after a rename, the old name still turns up in the prose the
+    /// rename deliberately did not touch.
+    #[test]
+    fn mentions_find_what_a_rename_left_behind() {
+        let mut doc = Doc::default();
+        doc.add_character("Mara", 0);
+        let ask = line(&mut doc, 0.0, "Innkeeper", "Ask Mara about the key.");
+        line(&mut doc, 400.0, "Mara", "I'm Mara.");
+        doc.rename_character("Mara", "Marra");
+
+        // Her own line is no longer spoken by "Mara", so it is unlinked text now too.
+        let left = doc.mentions(&Ref::Character("Mara".into()));
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0], Mention::Node(ask));
+        assert!(doc.mentions(&Ref::Character("Marra".into())).is_empty());
+    }
+
+    /// A node's alias is its name; text naming it from a node with no edge to it is a
+    /// mention, and one that does link there is not.
+    #[test]
+    fn mentions_of_a_node_are_by_alias_and_skip_its_links() {
+        let mut doc = Doc::default();
+        let intro = said(&mut doc, 0.0, "Welcome back to the intro.");
+        doc.node_mut(intro).unwrap().alias = "intro".into();
+        let linked = said(&mut doc, 400.0, "Back to the intro.");
+        let loose = said(&mut doc, 800.0, "TODO: loop to INTRO");
+        doc.add_edge(linked, intro);
+        doc.add_edge(loose, linked);
+        doc.edges[1].label = "see intro".into();
+
+        assert_eq!(
+            doc.mentions(&Ref::Node(intro)),
+            [Mention::Node(loose), Mention::Edge(1)]
+        );
+        let unnamed = said(&mut doc, 1200.0, "");
+        assert!(doc.mentions(&Ref::Node(unnamed)).is_empty());
+        assert!(doc.mentions(&Ref::Variable("intro".into())).is_empty());
+    }
+
+    #[test]
+    fn snippet_keeps_the_name_in_view() {
+        // Short enough: the whole line, on one line.
+        assert_eq!(snippet("Ask Mara\nabout it", "mara"), "Ask Mara about it");
+        // A late name gets a lead-in that starts on a word.
+        assert_eq!(
+            snippet("You will want to go and find Mara by the well.", "Mara"),
+            "…and find Mara by the well."
+        );
+        // No space before the name: never skip past it looking for one.
+        assert_eq!(
+            snippet("Somebody had to say it—Mara said", "Mara"),
+            "…to say it—Mara said"
+        );
+        assert_eq!(snippet("no name here", "Mara"), "no name here");
     }
 }
