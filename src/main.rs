@@ -2,8 +2,8 @@ mod doc;
 mod text_input;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem,
-    SCRIPT_EXT, SetOp, Severity, Value, VarState, View, clear_backup, in_port, join_set,
+    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, Ref,
+    SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, clear_backup, in_port, join_set,
     node_center, out_port, read_backup, split_set, with_default_extension,
 };
 use gpui::{
@@ -262,6 +262,10 @@ struct Editor {
     /// Which canvas is on screen. A flow is a *view* onto the one flat node list, so this
     /// is editor state and never serialized — the whole feature is this filter plus a tab.
     flow: String,
+    /// Whose "Used by" list is open under its row in the left pane, if any. View state, and
+    /// filtered at render like `renaming`: a name the document no longer has matches no
+    /// row, so the list simply is not drawn.
+    used_by: Option<Ref>,
 }
 
 /// What the shared `var_input` is renaming. `Editor::pane` already says which *list* an
@@ -435,6 +439,7 @@ impl Editor {
             autosave_off: false,
             play: None,
             pane: SidePane::default(),
+            used_by: None,
             flow: String::new(),
         }
     }
@@ -2217,8 +2222,11 @@ impl Editor {
         let editing = self
             .editing_target()
             .is_some_and(|target| *target == ValueTarget::Default(name.clone()));
+        let target = Ref::Variable(variable.name.clone());
+        let used_by = self.used_by_toggle(("var-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
 
-        div()
+        let row = div()
             .flex()
             .gap_2()
             .items_center()
@@ -2268,6 +2276,7 @@ impl Editor {
                     })
                     .into_any_element(),
             })
+            .when(!editing, |this| this.child(used_by))
             .when(playing.is_none() && !editing, |this| {
                 this.child(
                     // The one place a variable's type changes. Lit when it holds a number,
@@ -2343,7 +2352,8 @@ impl Editor {
                             cx.notify();
                         })),
                 )
-            })
+            });
+        div().flex().flex_col().child(row).children(open)
     }
 
     /// A row of the Flows list: the canvas name, how many nodes stand on it, and the
@@ -2360,13 +2370,15 @@ impl Editor {
         // Owns everything it draws and borrows nothing back, like its two sibling rows.
     ) -> impl IntoElement + use<> {
         let on = self.flow == flow;
-        let count = self.doc.nodes_in(&flow).count();
         let main = flow.is_empty();
+        let target = Ref::Flow(flow.clone());
+        let used_by = self.used_by_toggle(("flow-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
         let selected = self.selection.nodes().len();
         let (to_show, to_rename, to_remove, to_move) =
             (flow.clone(), flow.clone(), flow.clone(), flow.clone());
 
-        div()
+        let row = div()
             .flex()
             .gap_2()
             .items_center()
@@ -2392,12 +2404,9 @@ impl Editor {
                         cx.notify();
                     })),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(0x6c6c78))
-                    .child(count.to_string()),
-            )
+            // How many nodes stand on it, which opens the list of them — the canvas itself
+            // shows them too, but not while another one is on screen.
+            .child(used_by)
             .when(!playing && selected > 0 && !on, |this| {
                 this.child(
                     div()
@@ -2464,7 +2473,8 @@ impl Editor {
                             cx.notify();
                         })),
                 )
-            })
+            });
+        div().flex().flex_col().child(row).children(open)
     }
 
     /// One row of the cast list: the character's colour, their name, and the rename and
@@ -2480,12 +2490,14 @@ impl Editor {
         let character = &self.doc.characters[i];
         let color = character.color;
         let name = character.name.clone();
-        let lines = self.doc.stats(|node| node.speaker == name).lines;
+        let target = Ref::Character(name.clone());
+        let used_by = self.used_by_toggle(("cast-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
         let to_recolor = name.clone();
         let to_rename = name.clone();
         let to_remove = name.clone();
 
-        div()
+        let row = div()
             .flex()
             .gap_2()
             .items_center()
@@ -2517,14 +2529,10 @@ impl Editor {
                     .text_color(rgb(0xb8b8c4))
                     .child(name),
             )
-            // Lines spoken, the number casting asks first; the flow row's node count is its
-            // sibling. Words go at the foot of the tab, where there is width for them.
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(0x6c6c78))
-                    .child(lines.to_string()),
-            )
+            // How many lines they speak — the number casting asks first, and the flow row's
+            // node count is its sibling — which opens the list of those lines. Words go at
+            // the foot of the tab, where there is width for them.
+            .child(used_by)
             .when(!playing, |this| {
                 this.child(
                     div()
@@ -2559,6 +2567,145 @@ impl Editor {
                             this.doc.remove_character(&to_remove);
                             cx.notify();
                         })),
+                )
+            });
+        div().flex().flex_col().child(row).children(open)
+    }
+
+    /// The count that opens a row's "Used by" list: how many nodes refer to the name, lit
+    /// while its list is open. Clicking it is view state, never an edit, so it stays live
+    /// during play — looking up where a flag is set is exactly what a play-through prompts.
+    fn used_by_toggle(
+        &self,
+        id: (&'static str, usize),
+        target: &Ref,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let mut nodes: Vec<NodeId> = self
+            .doc
+            .references(target)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        nodes.dedup();
+        // A cast row counts lines, the number the Cast foot adds up; a speaker on a blank
+        // node still shows up in the list, since that node does name them.
+        let count = match target {
+            Ref::Character(name) => self.doc.stats(|node| node.speaker == *name).lines,
+            _ => nodes.len(),
+        };
+        let open = self.used_by.as_ref() == Some(target);
+        let target = target.clone();
+        div()
+            .id(id)
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_color(if open { rgb(0x7aa2f7) } else { rgb(0x6c6c78) })
+            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .child(count.to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.used_by = match this.used_by.take() {
+                    Some(open) if open == target => None,
+                    _ => Some(target.clone()),
+                };
+                cx.notify();
+            }))
+    }
+
+    /// Every node that refers to `target`, one clickable row each, jumping through
+    /// `jump_to` — so a row on another canvas crosses to it with no arm of its own. Shared
+    /// by the left pane's rows and the inspector's "Linked from", which differ only in
+    /// what they ask [`Doc::references`] about.
+    fn used_by_list(&self, target: &Ref, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        /// Past this the list stops being scannable in a pane this narrow.
+        const MAX_ROWS: usize = 12;
+
+        let found = self.doc.references(target);
+        let more = found.len().saturating_sub(MAX_ROWS);
+        let rows: Vec<_> = found
+            .into_iter()
+            .take(MAX_ROWS)
+            .enumerate()
+            .filter_map(|(row, (id, how))| {
+                let node = self.doc.node(id)?;
+                // Under a variable the row is already about that variable, so it says what
+                // the node does to it — `sets = true` — rather than repeating the name.
+                let what = match (target, how) {
+                    (Ref::Variable(var), Use::Writes) => self.doc.effect_of(id, var).map(|e| {
+                        format!(
+                            "{} sets {} {}",
+                            node_number(&self.doc, id),
+                            e.op.symbol(),
+                            e.value
+                        )
+                    }),
+                    (Ref::Variable(var), Use::Reads) => self.doc.condition_of(id, var).map(|c| {
+                        format!(
+                            "{} checks {} {}",
+                            node_number(&self.doc, id),
+                            c.op.symbol(),
+                            c.want
+                        )
+                    }),
+                    // Under a character, likewise: the line, not who says it.
+                    (Ref::Character(_), _) => Some(match node.text.trim() {
+                        "" => node_number(&self.doc, id),
+                        text => text.to_string(),
+                    }),
+                    _ => None,
+                };
+                let verb = if how == Use::LeadsHere && node.kind == NodeKind::Jump {
+                    "↪ "
+                } else {
+                    ""
+                };
+                let elsewhere = match node.flow.as_str() {
+                    flow if flow == self.flow => String::new(),
+                    "" => " · (main)".to_string(),
+                    flow => format!(" · {flow}"),
+                };
+                let what = what.unwrap_or_else(|| format!("{verb}{}", ref_label(&self.doc, node)));
+                let label = format!("{what}{elsewhere}");
+                Some(
+                    div()
+                        .id(("used-by", row))
+                        .px_1()
+                        .rounded_sm()
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(rgb(0x9a9aa6))
+                        .hover(|style| style.bg(rgb(0x33333c)).text_color(rgb(0xd6d6dd)))
+                        .child(label)
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.jump_to(id, window, cx)),
+                        ),
+                )
+            })
+            .collect();
+        let empty = rows.is_empty();
+
+        div()
+            .flex()
+            .flex_col()
+            .ml_3()
+            .mb_1()
+            .pl_1()
+            .border_l_1()
+            .border_color(rgb(0x3a3a44))
+            .when(empty, |this| {
+                this.child(div().text_color(rgb(0x6c6c78)).child(match target {
+                    Ref::Node(_) => "Nothing leads here — a start.",
+                    _ => "Used nowhere.",
+                }))
+            })
+            .children(rows)
+            .when(more > 0, |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child(format!("…and {more} more")),
                 )
             })
     }
@@ -3171,6 +3318,11 @@ impl Editor {
                         .when(kind == NodeKind::Speech, |this| {
                             this.child(self.end_toggle(id, cx))
                         })
+                        // A note takes no edges, so nothing can ever lead to one.
+                        .when(kind != NodeKind::Note, |this| {
+                            this.child(div().text_color(rgb(0x8a8a96)).child("Linked from"))
+                                .child(self.used_by_list(&Ref::Node(id), cx))
+                        })
                     }
                     (None, Selection::Nodes(ids)) => this
                         .child(
@@ -3298,6 +3450,43 @@ fn node_label(doc: &Doc, node: &Node) -> String {
         ("", text) => text.to_string(),
         (speaker, "") => speaker.to_string(),
         (speaker, text) => format!("{speaker} — {text}"),
+    }
+}
+
+/// How a node reads in a "Used by" row: what it says, or, for the logic kinds that say
+/// nothing, what they do — a list of eight rows reading "Node 7" is no list at all.
+fn ref_label(doc: &Doc, node: &Node) -> String {
+    let joined = |parts: Vec<String>, sep: &str| parts.join(sep);
+    match node.kind {
+        NodeKind::Instruction if !node.effects.is_empty() => joined(
+            node.effects
+                .iter()
+                .map(|e| format!("{} {} {}", e.var, e.op.symbol(), e.value))
+                .collect(),
+            ", ",
+        ),
+        NodeKind::Condition if !node.conditions.is_empty() => joined(
+            node.conditions
+                .iter()
+                .map(|c| format!("{} {} {}", c.var, c.op.symbol(), c.want))
+                .collect(),
+            " and ",
+        ),
+        // A jump says nothing and does nothing on its own, so it is named by what leads into
+        // it: "↪ from Two coppers a night" is which branch returns here.
+        NodeKind::Jump => match doc.references(&Ref::Node(node.id)).first() {
+            Some(&(from, _)) => match doc.node(from) {
+                // One level only: a ring of jumps leading into each other would otherwise
+                // name itself forever.
+                Some(from) if from.kind == NodeKind::Jump => {
+                    format!("from {}", node_number(doc, from.id))
+                }
+                Some(from) => format!("from {}", ref_label(doc, from)),
+                None => node_number(doc, node.id),
+            },
+            None => node_number(doc, node.id),
+        },
+        _ => node_label(doc, node),
     }
 }
 

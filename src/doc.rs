@@ -452,6 +452,34 @@ pub struct Count {
     pub words: usize,
 }
 
+/// A name something in the document can be referred to by — what [`Doc::references`] is
+/// asked about. The four things the file keys by name or id and the four find-and-replace
+/// functions rewrite, and nothing else.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Ref {
+    Variable(String),
+    Character(String),
+    Flow(String),
+    Node(NodeId),
+}
+
+/// How a node refers to a [`Ref`]: the field the reference lives in, said the way the "Used
+/// by" list says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Use {
+    /// An effect names the variable.
+    Writes,
+    /// A check names the variable.
+    Reads,
+    /// A `Speech` node's speaker is the character.
+    Speaks,
+    /// The node is drawn on the flow.
+    StandsOn,
+    /// An edge from this node leads to the target — a choice, a branch, or a jump from any
+    /// canvas.
+    LeadsHere,
+}
+
 /// Splits a variable name into the set it belongs to and the rest: everything before the
 /// first `.`, which the variables pane renders as a group header.
 ///
@@ -1679,6 +1707,52 @@ impl Doc {
     /// document's own path.
     pub fn export_ftl(&self, path: &Path) -> Result<(), String> {
         std::fs::write(path, self.to_ftl()).map_err(|e| e.to_string())
+    }
+
+    /// Every node that refers to `target`, in document order, with the field it does it
+    /// through — Obsidian's backlinks, over the names this file keys by.
+    ///
+    /// The read-only twin of the find-and-replace functions, and it must visit **exactly**
+    /// the fields they rewrite: effects and checks on any kind for a variable, as
+    /// [`Doc::rename_variable`] does; a `Speech` node's trimmed speaker for a character, as
+    /// [`Doc::rename_character`] does; `Node::flow` for a flow, as [`Doc::rename_flow`] does.
+    /// A field that stores a name joins this function as well as those, and the
+    /// `references_match_*` tests are what catch it when it does not. A node is the fourth
+    /// target: every node with an edge into it, which is how a jump from another canvas
+    /// shows up without the crossing needing an arm of its own.
+    ///
+    /// A node that refers twice in one way is listed once; one that writes and reads the
+    /// same variable — only a hand-edit can make that — is listed for each.
+    pub fn references(&self, target: &Ref) -> Vec<(NodeId, Use)> {
+        let mut found = Vec::new();
+        for node in &self.nodes {
+            match target {
+                Ref::Variable(name) => {
+                    if node.effects.iter().any(|e| e.var == *name) {
+                        found.push((node.id, Use::Writes));
+                    }
+                    if node.conditions.iter().any(|c| c.var == *name) {
+                        found.push((node.id, Use::Reads));
+                    }
+                }
+                Ref::Character(name) => {
+                    if node.kind == NodeKind::Speech && node.speaker.trim() == name {
+                        found.push((node.id, Use::Speaks));
+                    }
+                }
+                Ref::Flow(name) => {
+                    if node.flow == *name {
+                        found.push((node.id, Use::StandsOn));
+                    }
+                }
+                Ref::Node(id) => {
+                    if self.edges.iter().any(|e| e.from == node.id && e.to == *id) {
+                        found.push((node.id, Use::LeadsHere));
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Every node with an alias, sorted by it: the author's own landmarks. No `starred`
@@ -4670,5 +4744,121 @@ mod tests {
         let script = doc.to_screenplay();
         assert!(script.contains("down we go\n\n→ §2 (cellar)\n"));
         assert!(script.contains("## cellar\n\n### §2\n\nthe cellar\n"));
+    }
+
+    /// The ids whose node differs between two documents with the same node list — what a
+    /// find-and-replace actually touched.
+    fn touched(before: &Doc, after: &Doc, differs: impl Fn(&Node, &Node) -> bool) -> Vec<NodeId> {
+        before
+            .nodes
+            .iter()
+            .zip(&after.nodes)
+            .filter(|(a, b)| differs(a, b))
+            .map(|(a, _)| a.id)
+            .collect()
+    }
+
+    fn ids(found: Vec<(NodeId, Use)>) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = found.into_iter().map(|(id, _)| id).collect();
+        ids.dedup();
+        ids
+    }
+
+    /// A document where a variable is written, read, and written-and-read by a hand-edit on
+    /// a kind that should not carry it — every field `rename_variable` reaches.
+    fn referencing_doc() -> Doc {
+        let mut doc = Doc::sample();
+        doc.add_variable("gold");
+        let set = doc.add_node(0.0, 800.0);
+        doc.node_mut(set).unwrap().kind = NodeKind::Instruction;
+        doc.set_effect(set, "gold", Some(Value::Int(5)), SetOp::Add);
+        let check = doc.add_node(400.0, 800.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(check, "gold", Some(Value::Int(3)), Cmp::Gt);
+        let odd = spoken(&mut doc, 800.0, 800.0);
+        doc.set_effect(odd, "gold", Some(Value::Int(1)), SetOp::Set);
+        doc.set_condition(odd, "gold", Some(Value::Int(1)), Cmp::Eq);
+        doc
+    }
+
+    #[test]
+    fn references_match_rename_variable() {
+        let doc = referencing_doc();
+        for name in ["gold", "asked_about_pass"] {
+            let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+            renamed.rename_variable(name, "renamed");
+            let rewritten = touched(&doc, &renamed, |a, b| {
+                a.effects != b.effects || a.conditions != b.conditions
+            });
+            let found = ids(doc.references(&Ref::Variable(name.into())));
+            assert!(!found.is_empty());
+            assert_eq!(found, rewritten, "{name}");
+        }
+    }
+
+    #[test]
+    fn references_match_rename_character() {
+        let mut doc = Doc::sample();
+        // A hub carrying a speaker is not a line, and the rename leaves it alone too.
+        let hub = doc
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Hub)
+            .unwrap()
+            .id;
+        doc.node_mut(hub).unwrap().speaker = "Innkeeper".into();
+        for name in ["Innkeeper", "Player"] {
+            let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+            renamed.rename_character(name, "Renamed");
+            let rewritten = touched(&doc, &renamed, |a, b| a.speaker != b.speaker);
+            let found = ids(doc.references(&Ref::Character(name.into())));
+            assert!(!found.is_empty());
+            assert_eq!(found, rewritten, "{name}");
+        }
+    }
+
+    #[test]
+    fn references_match_rename_flow() {
+        let mut doc = Doc::sample();
+        let moved: Vec<NodeId> = doc.nodes.iter().take(3).map(|n| n.id).collect();
+        doc.move_to_flow(&moved, "cellar");
+        let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+        renamed.rename_flow("cellar", "vault");
+        let rewritten = touched(&doc, &renamed, |a, b| a.flow != b.flow);
+        assert_eq!(ids(doc.references(&Ref::Flow("cellar".into()))), rewritten);
+        assert_eq!(rewritten, moved);
+    }
+
+    #[test]
+    fn references_name_the_field() {
+        let doc = referencing_doc();
+        let uses: Vec<Use> = doc
+            .references(&Ref::Variable("gold".into()))
+            .into_iter()
+            .map(|(_, how)| how)
+            .collect();
+        assert_eq!(uses, [Use::Writes, Use::Reads, Use::Writes, Use::Reads]);
+    }
+
+    /// Every edge in counts, a jump from another canvas included, and a node with two
+    /// edges in is listed once.
+    #[test]
+    fn references_to_a_node_are_its_incoming_edges() {
+        let mut doc = Doc::default();
+        let target = spoken(&mut doc, 0.0, 0.0);
+        let a = spoken(&mut doc, 400.0, 0.0);
+        let jump = doc.add_node(800.0, 0.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        doc.node_mut(jump).unwrap().flow = "cellar".into();
+        let unrelated = spoken(&mut doc, 1200.0, 0.0);
+        doc.add_edge(a, target);
+        doc.edges.push(doc.edges[0].clone());
+        doc.add_edge(jump, target);
+        doc.add_edge(target, unrelated);
+
+        assert_eq!(
+            doc.references(&Ref::Node(target)),
+            [(a, Use::LeadsHere), (jump, Use::LeadsHere)]
+        );
     }
 }
