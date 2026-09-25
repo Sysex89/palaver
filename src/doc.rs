@@ -92,6 +92,66 @@ pub const GAP_X: f32 = 100.0;
 /// Vertical gap between siblings sharing a parent.
 pub const GAP_Y: f32 = 30.0;
 
+/// A flow's box on the flow map. The map is laid out in *pane* pixels and ignores the
+/// canvas's pan and zoom: it is a table of contents, not a place anything is drawn at.
+pub const MAP_W: f32 = 180.0;
+pub const MAP_H: f32 = 64.0;
+/// Room between boxes for an arrow and its count.
+const MAP_GAP_X: f32 = 150.0;
+const MAP_GAP_Y: f32 = 110.0;
+const MAP_MARGIN: f32 = 40.0;
+
+/// How many columns a map of `n` flows is laid out in: the smallest square that holds
+/// them, so the grid grows in both directions rather than running off one edge.
+fn map_cols(n: usize) -> usize {
+    (1..).find(|c| c * c >= n).unwrap_or(1)
+}
+
+/// Top-left corner of the `i`th of `n` boxes on the flow map, in pane pixels. A fixed
+/// grid in [`Doc::all_flows`] order, main flow first — never a force simulation, so a
+/// flow is always where it was last time.
+// ponytail: past a few dozen flows the grid runs off the pane, and the map neither
+// scrolls nor zooms. Give it the canvas's `View` if a project ever gets there.
+pub fn map_cell(i: usize, n: usize) -> (f32, f32) {
+    let cols = map_cols(n);
+    let (col, row) = (i % cols, i / cols);
+    (
+        MAP_MARGIN + col as f32 * (MAP_W + MAP_GAP_X),
+        MAP_MARGIN + row as f32 * (MAP_H + MAP_GAP_Y),
+    )
+}
+
+/// Which of `n` map boxes, if any, a pane point falls in — the flow map's whole hit test,
+/// so the canvas's own (`hit_test`, `edge_at`…) never learns the map exists.
+pub fn map_hit(n: usize, x: f32, y: f32) -> Option<usize> {
+    (0..n).find(|&i| {
+        let (bx, by) = map_cell(i, n);
+        x >= bx && x <= bx + MAP_W && y >= by && y <= by + MAP_H
+    })
+}
+
+/// Where a ray from the middle of a `w`×`h` box towards `toward` crosses its border — so
+/// an arrow between two boxes starts and ends at their edges rather than under them.
+pub fn box_exit(center: (f32, f32), w: f32, h: f32, toward: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (toward.0 - center.0, toward.1 - center.1);
+    if dx == 0.0 && dy == 0.0 {
+        return center;
+    }
+    // The ray leaves by whichever side it reaches first.
+    let tx = if dx == 0.0 {
+        f32::INFINITY
+    } else {
+        (w / 2.0) / dx.abs()
+    };
+    let ty = if dy == 0.0 {
+        f32::INFINITY
+    } else {
+        (h / 2.0) / dy.abs()
+    };
+    let t = tx.min(ty);
+    (center.0 + dx * t, center.1 + dy * t)
+}
+
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 3.0;
 
@@ -235,6 +295,12 @@ pub struct Node {
     /// what every node in a file written before flows existed loads as.
     #[serde(default)]
     pub flow: String,
+    /// Bare labels — `todo`, `vo.recorded` — stored without the `#`. A tag has no value and
+    /// the walk never reads one: nothing that plays, exports or checks the graph looks at
+    /// this field, which is what keeps it from growing into a property bag. Orthogonal to
+    /// [`NodeKind`] like `alias`, so a note or a hub can carry one too.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Marked as a deliberate ending, so having no outgoing edges is not a fault.
     /// `default` so `.dln` files written before this field keep loading.
     #[serde(default)]
@@ -453,13 +519,16 @@ pub struct Count {
 }
 
 /// A name something in the document can be referred to by — what [`Doc::references`] is
-/// asked about. The four things the file keys by name or id and the four find-and-replace
-/// functions rewrite, and nothing else.
+/// asked about. The things the file keys by name or id and the find-and-replace functions
+/// rewrite, and nothing else.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ref {
     Variable(String),
     Character(String),
     Flow(String),
+    /// A tag and every tag under it — `act1` names `act1.tavern` too, as
+    /// [`Doc::rename_tag`] carries it.
+    Tag(String),
     Node(NodeId),
 }
 
@@ -475,6 +544,8 @@ pub enum Use {
     Speaks,
     /// The node is drawn on the flow.
     StandsOn,
+    /// The node carries the tag.
+    Tagged,
     /// An edge from this node leads to the target — a choice, a branch, or a jump from any
     /// canvas.
     LeadsHere,
@@ -546,6 +617,7 @@ enum Filter {
     Kind(NodeKind),
     Sets(String),
     Checks(String),
+    Tag(String),
     End,
     Aliased,
     Start,
@@ -557,10 +629,17 @@ impl Filter {
     /// nobody knows, or an `is:`/`has:`/`kind:` value that matches nothing. `Some(None)`
     /// for a known key with nothing after it yet, which filters nothing.
     fn parse(term: &str) -> Option<Option<Filter>> {
+        // `#todo` is `tag:todo`, spelled the way it is written everywhere else. A bare `#`
+        // is plain text, like any other lone character.
+        if let Some(tag) = term.strip_prefix('#').filter(|tag| !tag.is_empty()) {
+            return Some(Some(Filter::Tag(tag.to_lowercase())));
+        }
         let (key, value) = term.split_once(':')?;
         let value = value.to_lowercase();
         let key = key.to_lowercase();
-        let known = ["speaker", "flow", "kind", "sets", "checks", "is", "has"];
+        let known = [
+            "speaker", "flow", "kind", "sets", "checks", "tag", "is", "has",
+        ];
         if !known.contains(&key.as_str()) {
             return None;
         }
@@ -572,6 +651,7 @@ impl Filter {
             "flow" => Filter::Flow(value),
             "sets" => Filter::Sets(value),
             "checks" => Filter::Checks(value),
+            "tag" => Filter::Tag(value.trim_start_matches('#').to_string()),
             "kind" => {
                 const KINDS: [(&str, NodeKind); 6] = [
                     ("speech", NodeKind::Speech),
@@ -621,6 +701,23 @@ pub fn join_set(set: &str, rest: &str) -> String {
         true => rest.to_string(),
         false => format!("{set}.{rest}"),
     }
+}
+
+/// A typed tag as it is stored, or `None` when it cannot be one: trimmed, without its `#`,
+/// and a single word — a tag with a space in it could never be asked for with `tag:`.
+pub fn clean_tag(typed: &str) -> Option<String> {
+    let tag = typed.trim().trim_start_matches('#');
+    match tag.is_empty() || tag.contains(char::is_whitespace) {
+        true => None,
+        false => Some(tag.to_string()),
+    }
+}
+
+/// Whether `tag` is `name` or sits under it (`act1.tavern` under `act1`) — the one rule
+/// [`Doc::rename_tag`] and [`Doc::references`] share, so they cannot drift apart.
+fn tag_under(tag: &str, name: &str) -> bool {
+    tag.strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Every variable's value at one point in a play-through. Never stored on the editor —
@@ -993,6 +1090,7 @@ impl Doc {
             text: String::new(),
             alias: String::new(),
             flow: String::new(),
+            tags: Vec::new(),
             end: false,
             kind: NodeKind::Speech,
             effects: Vec::new(),
@@ -1244,6 +1342,11 @@ impl Doc {
                     Filter::Sets(_) | Filter::Checks(_) => named
                         .iter()
                         .any(|(at, ids)| *at == i && ids.contains(&n.id)),
+                    // A prefix, so `tag:vo` finds `vo.recorded`.
+                    Filter::Tag(tag) => n
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().starts_with(tag.as_str())),
                     Filter::End => n.end,
                     Filter::Aliased => !n.alias.trim().is_empty(),
                     Filter::Start => {
@@ -1717,6 +1820,41 @@ impl Doc {
         found
     }
 
+    /// Every flow the map draws a box for: the main one first, then [`Doc::all_flows`].
+    /// The same list, in the same order, as the Flows tab.
+    pub fn map_flows(&self) -> Vec<&str> {
+        std::iter::once("").chain(self.all_flows()).collect()
+    }
+
+    /// The flow map's arrows: for each ordered pair of flows, how many jumps on the first
+    /// land on a node on the second. Computed from the jump edges every time and never
+    /// stored — the map is a picture of the graph, not a second copy of it. A jump that
+    /// lands on its own canvas crosses nothing and is not counted; a jump pointing at
+    /// nothing has nowhere to draw an arrow to. Ordered by [`Doc::map_flows`], source then
+    /// target, so the map draws the same way every frame.
+    pub fn flow_links(&self) -> Vec<(String, String, usize)> {
+        let mut links: Vec<(String, String, usize)> = Vec::new();
+        for edge in self.edges.iter().filter(|e| self.is_jump(e.from)) {
+            let (Some(from), Some(to)) = (self.node(edge.from), self.node(edge.to)) else {
+                continue;
+            };
+            if from.flow == to.flow {
+                continue;
+            }
+            match links
+                .iter_mut()
+                .find(|(a, b, _)| *a == from.flow && *b == to.flow)
+            {
+                Some((_, _, count)) => *count += 1,
+                None => links.push((from.flow.clone(), to.flow.clone(), 1)),
+            }
+        }
+        let flows = self.map_flows();
+        let at = |flow: &str| flows.iter().position(|f| *f == flow);
+        links.sort_by_key(|(a, b, _)| (at(a), at(b)));
+        links
+    }
+
     /// Whether [`Doc::add_flow`] would accept this name. Separate for the reason
     /// [`Doc::variable_name_free`] is: a refused add must not leave an empty undo step.
     pub fn flow_name_free(&self, name: &str) -> bool {
@@ -1777,6 +1915,117 @@ impl Doc {
         for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
             node.flow = flow.to_string();
         }
+    }
+
+    /// Every tag some node carries, once each, sorted ignoring case. Tags are never
+    /// declared: the list is whatever the nodes say, as [`Doc::all_flows`] is for the flows
+    /// nobody declared — so there is no removal policy to choose and no unknown tag.
+    pub fn all_tags(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = Vec::new();
+        for tag in self.nodes.iter().flat_map(|n| &n.tags) {
+            if !found.contains(&tag.as_str()) {
+                found.push(tag);
+            }
+        }
+        found.sort_by_key(|tag| tag.to_lowercase());
+        found
+    }
+
+    /// The groups the dotted tags fall into, through [`split_set`] exactly as a variable's
+    /// name does — what the tag picker offers, the way [`Doc::all_sets`] feeds the other.
+    pub fn tag_sets(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = Vec::new();
+        for tag in self.all_tags() {
+            if let (Some(set), _) = split_set(tag)
+                && !found.contains(&set)
+            {
+                found.push(set);
+            }
+        }
+        found
+    }
+
+    /// Whether [`Doc::add_tag`] would change anything: the tag is well-formed and some
+    /// listed node lacks it. The pre-checkpoint check, for the empty-undo-step reason
+    /// [`Doc::variable_name_free`] exists.
+    pub fn can_tag(&self, ids: &[NodeId], tag: &str) -> bool {
+        let Some(tag) = clean_tag(tag) else {
+            return false;
+        };
+        self.nodes
+            .iter()
+            .any(|n| ids.contains(&n.id) && !n.tags.contains(&tag))
+    }
+
+    /// Tags every listed node that lacks the tag, returning how many gained it. A node
+    /// never carries one tag twice.
+    pub fn add_tag(&mut self, ids: &[NodeId], tag: &str) -> usize {
+        let Some(tag) = clean_tag(tag) else {
+            return 0;
+        };
+        let mut tagged = 0;
+        for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
+            if !node.tags.contains(&tag) {
+                node.tags.push(tag.clone());
+                tagged += 1;
+            }
+        }
+        tagged
+    }
+
+    /// Takes the tag off one node. False when it did not carry it.
+    pub fn remove_tag(&mut self, id: NodeId, tag: &str) -> bool {
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        let before = node.tags.len();
+        node.tags.retain(|t| t != tag);
+        node.tags.len() != before
+    }
+
+    /// Whether [`Doc::rename_tag`] would change anything — the pre-checkpoint check.
+    pub fn tag_rename_ok(&self, from: &str, to: &str) -> bool {
+        clean_tag(to).is_some_and(|to| to != from)
+            && self
+                .nodes
+                .iter()
+                .flat_map(|n| &n.tags)
+                .any(|t| tag_under(t, from))
+    }
+
+    /// Renames the tag on every node carrying it, and every tag under it — `act1` to
+    /// `act2` moves `act1.tavern` to `act2.tavern` — returning how many nodes changed. The
+    /// fifth find-and-replace in this file, and [`Doc::references`] visits the same tags.
+    ///
+    /// Unlike [`Doc::rename_set`] it merges rather than refuses when the new name is taken:
+    /// a tag has no value to conflict, so renaming a misspelt `#tood` onto `#todo` is the
+    /// ordinary way to fix it, and a node left carrying both keeps one.
+    pub fn rename_tag(&mut self, from: &str, to: &str) -> usize {
+        if !self.tag_rename_ok(from, to) {
+            return 0;
+        }
+        let Some(to) = clean_tag(to) else {
+            return 0;
+        };
+        let mut changed = 0;
+        for node in &mut self.nodes {
+            if !node.tags.iter().any(|t| tag_under(t, from)) {
+                continue;
+            }
+            let mut tags: Vec<String> = Vec::new();
+            for tag in &node.tags {
+                let tag = match tag_under(tag, from) {
+                    true => format!("{to}{}", &tag[from.len()..]),
+                    false => tag.clone(),
+                };
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+            node.tags = tags;
+            changed += 1;
+        }
+        changed
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -1952,6 +2201,11 @@ impl Doc {
                         found.push((node.id, Use::StandsOn));
                     }
                 }
+                Ref::Tag(name) => {
+                    if node.tags.iter().any(|t| tag_under(t, name)) {
+                        found.push((node.id, Use::Tagged));
+                    }
+                }
                 Ref::Node(id) => {
                     if self.edges.iter().any(|e| e.from == node.id && e.to == *id) {
                         found.push((node.id, Use::LeadsHere));
@@ -1985,7 +2239,7 @@ impl Doc {
                 Some(node) => (node.alias.trim(), self.references(target)),
                 None => return Vec::new(),
             },
-            Ref::Variable(_) | Ref::Flow(_) => return Vec::new(),
+            Ref::Variable(_) | Ref::Flow(_) | Ref::Tag(_) => return Vec::new(),
         };
         if name.is_empty() {
             return Vec::new();
@@ -5282,5 +5536,200 @@ mod tests {
         assert!(doc.query("mood:happy").is_empty());
         assert!(doc.query("is:e").is_empty());
         assert!(doc.query("kind:zzz").is_empty());
+    }
+
+    /// A small tagged document: three nodes, one carrying a group and a child of it.
+    fn tagged_doc() -> (Doc, [NodeId; 3]) {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 600.0, 0.0);
+        doc.add_tag(&[a, b], "todo");
+        doc.add_tag(&[a], "#act1.tavern");
+        doc.add_tag(&[c], "act1");
+        doc.add_tag(&[c], "vo.recorded");
+        (doc, [a, b, c])
+    }
+
+    #[test]
+    fn clean_tag_drops_the_hash_and_refuses_a_space() {
+        assert_eq!(clean_tag("  #todo "), Some("todo".into()));
+        assert_eq!(clean_tag("vo.recorded"), Some("vo.recorded".into()));
+        assert_eq!(clean_tag("#"), None);
+        assert_eq!(clean_tag("   "), None);
+        assert_eq!(clean_tag("two words"), None);
+    }
+
+    #[test]
+    fn a_tag_is_added_once_and_removed() {
+        let (mut doc, [a, b, _]) = tagged_doc();
+        assert!(!doc.can_tag(&[a, b], "todo"));
+        assert_eq!(doc.add_tag(&[a, b], "#todo"), 0);
+        assert_eq!(doc.node(a).unwrap().tags, ["todo", "act1.tavern"]);
+        assert!(doc.remove_tag(a, "todo"));
+        assert!(!doc.remove_tag(a, "todo"));
+        assert!(doc.can_tag(&[a, b], "todo"));
+        assert_eq!(doc.add_tag(&[a, b], "todo"), 1);
+    }
+
+    #[test]
+    fn tags_are_whatever_the_nodes_carry() {
+        let (mut doc, [a, ..]) = tagged_doc();
+        doc.add_tag(&[a], "Draft");
+        assert_eq!(
+            doc.all_tags(),
+            ["act1", "act1.tavern", "Draft", "todo", "vo.recorded"]
+        );
+        assert_eq!(doc.tag_sets(), ["act1", "vo"]);
+    }
+
+    #[test]
+    fn an_old_file_loads_with_no_tags() {
+        let (doc, _) = tagged_doc();
+        let json = doc.to_json().replace("\"tags\"", "\"ignored\"");
+        let loaded = Doc::from_json(&json).unwrap();
+        assert!(loaded.all_tags().is_empty());
+    }
+
+    #[test]
+    fn rename_tag_carries_the_tags_under_it() {
+        let (mut doc, [a, b, c]) = tagged_doc();
+        assert_eq!(doc.rename_tag("act1", "act2"), 2);
+        assert_eq!(doc.node(a).unwrap().tags, ["todo", "act2.tavern"]);
+        assert_eq!(doc.node(c).unwrap().tags, ["act2", "vo.recorded"]);
+        // `todo` is not under `to`, whatever the letters say.
+        assert!(!doc.tag_rename_ok("to", "x"));
+        assert_eq!(doc.node(b).unwrap().tags, ["todo"]);
+    }
+
+    #[test]
+    fn rename_tag_merges_onto_a_taken_name() {
+        let (mut doc, [a, ..]) = tagged_doc();
+        doc.add_tag(&[a], "tood");
+        assert_eq!(doc.rename_tag("tood", "todo"), 1);
+        assert_eq!(doc.node(a).unwrap().tags, ["todo", "act1.tavern"]);
+    }
+
+    #[test]
+    fn rename_tag_refuses_a_no_op() {
+        let (mut doc, _) = tagged_doc();
+        assert_eq!(doc.rename_tag("todo", "todo"), 0);
+        assert_eq!(doc.rename_tag("todo", "two words"), 0);
+        assert_eq!(doc.rename_tag("nothing", "else"), 0);
+    }
+
+    #[test]
+    fn references_match_rename_tag() {
+        let (doc, _) = tagged_doc();
+        for name in ["todo", "act1", "act1.tavern", "vo"] {
+            let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+            renamed.rename_tag(name, "renamed");
+            let rewritten = touched(&doc, &renamed, |a, b| a.tags != b.tags);
+            let found = ids(doc.references(&Ref::Tag(name.into())));
+            assert!(!found.is_empty());
+            assert_eq!(found, rewritten, "{name}");
+        }
+    }
+
+    #[test]
+    fn query_finds_a_tag_by_prefix() {
+        let (doc, [a, b, c]) = tagged_doc();
+        assert_eq!(doc.query("tag:todo"), [a, b]);
+        assert_eq!(doc.query("tag:vo"), [c]);
+        assert_eq!(doc.query("#act1"), [a, c]);
+        assert_eq!(doc.query("tag:#TODO"), [a, b]);
+        assert_eq!(doc.query("#todo tag:act1"), [a]);
+        // Typing toward one filters nothing yet, and a lone `#` is plain text.
+        assert_eq!(doc.query("tag:").len(), 0);
+        assert!(doc.query("#").is_empty());
+    }
+
+    /// The walk, the exports and the problem list never read a tag.
+    #[test]
+    fn a_tag_changes_nothing_the_walk_or_an_export_sees() {
+        let mut doc = Doc::sample();
+        let before = (doc.to_ftl(), doc.to_screenplay(), doc.problems().len());
+        let ids: Vec<NodeId> = doc.nodes.iter().map(|n| n.id).collect();
+        doc.add_tag(&ids, "draft");
+        assert_eq!(
+            before,
+            (doc.to_ftl(), doc.to_screenplay(), doc.problems().len())
+        );
+        assert!(doc.mentions(&Ref::Tag("draft".into())).is_empty());
+    }
+
+    /// A jump node on `flow` pointing at `to`.
+    fn jump_on(doc: &mut Doc, flow: &str, to: NodeId) -> NodeId {
+        let jump = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(jump).unwrap();
+        node.kind = NodeKind::Jump;
+        node.flow = flow.to_string();
+        doc.add_edge(jump, to);
+        jump
+    }
+
+    #[test]
+    fn flow_links_count_the_jumps_between_flows() {
+        let mut doc = Doc::default();
+        let tavern = doc.add_node(0.0, 0.0);
+        let cellar = doc.add_node(0.0, 0.0);
+        doc.move_to_flow(&[cellar], "cellar");
+        let street = doc.add_node(0.0, 0.0);
+        doc.move_to_flow(&[street], "street");
+        doc.add_flow("empty");
+
+        jump_on(&mut doc, "", cellar);
+        jump_on(&mut doc, "", cellar);
+        jump_on(&mut doc, "cellar", tavern);
+        jump_on(&mut doc, "street", cellar);
+        // Lands on its own canvas: nothing crosses.
+        jump_on(&mut doc, "street", street);
+        // An ordinary edge that crosses is a `CrossFlowEdge`, not a jump, and not drawn.
+        let loose = doc.add_node(0.0, 0.0);
+        doc.add_edge(loose, cellar);
+        // A jump with no target has nowhere to point.
+        let dangling = doc.add_node(0.0, 0.0);
+        doc.node_mut(dangling).unwrap().kind = NodeKind::Jump;
+
+        // Declared flows first, then the ones nodes merely stand on — `all_flows`'s order.
+        assert_eq!(doc.map_flows(), ["", "empty", "cellar", "street"]);
+        assert_eq!(
+            doc.flow_links(),
+            [
+                ("".to_string(), "cellar".to_string(), 2),
+                ("cellar".to_string(), "".to_string(), 1),
+                ("street".to_string(), "cellar".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_map_grid_is_square_and_hit_by_its_boxes() {
+        // Five flows fit a 3×2 grid: three across, then two.
+        assert_eq!(map_cell(0, 5), (MAP_MARGIN, MAP_MARGIN));
+        assert_eq!(map_cell(2, 5).1, MAP_MARGIN);
+        assert_eq!(map_cell(3, 5), (MAP_MARGIN, MAP_MARGIN + MAP_H + MAP_GAP_Y));
+        assert_eq!(map_cols(1), 1);
+        assert_eq!(map_cols(4), 2);
+        assert_eq!(map_cols(5), 3);
+
+        let (x, y) = map_cell(4, 5);
+        assert_eq!(map_hit(5, x + 1.0, y + 1.0), Some(4));
+        assert_eq!(map_hit(5, x + MAP_W + 1.0, y), None);
+        assert_eq!(map_hit(5, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn box_exit_lands_on_the_border() {
+        // Straight right leaves by the right side, straight down by the bottom.
+        assert_eq!(box_exit((0.0, 0.0), 100.0, 40.0, (500.0, 0.0)), (50.0, 0.0));
+        assert_eq!(
+            box_exit((0.0, 0.0), 100.0, 40.0, (0.0, -500.0)),
+            (0.0, -20.0)
+        );
+        // A shallow diagonal still leaves by the side it reaches first.
+        let (x, y) = box_exit((0.0, 0.0), 100.0, 40.0, (200.0, 20.0));
+        assert_eq!((x, y), (50.0, 5.0));
+        assert_eq!(box_exit((3.0, 4.0), 10.0, 10.0, (3.0, 4.0)), (3.0, 4.0));
     }
 }
