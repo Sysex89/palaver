@@ -537,6 +537,68 @@ pub fn snippet(text: &str, name: &str) -> String {
     }
 }
 
+/// One `key:value` term of a [`Doc::query`], parsed. Values are lowercased once here, so
+/// the per-node test never allocates.
+#[derive(Clone, PartialEq, Debug)]
+enum Filter {
+    Speaker(String),
+    Flow(String),
+    Kind(NodeKind),
+    Sets(String),
+    Checks(String),
+    End,
+    Aliased,
+    Start,
+    HasProblem,
+}
+
+impl Filter {
+    /// `None` when the term is not a filter at all and is plain text — no colon, a key
+    /// nobody knows, or an `is:`/`has:`/`kind:` value that matches nothing. `Some(None)`
+    /// for a known key with nothing after it yet, which filters nothing.
+    fn parse(term: &str) -> Option<Option<Filter>> {
+        let (key, value) = term.split_once(':')?;
+        let value = value.to_lowercase();
+        let key = key.to_lowercase();
+        let known = ["speaker", "flow", "kind", "sets", "checks", "is", "has"];
+        if !known.contains(&key.as_str()) {
+            return None;
+        }
+        if value.is_empty() {
+            return Some(None);
+        }
+        let filter = match key.as_str() {
+            "speaker" => Filter::Speaker(value),
+            "flow" => Filter::Flow(value),
+            "sets" => Filter::Sets(value),
+            "checks" => Filter::Checks(value),
+            "kind" => {
+                const KINDS: [(&str, NodeKind); 6] = [
+                    ("speech", NodeKind::Speech),
+                    ("hub", NodeKind::Hub),
+                    ("jump", NodeKind::Jump),
+                    ("instruction", NodeKind::Instruction),
+                    ("condition", NodeKind::Condition),
+                    ("note", NodeKind::Note),
+                ];
+                let (_, kind) = KINDS.iter().find(|(name, _)| name.starts_with(&value))?;
+                Filter::Kind(*kind)
+            }
+            "is" => match value.as_str() {
+                "end" => Filter::End,
+                "aliased" => Filter::Aliased,
+                "start" => Filter::Start,
+                _ => return None,
+            },
+            _ => match value.as_str() {
+                "problem" => Filter::HasProblem,
+                _ => return None,
+            },
+        };
+        Some(Some(filter))
+    }
+}
+
 /// Splits a variable name into the set it belongs to and the rest: everything before the
 /// first `.`, which the variables pane renders as a group header.
 ///
@@ -1087,20 +1149,108 @@ impl Doc {
             .map(|n| n.id)
     }
 
-    /// Nodes whose speaker or text contains `query`, ignoring case, in document order.
-    /// A blank query matches nothing rather than everything, so an idle search box is free.
-    // ponytail: node text only; extend to edge labels if choices need finding too.
-    pub fn find(&self, query: &str) -> Vec<NodeId> {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
+    /// The nodes a search-box query matches, in document order — Dataview-lite over the
+    /// one search field, with no new widget.
+    ///
+    /// The query is split on whitespace. A `key:value` term with a key below is a filter;
+    /// everything else is put back together and matched the way plain search always was, a
+    /// case-insensitive substring of the speaker, the text or the alias — so a query with
+    /// no colon in it behaves exactly as search did before filters existed. Terms AND
+    /// together: there is no OR and no nesting, and anything wanting either is an
+    /// expression language, which is out of scope.
+    ///
+    /// - `speaker:` — the speaker contains it, ignoring case.
+    /// - `flow:` — the node stands on that flow; `main` is the unnamed one.
+    /// - `kind:` — `speech`, `hub`, `jump`, `instruction`, `condition` or `note`, or any
+    ///   prefix of one (`kind:cond`).
+    /// - `sets:` / `checks:` — an effect or a check names that variable, through
+    ///   [`Doc::references`] so it sees exactly the fields a rename does; a set name finds
+    ///   every variable in it (`sets:shop` finds `shop.paid`).
+    /// - `is:end`, `is:aliased`, `is:start` (nothing leads here), `has:problem`.
+    ///
+    /// An unknown key, or an `is:`/`has:` value it does not know, is matched as plain text
+    /// rather than refused: `sync_fields`-style, typing toward `speaker:` must never show
+    /// an error mid-word. A key with nothing after its colon yet filters nothing. A blank
+    /// query matches nothing rather than everything, so an idle search box is free.
+    // ponytail: a value cannot hold a space — `speaker:Old Tom` is `speaker:Old` AND the
+    // text "Tom". Quoting is the upgrade if two-word names start to bite.
+    pub fn query(&self, query: &str) -> Vec<NodeId> {
+        let mut filters: Vec<Filter> = Vec::new();
+        let mut text: Vec<&str> = Vec::new();
+        for term in query.split_whitespace() {
+            match Filter::parse(term) {
+                Some(Some(filter)) => filters.push(filter),
+                // A known key with no value yet: typed, but not finished.
+                Some(None) => {}
+                None => text.push(term),
+            }
+        }
+        if filters.is_empty() && text.is_empty() {
             return Vec::new();
         }
+        let text = text.join(" ").to_lowercase();
+
+        // The two filters that need the whole document are worked out once, not per node.
+        let faulty: HashSet<NodeId> = match filters.contains(&Filter::HasProblem) {
+            true => self.problems().iter().filter_map(Problem::node).collect(),
+            false => HashSet::new(),
+        };
+        let uses = |var: &str, how: Use| -> HashSet<NodeId> {
+            let var = var.to_lowercase();
+            let mut names: Vec<String> = self
+                .variables
+                .iter()
+                .map(|v| v.name.clone())
+                .filter(|name| {
+                    let name = name.to_lowercase();
+                    name == var || split_set(&name).0 == Some(var.as_str())
+                })
+                .collect();
+            // An undeclared name a hand-edit left behind is still findable.
+            names.push(var.clone());
+            names
+                .into_iter()
+                .flat_map(|name| self.references(&Ref::Variable(name)))
+                .filter(|&(_, used)| used == how)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let named: Vec<(usize, HashSet<NodeId>)> = filters
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| match f {
+                Filter::Sets(var) => Some((i, uses(var, Use::Writes))),
+                Filter::Checks(var) => Some((i, uses(var, Use::Reads))),
+                _ => None,
+            })
+            .collect();
+
         self.nodes
             .iter()
             .filter(|n| {
-                n.speaker.to_lowercase().contains(&query)
-                    || n.text.to_lowercase().contains(&query)
-                    || n.alias.to_lowercase().contains(&query)
+                text.is_empty()
+                    || n.speaker.to_lowercase().contains(&text)
+                    || n.text.to_lowercase().contains(&text)
+                    || n.alias.to_lowercase().contains(&text)
+            })
+            .filter(|n| {
+                filters.iter().enumerate().all(|(i, filter)| match filter {
+                    Filter::Speaker(who) => n.speaker.to_lowercase().contains(who.as_str()),
+                    Filter::Flow(flow) => {
+                        n.flow.to_lowercase() == *flow
+                            || (n.flow.is_empty() && matches!(flow.as_str(), "main" | "(main)"))
+                    }
+                    Filter::Kind(kind) => n.kind == *kind,
+                    Filter::Sets(_) | Filter::Checks(_) => named
+                        .iter()
+                        .any(|(at, ids)| *at == i && ids.contains(&n.id)),
+                    Filter::End => n.end,
+                    Filter::Aliased => !n.alias.trim().is_empty(),
+                    Filter::Start => {
+                        n.kind != NodeKind::Note && !self.edges.iter().any(|e| e.to == n.id)
+                    }
+                    Filter::HasProblem => faulty.contains(&n.id),
+                })
             })
             .map(|n| n.id)
             .collect()
@@ -4206,7 +4356,7 @@ mod tests {
         let doc = Doc::sample();
 
         // "Innkeeper" is a speaker; "inn before the pass" is inside another node's text.
-        let hits = doc.find("inn");
+        let hits = doc.query("inn");
         let expected: Vec<NodeId> = doc
             .nodes
             .iter()
@@ -4227,7 +4377,7 @@ mod tests {
         doc.node_mut(id).unwrap().alias = "blacksmith_intro".into();
 
         assert_eq!(
-            doc.find("BLACKSMITH"),
+            doc.query("BLACKSMITH"),
             vec![id],
             "case-insensitive, like the rest"
         );
@@ -4236,16 +4386,16 @@ mod tests {
     #[test]
     fn find_ignores_case() {
         let doc = Doc::sample();
-        assert_eq!(doc.find("INNKEEPER"), doc.find("innkeeper"));
-        assert!(!doc.find("INNKEEPER").is_empty());
+        assert_eq!(doc.query("INNKEEPER"), doc.query("innkeeper"));
+        assert!(!doc.query("INNKEEPER").is_empty());
     }
 
     #[test]
     fn find_on_an_empty_query_returns_nothing() {
         let doc = Doc::sample();
-        assert!(doc.find("").is_empty());
-        assert!(doc.find("   ").is_empty(), "whitespace is not a match-all");
-        assert!(doc.find("no such speaker").is_empty());
+        assert!(doc.query("").is_empty());
+        assert!(doc.query("   ").is_empty(), "whitespace is not a match-all");
+        assert!(doc.query("no such speaker").is_empty());
     }
 
     #[test]
@@ -5058,5 +5208,79 @@ mod tests {
             "…to say it—Mara said"
         );
         assert_eq!(snippet("no name here", "Mara"), "no name here");
+    }
+
+    /// No colon, no change: plain search is exactly what it was.
+    #[test]
+    fn a_query_without_filters_is_plain_search() {
+        let doc = Doc::sample();
+        assert_eq!(doc.query("where am"), doc.query("  Where   am "));
+        assert_eq!(doc.query("where am").len(), 1);
+        assert!(doc.query("").is_empty());
+    }
+
+    #[test]
+    fn query_filters_by_speaker_kind_and_flag() {
+        let mut doc = Doc::sample();
+        let player = doc.query("speaker:player");
+        assert_eq!(player.len(), 2);
+        // Filters AND with each other and with the text.
+        assert_eq!(doc.query("speaker:player where").len(), 1);
+        assert_eq!(doc.query("kind:hub").len(), 1);
+        assert_eq!(doc.query("kind:cond"), doc.query("kind:condition"));
+        assert_eq!(doc.query("is:start").len(), 1);
+
+        let farewell = doc.query("safe travels")[0];
+        doc.node_mut(farewell).unwrap().end = true;
+        doc.node_mut(farewell).unwrap().alias = "bye".into();
+        assert_eq!(doc.query("is:end"), [farewell]);
+        assert_eq!(doc.query("is:aliased"), [farewell]);
+    }
+
+    #[test]
+    fn query_filters_by_flow() {
+        let mut doc = Doc::sample();
+        let moved = doc.query("where am");
+        doc.move_to_flow(&moved, "Cellar");
+        assert_eq!(doc.query("flow:cellar"), moved);
+        assert_eq!(doc.query("flow:main").len(), doc.nodes.len() - 1);
+    }
+
+    /// Through `references`, so a set name finds every variable in it and writes are kept
+    /// apart from reads.
+    #[test]
+    fn query_finds_what_sets_and_checks_a_variable() {
+        let mut doc = Doc::sample();
+        let writes = doc.query("sets:asked_about_pass");
+        let reads = doc.query("checks:asked_about_pass");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(reads.len(), 1);
+        assert_ne!(writes, reads);
+
+        doc.rename_variable("asked_about_pass", "pass.asked");
+        assert_eq!(doc.query("sets:pass"), writes);
+        assert_eq!(doc.query("sets:PASS.ASKED"), writes);
+        assert!(doc.query("sets:pas").is_empty());
+    }
+
+    #[test]
+    fn query_finds_nodes_with_problems() {
+        let doc = Doc::sample();
+        // The sample's three dead ends, and nothing else.
+        assert_eq!(doc.query("has:problem").len(), 3);
+        assert_eq!(doc.query("has:problem speaker:player").len(), 0);
+    }
+
+    /// Typing toward a filter never errors: an unknown key is text, and a known key with no
+    /// value yet filters nothing.
+    #[test]
+    fn a_half_typed_filter_is_harmless() {
+        let doc = Doc::sample();
+        assert_eq!(doc.query("speaker:"), Vec::<NodeId>::new());
+        assert_eq!(doc.query("where speaker:"), doc.query("where"));
+        // Not a key, so the whole term is text — and it is in nobody's line.
+        assert!(doc.query("mood:happy").is_empty());
+        assert!(doc.query("is:e").is_empty());
+        assert!(doc.query("kind:zzz").is_empty());
     }
 }
