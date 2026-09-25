@@ -3,8 +3,8 @@ mod text_input;
 
 use doc::{
     Cmp, Doc, FILE_EXT, FTL_EXT, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem,
-    Ref, SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, clear_backup, in_port, join_set,
-    node_center, out_port, read_backup, snippet, split_set, with_default_extension,
+    Ref, SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, clean_tag, clear_backup, in_port,
+    join_set, node_center, out_port, read_backup, snippet, split_set, with_default_extension,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -71,6 +71,7 @@ fn declare_hint(pane: SidePane) -> &'static str {
         SidePane::Variables => "New flag",
         SidePane::Cast => "New character",
         SidePane::Flows => "New flow",
+        SidePane::Tags => "Tag the selection",
     }
 }
 
@@ -285,6 +286,9 @@ enum SidePane {
     Variables,
     Cast,
     Flows,
+    /// Never declared: the list is whatever the nodes carry, so the field's `+` tags the
+    /// selection rather than adding to a list.
+    Tags,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -393,7 +397,7 @@ impl Editor {
 
         // Neither of these is document content, so they stay out of the loop above and only
         // ask for a re-render — without this, typing would not refresh what they drive.
-        let search_input = cx.new(|cx| TextInput::new("Find — or speaker: kind: is:end", cx));
+        let search_input = cx.new(|cx| TextInput::new("Find — or #tag speaker: is:end", cx));
         let var_input = cx.new(|cx| TextInput::new(declare_hint(SidePane::default()), cx));
         let value_input = cx.new(|cx| TextInput::new("0", cx));
         for input in [&search_input, &var_input, &value_input] {
@@ -1687,7 +1691,11 @@ impl Editor {
             .renaming
             .clone()
             .filter(|rename| match (rename, self.pane) {
+                (Rename::Set(set), SidePane::Tags) => self.doc.tag_sets().contains(&set.as_str()),
                 (Rename::Set(set), _) => self.doc.all_sets().contains(&set.as_str()),
+                (Rename::Item(name), SidePane::Tags) => {
+                    self.doc.all_tags().contains(&name.as_str())
+                }
                 (Rename::Item(name), SidePane::Variables) => self.doc.variable(name).is_some(),
                 (Rename::Item(name), SidePane::Cast) => self.doc.character(name).is_some(),
                 (Rename::Item(name), SidePane::Flows) => {
@@ -1697,18 +1705,34 @@ impl Editor {
         let is_rename = renaming.is_some();
         let renaming_set = matches!(renaming, Some(Rename::Set(_)));
         let pane = self.pane;
+        // Owned for the same reason the flow names are: the picker chips borrow `cx`. The
+        // Tags tab groups by the same dotted convention, so it gets the same picker.
+        let sets: Vec<String> = match pane {
+            SidePane::Tags => self.doc.tag_sets(),
+            _ => self.doc.all_sets(),
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         // Aimed at a set the document no longer has is aimed at nothing, exactly as above.
-        let set = match self.doc.all_sets().contains(&self.set.as_str()) {
+        let set = match sets.contains(&self.set) {
             true => self.set.clone(),
             false => String::new(),
         };
-        // Owned for the same reason the flow names are: the picker chips borrow `cx`.
-        let sets: Vec<String> = self
-            .doc
-            .all_sets()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let selected: Vec<NodeId> = self.selection.nodes().to_vec();
+        // Tags grouped the way variables are below, by the set in the name.
+        let mut tag_groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for tag in self.doc.all_tags() {
+            let set = split_set(tag).0.map(str::to_string);
+            match tag_groups.iter_mut().find(|(s, _)| *s == set) {
+                Some((_, rows)) => rows.push(tag.to_string()),
+                None => tag_groups.push((set, vec![tag.to_string()])),
+            }
+        }
+        // Ungrouped tags lead, then each set in order — `all_tags` is sorted, but a set's
+        // first tag can sort after a loose one.
+        tag_groups.sort_by_key(|(set, _)| set.as_ref().map(|s| s.to_lowercase()));
+        let any_tag_sets = tag_groups.iter().any(|(set, _)| set.is_some());
         // Owned, so the rows can borrow `cx` mutably. The main flow leads, then every other
         // canvas the document has — declared or merely stood on, so no node is unreachable.
         let flows: Vec<String> = std::iter::once(String::new())
@@ -1757,6 +1781,7 @@ impl Editor {
                         ),
                         (SidePane::Cast, "Cast", "pane-cast"),
                         (SidePane::Flows, "Flows", "pane-flows"),
+                        (SidePane::Tags, "Tags", "pane-tags"),
                     ]
                     .map(|(pane, label, element_id)| {
                         let on = pane == self.pane;
@@ -1801,6 +1826,63 @@ impl Editor {
                         SidePane::Cast => list.children(
                             (0..self.doc.characters.len())
                                 .map(|i| self.cast_row(i, playing.is_some(), cx)),
+                        ),
+                        SidePane::Tags if tag_groups.is_empty() => list.child(
+                            div()
+                                .text_color(rgb(0x6c6c78))
+                                .child("No tags yet. Select nodes and tag them below."),
+                        ),
+                        SidePane::Tags => list.children(
+                            tag_groups
+                                .into_iter()
+                                .enumerate()
+                                .map(|(g, (header, rows))| {
+                                    let rows: Vec<_> = rows
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, tag)| {
+                                            self.tag_row(g * 1000 + i, tag, playing.is_some(), cx)
+                                        })
+                                        .collect();
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .when(any_tag_sets, |this| {
+                                            this.child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .flex_grow()
+                                                            .text_color(rgb(0x8a8a96))
+                                                            .truncate()
+                                                            .child(header.clone().unwrap_or_else(
+                                                                || "(ungrouped)".to_string(),
+                                                            )),
+                                                    )
+                                                    .when_some(
+                                                        header.filter(|_| playing.is_none()),
+                                                        |this, name| {
+                                                            this.child(
+                                                                self.set_rename_button(&name, cx),
+                                                            )
+                                                        },
+                                                    ),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .when(any_tag_sets, |this| this.pl_2())
+                                                .children(rows),
+                                        )
+                                })
+                                .collect::<Vec<_>>(),
                         ),
                         SidePane::Flows => list.children(
                             flows
@@ -1858,7 +1940,7 @@ impl Editor {
             // Flows tab — the one a click on a flow row has just switched to.
             .map(|this| {
                 let (whose, count) = match pane {
-                    SidePane::Variables => return this,
+                    SidePane::Variables | SidePane::Tags => return this,
                     SidePane::Cast => ("Whole cast".to_string(), self.doc.stats(|_| true)),
                     SidePane::Flows => {
                         let flow = self.flow.as_str();
@@ -1894,9 +1976,12 @@ impl Editor {
                     this.child(div().text_color(rgb(0x8a8a96)).truncate().child(what))
                 })
                 // Only above the variables, and not while the field holds a set name.
-                .when(pane == SidePane::Variables && !renaming_set, |this| {
+                .when(
+                    matches!(pane, SidePane::Variables | SidePane::Tags) && !renaming_set,
+                    |this| {
                     this.child(self.set_picker(&set, &sets, cx))
-                })
+                    },
+                )
                 .child(
                 div()
                     .flex()
@@ -1923,10 +2008,23 @@ impl Editor {
                                 // name; the picker holds the set. Not when it is renaming a
                                 // set, where the field *is* the set name.
                                 let name = match (pane, renaming_set) {
-                                    (SidePane::Variables, false) => join_set(&set, typed.trim()),
+                                    (SidePane::Variables | SidePane::Tags, false) => {
+                                        join_set(&set, typed.trim())
+                                    }
                                     _ => typed,
                                 };
-                                let free = match (pane, renaming_set) {
+                                let free = match (pane, &renaming) {
+                                    // A tag rename merges rather than refuses, so the only
+                                    // question is whether it would change anything; a new
+                                    // tag goes onto the selection, and only if some of it
+                                    // lacks it.
+                                    (SidePane::Tags, Some(Rename::Item(old) | Rename::Set(old))) => {
+                                        this.doc.tag_rename_ok(old, &name)
+                                    }
+                                    (SidePane::Tags, None) => this.doc.can_tag(&selected, &name),
+                                    _ => true,
+                                } && match (pane, renaming_set) {
+                                    (SidePane::Tags, _) => true,
                                     (_, true) => this.doc.set_name_free(&name),
                                     (SidePane::Cast, _) => this.doc.character_name_free(&name),
                                     (SidePane::Variables, _) => {
@@ -1939,6 +2037,31 @@ impl Editor {
                                 }
                                 this.doc.checkpoint();
                                 match (&renaming, pane) {
+                                    // A tag, or a whole group of them: every node carrying
+                                    // one follows, and the search that found them too.
+                                    (Some(Rename::Item(old) | Rename::Set(old)), SidePane::Tags) => {
+                                        let moved = this.doc.rename_tag(old, &name);
+                                        let s = if moved == 1 { "" } else { "s" };
+                                        let name = clean_tag(&name).unwrap_or_default();
+                                        if this.set == *old {
+                                            this.set = name.clone();
+                                        }
+                                        this.set_status(
+                                            format!(
+                                                "Renamed #{old} to #{name} — {moved} node{s}."
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                    (None, SidePane::Tags) => {
+                                        let tagged = this.doc.add_tag(&selected, &name);
+                                        let s = if tagged == 1 { "" } else { "s" };
+                                        let name = clean_tag(&name).unwrap_or_default();
+                                        this.set_status(
+                                            format!("Tagged {tagged} node{s} #{name}."),
+                                            cx,
+                                        );
+                                    }
                                     // Every dotted name in the set follows, and so does
                                     // every effect and check naming one.
                                     (Some(Rename::Set(old)), _) => {
@@ -2489,6 +2612,144 @@ impl Editor {
                 )
             });
         div().flex().flex_col().child(row).children(open)
+    }
+
+    /// One row of the Tags tab: the tag, how many nodes carry it (the "Used by" toggle), a
+    /// `+` that puts it on the selection when some of it lacks the tag — the picking half,
+    /// so an existing tag is clicked rather than retyped — and rename. Clicking the name
+    /// searches for it. There is no remove: a tag nobody carries is not in the list, so
+    /// taking it off the nodes (from the inspector) is the whole of removing one.
+    fn tag_row(
+        &self,
+        i: usize,
+        tag: String,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let target = Ref::Tag(tag.clone());
+        let used_by = self.used_by_toggle(("tag-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
+        let can_tag = self.doc.can_tag(self.selection.nodes(), &tag);
+        let shown = format!("#{}", split_set(&tag).1);
+        let (to_find, to_add, to_rename) = (tag.clone(), tag.clone(), tag);
+
+        let row = div()
+            .flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .id(("tag-name", i))
+                    .flex_grow()
+                    .truncate()
+                    .cursor_pointer()
+                    .text_color(rgb(0xb8b8c4))
+                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .child(shown)
+                    // Only the search box changes, so no checkpoint.
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let query = format!("tag:{to_find}");
+                        this.search_input
+                            .update(cx, |input, cx| input.set_content(&query, cx));
+                        cx.notify();
+                    })),
+            )
+            .child(used_by)
+            .when(!playing && can_tag, |this| {
+                this.child(
+                    div()
+                        .id(("tag-add", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("+")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let ids = this.selection.nodes().to_vec();
+                            if !this.doc.can_tag(&ids, &to_add) {
+                                return;
+                            }
+                            this.doc.checkpoint();
+                            let tagged = this.doc.add_tag(&ids, &to_add);
+                            let s = if tagged == 1 { "" } else { "s" };
+                            this.set_status(format!("Tagged {tagged} node{s} #{to_add}."), cx);
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!playing, |this| {
+                this.child(
+                    div()
+                        .id(("tag-rename", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(0x6c6c78))
+                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .child("\u{270e}")
+                        // Not an edit yet, so no checkpoint — it only aims the shared field,
+                        // which holds the whole tag, set and all, as a flow rename does.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.renaming = Some(Rename::Item(to_rename.clone()));
+                            this.set = String::new();
+                            this.var_input
+                                .update(cx, |input, cx| input.set_content(&to_rename, cx));
+                            cx.notify();
+                        })),
+                )
+            });
+        div().flex().flex_col().child(row).children(open)
+    }
+
+    /// The inspector's tags: one chip per tag the node carries, each with a `×` that takes
+    /// it off. Tags are put *on* from the Tags tab, which works for a whole selection.
+    fn tag_chips(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let tags = self
+            .doc
+            .node(id)
+            .map(|node| node.tags.clone())
+            .unwrap_or_default();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .items_center()
+            .child(div().text_color(rgb(0x8a8a96)).mr_1().child("Tags"))
+            .when(tags.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x6c6c78))
+                        .child("none — add from the Tags tab"),
+                )
+            })
+            .children(tags.into_iter().enumerate().map(|(i, tag)| {
+                let label = format!("#{tag}");
+                div()
+                    .flex()
+                    .gap_1()
+                    .px_2()
+                    .rounded_sm()
+                    .bg(rgb(0x2b2b33))
+                    .text_color(rgb(0xb8b8c4))
+                    .child(label)
+                    .child(
+                        div()
+                            .id(("tag-off", i))
+                            .cursor_pointer()
+                            .text_color(rgb(0x6c6c78))
+                            .hover(|style| style.text_color(rgb(0xff7a7a)))
+                            .child("\u{d7}")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.doc.node(id).is_some_and(|n| n.tags.contains(&tag)) {
+                                    return;
+                                }
+                                this.doc.checkpoint();
+                                this.doc.remove_tag(id, &tag);
+                                cx.notify();
+                            })),
+                    )
+            }))
     }
 
     /// One row of the cast list: the character's colour, their name, and the rename and
@@ -3427,6 +3688,8 @@ impl Editor {
                         .when(kind == NodeKind::Speech, |this| {
                             this.child(self.end_toggle(id, cx))
                         })
+                        // Every kind, like the alias: a tag is orthogonal to `NodeKind`.
+                        .child(self.tag_chips(id, cx))
                         // A note takes no edges, so nothing can ever lead to one.
                         .when(kind != NodeKind::Note, |this| {
                             this.child(div().text_color(rgb(0x8a8a96)).child("Linked from"))
@@ -3882,6 +4145,27 @@ fn node_box(
                         .line_clamp(4)
                         .child(node.text.clone()),
                 ),
+        })
+        // The first tag in a corner, over whatever text runs under it, so `#todo` can be
+        // seen without selecting anything — and the box stays `NODE_W`×`NODE_H`, since
+        // kinds and tags change what a node draws, never how big it is.
+        .when_some(node.tags.first(), |this, first| {
+            let more = match node.tags.len() {
+                1 => String::new(),
+                n => format!(" +{}", n - 1),
+            };
+            this.child(
+                div()
+                    .absolute()
+                    .right(px(4.0))
+                    .bottom(px(2.0))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(0x2b2b33))
+                    .text_size(px(view.scale(BASE_TEXT * 0.8)))
+                    .text_color(rgb(0x7a8aa6))
+                    .child(format!("#{first}{more}")),
+            )
         })
 }
 
