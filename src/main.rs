@@ -393,7 +393,7 @@ impl Editor {
 
         // Neither of these is document content, so they stay out of the loop above and only
         // ask for a re-render — without this, typing would not refresh what they drive.
-        let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
+        let search_input = cx.new(|cx| TextInput::new("Find — or speaker: kind: is:end", cx));
         let var_input = cx.new(|cx| TextInput::new(declare_hint(SidePane::default()), cx));
         let value_input = cx.new(|cx| TextInput::new("0", cx));
         for input in [&search_input, &var_input, &value_input] {
@@ -1583,7 +1583,7 @@ impl Editor {
         let query = self.search_input.read(cx).content().to_string();
         // ponytail: rescans every node each frame, but only while a query is active — which
         // is never while dragging. Cache it if searching a huge graph ever stutters.
-        let hits = self.doc.find(&query);
+        let hits = self.doc.query(&query);
         let more = hits.len().saturating_sub(MAX_ROWS);
 
         // An idle search box lists the bookmarks instead: every aliased node, the author's
@@ -1638,11 +1638,14 @@ impl Editor {
                     })
             })
             .when(!query.trim().is_empty(), |this| {
-                this.when(hits.is_empty(), |this| {
-                    this.child(div().text_color(rgb(0x6c6c78)).child("No matches."))
-                })
+                // A filter can catch a lot more than a word does, so say how much.
+                this.child(div().text_color(rgb(0x6c6c78)).child(match hits.len() {
+                    0 => "No matches.".to_string(),
+                    1 => "1 match".to_string(),
+                    n => format!("{n} matches"),
+                }))
                 .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
-                    let label = node_label(&self.doc, self.doc.node(id)?);
+                    let label = ref_label(&self.doc, self.doc.node(id)?);
                     Some(
                         div()
                             .id(("search-result", id))
