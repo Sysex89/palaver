@@ -518,7 +518,7 @@ impl Editor {
                         // Recovered work is still unsaved work, and `checkpoint` is the only
                         // thing that says so. The price is a first undo that restores the
                         // state it was already in.
-                        this.doc.checkpoint();
+                        this.checkpoint();
                     })
                     .ok();
                 }
@@ -842,7 +842,16 @@ impl Editor {
         cx.notify();
     }
 
-    // ponytail: one undo checkpoint per editing session, not per keystroke.
+    /// Every discrete edit checkpoints through here rather than on `doc` directly: it also
+    /// ends the typing session, so text typed *after* the edit gets an undo step of its own
+    /// instead of riding on the edit's and vanishing with it on the first Ctrl+Z.
+    fn checkpoint(&mut self) {
+        self.doc.checkpoint();
+        self.text_dirty = false;
+    }
+
+    // ponytail: one undo checkpoint per editing session, not per keystroke. On `doc`
+    // directly, since this *is* the typing session the wrapper above ends.
     fn checkpoint_once(&mut self) {
         if !self.text_dirty {
             self.doc.checkpoint();
@@ -979,6 +988,7 @@ impl Editor {
             }
             let node = self.doc.node(id).expect("hit_test returned a live node");
             let grab = (x - node.x, y - node.y);
+            let kind = node.kind;
             // Grabbing a node that is already selected keeps the set, which is what
             // makes a group drag possible; grabbing any other node replaces it.
             if !self.selection.nodes().contains(&id) {
@@ -989,15 +999,20 @@ impl Editor {
                 grab,
                 moved: false,
             });
-            if ev.click_count == 2 {
+            // Only where the inspector draws the Text field: focus on a field that is not
+            // rendered lands nowhere, and every shortcut is dead until the canvas is
+            // clicked again.
+            if ev.click_count == 2 && has_text_field(kind) {
                 window.focus(&self.text_input.read(cx).focus_handle(cx));
             }
         } else if let Some(index) = self.doc.edge_at(&self.flow, x, y) {
             self.select(Selection::Edge(index), cx);
             self.drag = None;
         } else if ev.click_count == 2 {
-            self.doc.checkpoint();
-            let id = self.doc.add_node(x, y);
+            self.checkpoint();
+            // Onto the canvas being looked at: `add_node` alone lands on the main flow,
+            // where a node made on any other canvas would be selected but invisible.
+            let id = self.doc.add_node_on(&self.flow, x, y);
             self.select(Selection::Nodes(vec![id]), cx);
             self.drag = None;
             window.focus(&self.speaker_input.read(cx).focus_handle(cx));
@@ -1020,12 +1035,15 @@ impl Editor {
         match self.drag.take() {
             Some(Drag::Edge { from, .. }) => {
                 let (x, y) = self.doc_pos(ev.position);
+                // Asked before the checkpoint: a drop the model refuses — onto a note,
+                // back onto the node itself, over an edge that exists — must leave no
+                // empty undo step and select nothing, least of all whichever edge is last
+                // in the file. A jump that already has a target is pointed at the new one.
                 if let Some(to) = self.doc.hit_test(&self.flow, x, y)
-                    && from != to
-                    && !self.doc.has_edge(from, to)
+                    && self.doc.can_link(from, to)
                 {
-                    self.doc.checkpoint();
-                    self.doc.add_edge(from, to);
+                    self.checkpoint();
+                    self.doc.link(from, to);
                     self.select(Selection::Edge(self.doc.edges.len() - 1), cx);
                 }
             }
@@ -1052,7 +1070,7 @@ impl Editor {
             Drag::Node { id, grab, moved } => {
                 // Checkpoint on the first movement, so a plain click leaves no empty undo entry.
                 if !moved {
-                    self.doc.checkpoint();
+                    self.checkpoint();
                     self.drag = Some(Drag::Node {
                         id,
                         grab,
@@ -1101,7 +1119,7 @@ impl Editor {
             return;
         }
         // One checkpoint for the whole set, so a group deletion is a single undo step.
-        self.doc.checkpoint();
+        self.checkpoint();
         match self.selection.clone() {
             Selection::Nodes(ids) => ids.iter().for_each(|id| self.doc.remove_node(*id)),
             Selection::Edge(index) => self.doc.remove_edge(index),
@@ -1220,16 +1238,17 @@ impl Editor {
         self.flow_map = false;
         // Guard before the checkpoint: one whose mutation then fails is an empty undo
         // step and a false dirty flag.
-        // A note takes no edges, so it can never branch off the selection: it always lands
-        // in the middle of the view. Without this the branch would be created and the edge
-        // silently refused, leaving the note parked where a child would have gone.
+        // A note takes no edges, so it can never branch off the selection, nor can
+        // anything branch off a note — nor off a jump that has its one target. Without
+        // the guard the node would be made and its edge silently refused, an orphan parked
+        // where a child would have gone. All three land in the middle of the view instead.
         let parent = self
             .selection
             .only_node()
             .filter(|_| kind != NodeKind::Note)
-            .filter(|id| self.doc.node(*id).is_some());
+            .filter(|id| self.doc.can_branch(*id));
 
-        self.doc.checkpoint();
+        self.checkpoint();
         let id = match parent {
             Some(from) => match self.doc.branch_from(from) {
                 Some(id) => id,
@@ -1237,17 +1256,12 @@ impl Editor {
             },
             None => {
                 // Centred on the view rather than parked at its origin, so the node lands
-                // where you are already looking.
+                // where you are already looking, and onto the canvas being looked at. The
+                // branch arm needs no equivalent: `branch_from` inherits the parent's, and
+                // switching canvas drops the selection, so a parent is always on this one.
                 let (x, y) = self.view.to_doc(Self::pane_center(window));
-                let id = self.doc.add_node(x - NODE_W / 2.0, y - NODE_H / 2.0);
-                // Onto the canvas being looked at. The branch arm needs no equivalent:
-                // `branch_from` inherits the parent's, and switching canvas drops the
-                // selection, so a parent is always on this one.
-                let flow = self.flow.clone();
-                if let Some(node) = self.doc.node_mut(id) {
-                    node.flow = flow;
-                }
-                id
+                self.doc
+                    .add_node_on(&self.flow, x - NODE_W / 2.0, y - NODE_H / 2.0)
             }
         };
         if let Some(node) = self.doc.node_mut(id) {
@@ -1303,7 +1317,7 @@ impl Editor {
     /// is what lets `Doc::vars_along` recompute the variables from the path alone.
     fn start_play(&mut self, at: NodeId, window: &Window, cx: &mut Context<Self>) {
         let path = self.doc.start_walk(at);
-        self.follow(&path, window);
+        self.follow(&path, window, cx);
         self.play = Some(path);
         cx.notify();
     }
@@ -1314,30 +1328,39 @@ impl Editor {
             return;
         };
         self.doc.advance(&mut path, to);
-        self.follow(&path, window);
+        self.follow(&path, window, cx);
         self.play = Some(path);
         cx.notify();
     }
 
     /// Brings the node a play-through has arrived at into view.
-    fn follow(&mut self, path: &[NodeId], window: &Window) {
+    fn follow(&mut self, path: &[NodeId], window: &Window, cx: &mut Context<Self>) {
         if let Some(&at) = path.last() {
-            self.show(at, window);
+            self.show(at, window, cx);
         }
     }
 
-    /// Brings a node into view without touching the selection — which is what separates
-    /// following a play-through from [`Editor::jump_to`].
+    /// Brings a node into view without touching the selection on the canvas it is on —
+    /// which is what separates following a play-through from [`Editor::jump_to`].
     /// Switching the canvas lives here rather than in each caller: `jump_to` and `follow`
     /// both come through, so a search hit, a problem row and a play-through that walks into
-    /// another flow all cross canvases without an arm of their own.
-    fn show(&mut self, id: NodeId, window: &Window) {
-        if let Some(node) = self.doc.node(id) {
-            self.flow_map = false;
-            self.flow.clone_from(&node.flow);
-            self.view
-                .center_on(node_center(node), Self::pane_center(window));
+    /// another flow all cross canvases without an arm of their own. Crossing drops the
+    /// selection, as a click on the Flows tab does: what was selected on the canvas left
+    /// behind is neither drawn nor hit-testable, and Delete or Tab would work it unseen.
+    fn show(&mut self, id: NodeId, window: &Window, cx: &mut Context<Self>) {
+        let Some((flow, center)) = self
+            .doc
+            .node(id)
+            .map(|node| (node.flow.clone(), node_center(node)))
+        else {
+            return;
+        };
+        self.flow_map = false;
+        if self.flow != flow {
+            self.flow = flow;
+            self.select(Selection::None, cx);
         }
+        self.view.center_on(center, Self::pane_center(window));
     }
 
     /// Selects a node and brings it into view without changing zoom.
@@ -1345,8 +1368,20 @@ impl Editor {
         if self.doc.node(id).is_none() {
             return;
         }
-        self.show(id, window);
+        self.show(id, window, cx);
         self.select(Selection::Nodes(vec![id]), cx);
+        cx.notify();
+    }
+
+    /// Selects an edge and brings the node it leaves into view: for a choice found in
+    /// prose, and for a fault about an edge nothing draws — a cross-flow edge above all —
+    /// which, selected, can at least be deleted, and whose ends the inspector names.
+    fn select_edge(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) {
+        let Some(from) = self.doc.edges.get(index).map(|edge| edge.from) else {
+            return;
+        };
+        self.show(from, window, cx);
+        self.select(Selection::Edge(index), cx);
         cx.notify();
     }
 
@@ -1374,7 +1409,7 @@ impl Editor {
         };
         let first = self.doc.nodes_in(&flow).next().map(|node| node.id);
         match first {
-            Some(first) => self.show(first, window),
+            Some(first) => self.show(first, window, cx),
             None => {
                 self.flow = flow;
                 self.flow_map = false;
@@ -1552,6 +1587,11 @@ impl Render for Editor {
             .flex_col()
             .size_full()
             .text_sm()
+            // Here and not in `canvas_pane` with the rest: an action reaches only the
+            // listeners between the root and the focused element, and Escape asks for the
+            // canvas back from a text field, which lives in a side pane beside the canvas
+            // pane rather than under it. The root is above all of them.
+            .on_action(cx.listener(Self::on_focus_canvas))
             .child(self.menu_bar(cx))
             .child(
                 div()
@@ -1634,7 +1674,6 @@ impl Editor {
             .on_action(cx.listener(Self::on_new_instruction))
             .on_action(cx.listener(Self::on_new_condition))
             .on_action(cx.listener(Self::on_new_note))
-            .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
@@ -2261,7 +2300,7 @@ impl Editor {
                                 if !free {
                                     return;
                                 }
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 match (&renaming, pane) {
                                     // A tag, or a whole group of them: every node carrying
                                     // one follows, and the search that found them too.
@@ -2406,17 +2445,34 @@ impl Editor {
     /// not a target any more, which is the filtering `renaming` gets and for the same reason:
     /// one place, rather than every site that could invalidate it.
     fn editing_target(&self) -> Option<&ValueTarget> {
+        // And still a number: retyped to a flag, the variable's row draws a checkbox with
+        // no editor in it, and an editor left aimed at it would write a number onto a flag.
+        let is_int = |name: &str| {
+            self.doc
+                .variable(name)
+                .is_some_and(|variable| matches!(variable.default, Value::Int(_)))
+        };
         self.editing.as_ref().filter(|target| match target {
-            ValueTarget::Default(name) => self.doc.variable(name).is_some(),
-            ValueTarget::Effect(id, _) | ValueTarget::Check(id, _) => self.doc.node(*id).is_some(),
+            ValueTarget::Default(name) => is_int(name),
+            ValueTarget::Effect(id, name) | ValueTarget::Check(id, name) => {
+                self.doc.node(*id).is_some() && is_int(name)
+            }
         })
     }
 
-    /// Aims the number editor at `target`, starting from the number that is there now.
-    fn edit_value(&mut self, target: ValueTarget, from: i64, cx: &mut Context<Self>) {
+    /// Aims the number editor at `target`, starting from the number that is there now, and
+    /// puts the cursor in it.
+    fn edit_value(
+        &mut self,
+        target: ValueTarget,
+        from: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editing = Some(target);
         self.value_input
             .update(cx, |input, cx| input.set_content(&from.to_string(), cx));
+        window.focus(&self.value_input.read(cx).focus_handle(cx));
         cx.notify();
     }
 
@@ -2436,15 +2492,16 @@ impl Editor {
             .text_color(rgb(0xf7c96a))
             .hover(|style| style.bg(rgb(0x33333c)))
             .child(n.to_string())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.edit_value(target.clone(), n, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.edit_value(target.clone(), n, window, cx);
             }))
     }
 
-    /// The number field and its commit button, drawn in place of whatever value the author
-    /// clicked. One field for the whole crate, so there is never a second half-typed number
-    /// lying around. A number that will not parse is simply refused, and the field keeping
-    /// its content is what says so — the same idiom as a duplicate variable name.
+    /// The number field, its commit button and its cancel button, drawn in place of
+    /// whatever value the author clicked. One field for the whole crate, so there is never
+    /// a second half-typed number lying around. A number that will not parse is simply
+    /// refused, and the field keeping its content is what says so — the same idiom as a
+    /// duplicate variable name; `✗` puts the number that was there back.
     fn value_editor(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let target = self.editing.clone();
         div()
@@ -2462,7 +2519,12 @@ impl Editor {
                     .hover(|style| style.text_color(rgb(0xd6d6dd)))
                     .child("✓")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(target) = target.clone() else {
+                        // Checked again at the click and not only at render, since the
+                        // document can move on between the two.
+                        let Some(target) = target
+                            .clone()
+                            .filter(|target| this.editing_target() == Some(target))
+                        else {
                             return;
                         };
                         let Ok(n) = this.value_input.read(cx).content().trim().parse::<i64>()
@@ -2470,7 +2532,7 @@ impl Editor {
                             return;
                         };
                         let value = Value::Int(n);
-                        this.doc.checkpoint();
+                        this.checkpoint();
                         match &target {
                             ValueTarget::Default(name) => this.doc.set_default(name, value),
                             // The operator is not what is being edited here, so it is read
@@ -2484,6 +2546,21 @@ impl Editor {
                                 this.doc.set_condition(*id, name, Some(value), op);
                             }
                         }
+                        this.editing = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("value-cancel")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(0x6c6c78))
+                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .child("✗")
+                    // Not an edit, so no checkpoint: nothing was written yet.
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.editing = None;
                         cx.notify();
                     })),
@@ -2608,7 +2685,7 @@ impl Editor {
                         this.cursor_pointer()
                             .hover(|style| style.text_color(rgb(0xd6d6dd)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 this.doc.set_default(&name, Value::Bool(!on));
                                 cx.notify();
                             }))
@@ -2653,7 +2730,7 @@ impl Editor {
                         .hover(|style| style.text_color(rgb(0xd6d6dd)))
                         .child("#")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             let to = if is_int {
                                 Value::Bool(false)
                             } else {
@@ -2702,7 +2779,7 @@ impl Editor {
                         .hover(|style| style.text_color(rgb(0xff7a7a)))
                         .child("×")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             // Effects naming it go with it, so say how many.
                             let dropped = this.doc.remove_variable(&to_remove);
                             if dropped > 0 {
@@ -2783,7 +2860,7 @@ impl Editor {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let ids = this.selection.nodes().to_vec();
                             let count = ids.len();
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             this.doc.move_to_flow(&ids, &to_move);
                             let s = if count == 1 { "" } else { "s" };
                             // The nodes just left this canvas, so nothing is selected on it.
@@ -2823,7 +2900,7 @@ impl Editor {
                         // The nodes come back to the main flow rather than going with it:
                         // deleting a canvas must not delete what is drawn on it.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             let moved = this.doc.remove_flow(&to_remove);
                             if this.flow == *to_remove {
                                 this.flow.clear();
@@ -2896,7 +2973,7 @@ impl Editor {
                             if !this.doc.can_tag(&ids, &to_add) {
                                 return;
                             }
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             let tagged = this.doc.add_tag(&ids, &to_add);
                             let s = if tagged == 1 { "" } else { "s" };
                             this.set_status(format!("Tagged {tagged} node{s} #{to_add}."), cx);
@@ -2914,13 +2991,16 @@ impl Editor {
                         .text_color(rgb(0x6c6c78))
                         .hover(|style| style.text_color(rgb(0xd6d6dd)))
                         .child("\u{270e}")
-                        // Not an edit yet, so no checkpoint — it only aims the shared field,
-                        // which holds the whole tag, set and all, as a flow rename does.
+                        // Not an edit yet, so no checkpoint — it only aims the shared field.
+                        // Split the way the declare field is joined, as a variable's rename
+                        // is: the picker holds the set, so a chip clicked mid-rename moves
+                        // the tag between sets rather than prefixing the set a second time.
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            let (set, rest) = split_set(&to_rename);
+                            this.set = set.unwrap_or_default().to_string();
                             this.renaming = Some(Rename::Item(to_rename.clone()));
-                            this.set = String::new();
                             this.var_input
-                                .update(cx, |input, cx| input.set_content(&to_rename, cx));
+                                .update(cx, |input, cx| input.set_content(rest, cx));
                             cx.notify();
                         })),
                 )
@@ -2970,7 +3050,7 @@ impl Editor {
                                 if !this.doc.node(id).is_some_and(|n| n.tags.contains(&tag)) {
                                     return;
                                 }
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 this.doc.remove_tag(id, &tag);
                                 cx.notify();
                             })),
@@ -3023,7 +3103,7 @@ impl Editor {
                                 let at = CAST_COLORS.iter().position(|c| *c == color);
                                 let next =
                                     CAST_COLORS[at.map_or(0, |at| (at + 1) % CAST_COLORS.len())];
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 this.doc.set_character_color(&to_recolor, next);
                                 cx.notify();
                             }))
@@ -3070,7 +3150,7 @@ impl Editor {
                         // Undeclaring only: the nodes keep saying the name, and the problem
                         // list is what points out that nobody declared it.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             this.doc.remove_character(&to_remove);
                             cx.notify();
                         })),
@@ -3244,12 +3324,9 @@ impl Editor {
             .take(MAX_ROWS)
             .enumerate()
             .filter_map(|(row, at)| {
-                let (text, node) = match at {
-                    Mention::Node(id) => (self.doc.node(id)?.text.as_str(), id),
-                    Mention::Edge(index) => {
-                        let edge = self.doc.edges.get(index)?;
-                        (edge.label.as_str(), edge.from)
-                    }
+                let text = match at {
+                    Mention::Node(id) => self.doc.node(id)?.text.as_str(),
+                    Mention::Edge(index) => self.doc.edges.get(index)?.label.as_str(),
                 };
                 let quote = snippet(text, &name);
                 let label = match at {
@@ -3270,11 +3347,7 @@ impl Editor {
                             Mention::Node(id) => this.jump_to(id, window, cx),
                             // A choice is found on the canvas at the node it leaves, and
                             // selected as itself so the Choice field is right there.
-                            Mention::Edge(index) => {
-                                this.show(node, window);
-                                this.select(Selection::Edge(index), cx);
-                                cx.notify();
-                            }
+                            Mention::Edge(index) => this.select_edge(index, window, cx),
                         })),
                 )
             })
@@ -3469,7 +3542,7 @@ impl Editor {
                                     return;
                                 };
                                 this.doc.step_back(&mut path);
-                                this.follow(&path, window);
+                                this.follow(&path, window, cx);
                                 this.play = Some(path);
                                 cx.notify();
                             }),
@@ -3528,11 +3601,20 @@ impl Editor {
                                 .truncate()
                                 .text_color(color)
                                 .child(problem_text(problem, &self.doc))
-                                // A dangling edge has no live node to jump to, so its row is inert.
                                 .when_some(problem.node(), |this, id| {
                                     this.hover(|style| style.bg(rgb(0x33333c))).on_click(
                                         cx.listener(move |this, _, window, cx| {
                                             this.jump_to(id, window, cx)
+                                        }),
+                                    )
+                                })
+                                // A fault about an edge selects the edge: a cross-flow
+                                // edge is drawn on neither canvas, so this row is the one
+                                // way to reach it and delete it.
+                                .when_some(problem.edge(), |this, index| {
+                                    this.hover(|style| style.bg(rgb(0x33333c))).on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.select_edge(index, window, cx)
                                         }),
                                     )
                                 })
@@ -3582,7 +3664,7 @@ impl Editor {
                         if this.doc.node(id).is_none_or(|node| node.kind == kind) {
                             return;
                         }
-                        this.doc.checkpoint();
+                        this.checkpoint();
                         if let Some(node) = this.doc.node_mut(id) {
                             node.kind = kind;
                         }
@@ -3698,7 +3780,7 @@ impl Editor {
                                     .child(glyph)
                                     .child(variable.name.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.doc.checkpoint();
+                                        this.checkpoint();
                                         // One gesture per side, both ending back at cleared:
                                         // a flag cycles its two states, a number cycles its
                                         // operators and keeps whatever value it already had.
@@ -3795,7 +3877,7 @@ impl Editor {
                 if this.doc.edges.get(index).is_none() {
                     return;
                 }
-                this.doc.checkpoint();
+                this.checkpoint();
                 this.doc.edges[index].branch = !this.doc.edges[index].branch;
                 cx.notify();
             }))
@@ -3818,7 +3900,7 @@ impl Editor {
                 if this.doc.edges.get(index).is_none() {
                     return;
                 }
-                this.doc.checkpoint();
+                this.checkpoint();
                 this.doc.edges[index].once = !this.doc.edges[index].once;
                 cx.notify();
             }))
@@ -3841,7 +3923,7 @@ impl Editor {
                 if this.doc.node(id).is_none() {
                     return;
                 }
-                this.doc.checkpoint();
+                this.checkpoint();
                 if let Some(node) = this.doc.node_mut(id) {
                     node.end = !node.end;
                 }
@@ -3894,17 +3976,14 @@ impl Editor {
                         .when(kind == NodeKind::Speech, |this| {
                             this.child(field("Speaker", &self.speaker_input))
                         })
-                        .when(
-                            matches!(kind, NodeKind::Speech | NodeKind::Hub | NodeKind::Note),
-                            |this| {
-                                let label = match kind {
-                                    NodeKind::Hub => "Label",
-                                    NodeKind::Note => "Note",
-                                    _ => "Text",
-                                };
-                                this.child(field(label, &self.text_input))
-                            },
-                        )
+                        .when(has_text_field(kind), |this| {
+                            let label = match kind {
+                                NodeKind::Hub => "Label",
+                                NodeKind::Note => "Note",
+                                _ => "Text",
+                            };
+                            this.child(field(label, &self.text_input))
+                        })
                         .when(kind == NodeKind::Instruction, |this| {
                             this.child(self.var_rows(id, VarRow::Sets, cx))
                         })
@@ -4045,12 +4124,25 @@ fn node_number(doc: &Doc, id: NodeId) -> String {
 
 /// How a node reads in a list: what it says, or who says it, or its position as a last resort.
 fn node_label(doc: &Doc, node: &Node) -> String {
-    match (node.speaker.trim(), node.text.trim()) {
+    // Only a speech node has a speaker: a hub converted from one still carries the
+    // field, and must not read as a line somebody says.
+    let speaker = match node.kind {
+        NodeKind::Speech => node.speaker.trim(),
+        _ => "",
+    };
+    match (speaker, node.text.trim()) {
         ("", "") => node_number(doc, node.id),
         ("", text) => text.to_string(),
         (speaker, "") => speaker.to_string(),
         (speaker, text) => format!("{speaker} — {text}"),
     }
+}
+
+/// The kinds whose Text field the inspector draws — and so the only ones a double-click
+/// may send the keyboard into. Focus on a field that is not rendered lands nowhere, and
+/// every shortcut is dead until the canvas is clicked again.
+fn has_text_field(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::Speech | NodeKind::Hub | NodeKind::Note)
 }
 
 /// How a node reads in a "Used by" row: what it says, or, for the logic kinds that say
@@ -4097,7 +4189,16 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         None => node_number(doc, id),
     };
     match problem {
-        Problem::CrossFlowEdge(_) => "Edge between two flows".to_string(),
+        // Named by its ends, since it is drawn on neither canvas: the row is how the
+        // author finds it at all.
+        Problem::CrossFlowEdge(index) => match doc.edges.get(*index) {
+            Some(edge) => format!(
+                "Edge between two flows: {} → {}",
+                label(edge.from),
+                label(edge.to)
+            ),
+            None => "Edge between two flows".to_string(),
+        },
         Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
         Problem::NoStart => "No start node — every node is linked to".into(),
         Problem::Unreachable(id) => format!("Unreachable: {}", label(*id)),
