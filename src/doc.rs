@@ -565,18 +565,32 @@ pub enum Mention {
 /// so "Mara" is found in "Ask Mara." and "Mara's key" but not in "Marathon"; a name with a
 /// space in it ("Old Tom") matches as a phrase. A blank name is found nowhere.
 pub fn find_word(text: &str, name: &str) -> Option<usize> {
-    let name: Vec<char> = name.trim().to_lowercase().chars().collect();
+    let name: Vec<char> = fold(name.trim()).map(|(_, c)| c).collect();
     if name.is_empty() {
         return None;
     }
-    // Char-wise rather than on the lowercased string, since lowercasing can change a
-    // string's byte length and an index into one would not fit the other.
-    let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    let (origin, text): (Vec<usize>, Vec<char>) = fold(text).unzip();
     let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
-    (0..text.len().saturating_sub(name.len() - 1)).find(|&at| {
-        text[at..].starts_with(&name)
-            && !word(at.checked_sub(1).and_then(|b| text.get(b)))
-            && !word(text.get(at + name.len()))
+    (0..text.len().saturating_sub(name.len() - 1))
+        .find(|&at| {
+            text[at..].starts_with(&name)
+                && !word(at.checked_sub(1).and_then(|b| text.get(b)))
+                && !word(text.get(at + name.len()))
+        })
+        .map(|at| origin[at])
+}
+
+/// `text` lowercased char by char, each paired with the index of the char it came from.
+/// The pairing is what makes [`find_word`]'s answer an index into the *original*:
+/// lowercasing can turn one char into two (`İ`), so an index into the folded text does not
+/// fit the text it came from. The same fold on both sides is what keeps a name in capitals
+/// findable — Greek writes `Σ` as `ς` at the end of a word and `σ` elsewhere, and a
+/// string-wise lowercase picks one while a char-wise one picks the other, so the final
+/// form is folded onto the other here.
+fn fold(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    text.chars().enumerate().flat_map(|(at, c)| {
+        c.to_lowercase()
+            .map(move |c| (at, if c == 'ς' { 'σ' } else { c }))
     })
 }
 
@@ -651,7 +665,11 @@ impl Filter {
             "flow" => Filter::Flow(value),
             "sets" => Filter::Sets(value),
             "checks" => Filter::Checks(value),
-            "tag" => Filter::Tag(value.trim_start_matches('#').to_string()),
+            // `tag:#` is a tag not typed yet, not a prefix every tag starts with.
+            "tag" => match value.trim_start_matches('#') {
+                "" => return Some(None),
+                tag => Filter::Tag(tag.to_string()),
+            },
             "kind" => {
                 const KINDS: [(&str, NodeKind); 6] = [
                     ("speech", NodeKind::Speech),
@@ -809,6 +827,17 @@ impl Problem {
             | Problem::UnwiredBranch(id, _)
             | Problem::DuplicateAlias(id, _)
             | Problem::UnknownSpeaker(id, _) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// The edge to select, when the problem is about one — so a fault nothing draws, a
+    /// cross-flow edge above all, can still be reached and deleted.
+    pub fn edge(&self) -> Option<usize> {
+        match self {
+            Problem::DanglingEdge(index)
+            | Problem::DuplicateEdge(index)
+            | Problem::CrossFlowEdge(index) => Some(*index),
             _ => None,
         }
     }
@@ -978,10 +1007,11 @@ impl Doc {
                     [true, false]
                         .into_iter()
                         .filter(|branch| {
-                            !self
-                                .edges
-                                .iter()
-                                .any(|e| e.from == n.id && e.branch == *branch)
+                            // Wired to a node that exists: a dangling edge is a pin
+                            // wired to nothing, whatever `DanglingEdge` says about it.
+                            !self.edges.iter().any(|e| {
+                                e.from == n.id && e.branch == *branch && self.node(e.to).is_some()
+                            })
                         })
                         .map(|branch| Problem::UnwiredBranch(n.id, branch))
                 }),
@@ -1096,6 +1126,17 @@ impl Doc {
             effects: Vec::new(),
             conditions: Vec::new(),
         });
+        id
+    }
+
+    /// [`Doc::add_node`] onto a canvas. Every node the editor makes goes through here: one
+    /// made on the canvas the author is looking at has to land on it, and `add_node` alone
+    /// puts it on the main flow.
+    pub fn add_node_on(&mut self, flow: &str, x: f32, y: f32) -> NodeId {
+        let id = self.add_node(x, y);
+        if let Some(node) = self.node_mut(id) {
+            node.flow = flow.to_string();
+        }
         id
     }
 
@@ -1323,17 +1364,23 @@ impl Doc {
             })
             .collect();
 
+        // Only a speech node has a speaker: a hub converted from one still carries the
+        // field, and must not be found by a name nobody says there.
+        let speaker = |n: &Node| match n.kind {
+            NodeKind::Speech => n.speaker.to_lowercase(),
+            _ => String::new(),
+        };
         self.nodes
             .iter()
             .filter(|n| {
                 text.is_empty()
-                    || n.speaker.to_lowercase().contains(&text)
+                    || speaker(n).contains(&text)
                     || n.text.to_lowercase().contains(&text)
                     || n.alias.to_lowercase().contains(&text)
             })
             .filter(|n| {
                 filters.iter().enumerate().all(|(i, filter)| match filter {
-                    Filter::Speaker(who) => n.speaker.to_lowercase().contains(who.as_str()),
+                    Filter::Speaker(who) => speaker(n).contains(who.as_str()),
                     Filter::Flow(flow) => {
                         n.flow.to_lowercase() == *flow
                             || (n.flow.is_empty() && matches!(flow.as_str(), "main" | "(main)"))
@@ -1391,20 +1438,28 @@ impl Doc {
         self.edges.iter().any(|e| e.from == from && e.to == to)
     }
 
-    /// Connects two nodes. False when the edge would be a self-loop or a duplicate, or
-    /// would be a second target for a jump — a jump points at exactly one node, and a
-    /// second edge would leave the canvas badge naming one of several.
-    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> bool {
+    /// Whether [`Doc::add_edge`] would accept the edge. Separate so the view can ask
+    /// *before* it checkpoints, the way [`Doc::variable_name_free`] is: a refused drag
+    /// must not leave an empty undo step, a false dirty flag, or a selection pointing at
+    /// whatever edge happened to be last in the file.
+    pub fn can_add_edge(&self, from: NodeId, to: NodeId) -> bool {
+        // A jump points at exactly one node, and a second edge would leave the canvas
+        // badge naming one of several. A note is an annotation, not a node in the
+        // conversation: no edge may touch one at either end. This is the only gate — the
+        // canvas drag and `branch_from` both come through here.
         if from == to || self.has_edge(from, to) {
             return false;
         }
         if self.is_jump(from) && self.edges.iter().any(|e| e.from == from) {
             return false;
         }
-        // A note is an annotation, not a node in the conversation: no edge may touch one at
-        // either end. This is the only gate — the canvas drag and `branch_from` both come
-        // through here.
-        if self.is_note(from) || self.is_note(to) {
+        !self.is_note(from) && !self.is_note(to)
+    }
+
+    /// Connects two nodes. False when the edge would be a self-loop or a duplicate, would
+    /// be a second target for a jump, or would touch a note — see [`Doc::can_add_edge`].
+    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> bool {
+        if !self.can_add_edge(from, to) {
             return false;
         }
         // The first edge out of a condition is its true branch: the happy path is what gets
@@ -1420,12 +1475,50 @@ impl Doc {
         true
     }
 
+    /// Whether [`Doc::link`] would change anything — the pre-checkpoint check, for the
+    /// reason [`Doc::can_add_edge`] exists.
+    pub fn can_link(&self, from: NodeId, to: NodeId) -> bool {
+        match self.is_jump(from) {
+            true => from != to && !self.is_note(to) && !self.has_edge(from, to),
+            false => self.can_add_edge(from, to),
+        }
+    }
+
+    /// Connects two nodes the way a drag from an out-port does: an ordinary node gains a
+    /// choice, and a jump that already has a target is pointed at the new one instead, so
+    /// the one-target rule holds and the port stays a handle that lands. False, with
+    /// nothing changed, when [`Doc::can_link`] refuses.
+    pub fn link(&mut self, from: NodeId, to: NodeId) -> bool {
+        if !self.can_link(from, to) {
+            return false;
+        }
+        if self.is_jump(from) {
+            self.edges.retain(|e| e.from != from);
+        }
+        self.add_edge(from, to)
+    }
+
+    /// Whether [`Doc::branch_from`] would connect a new node to this one: it exists, takes
+    /// edges out, and — for a jump — has no target yet. The pre-checkpoint check, so a Tab
+    /// that cannot branch places the node instead of leaving an orphan beside the parent
+    /// and an empty undo step.
+    pub fn can_branch(&self, from: NodeId) -> bool {
+        self.node(from).is_some_and(|parent| match parent.kind {
+            NodeKind::Note => false,
+            NodeKind::Jump => !self.edges.iter().any(|e| e.from == from),
+            _ => true,
+        })
+    }
+
     /// Adds a node connected to `from`, to its right and below any children it already
-    /// has, so a fan of choices stacks downward. None when `from` is gone, and then
-    /// nothing is added.
+    /// has, so a fan of choices stacks downward. None, with nothing added, when
+    /// [`Doc::can_branch`] refuses.
     // ponytail: only avoids siblings; it can land on an unrelated node elsewhere in the
     // graph. Scan every node for a collision if that starts to bite.
     pub fn branch_from(&mut self, from: NodeId) -> Option<NodeId> {
+        if !self.can_branch(from) {
+            return None;
+        }
         let parent = self.node(from)?;
         let (x, mut y) = (parent.x + NODE_W + GAP_X, parent.y);
         let lowest_child = self
@@ -1439,14 +1532,12 @@ impl Doc {
             y = lowest_child + NODE_H + GAP_Y;
         }
 
-        let flow = parent.flow.clone();
-        let id = self.add_node(x, y);
         // Branching lands on the canvas the parent is drawn on, so Tab never creates a node
         // the author cannot see.
-        if let Some(node) = self.node_mut(id) {
-            node.flow = flow;
-        }
-        // A fresh id is neither a self-loop nor a duplicate, so this cannot fail.
+        let flow = parent.flow.clone();
+        let id = self.add_node_on(&flow, x, y);
+        // A fresh id is neither a self-loop nor a duplicate, and `can_branch` ruled out a
+        // note and a jump with a target, so this cannot fail.
         self.add_edge(from, id);
         Some(id)
     }
@@ -2097,9 +2188,13 @@ impl Doc {
     pub fn to_ftl(&self) -> String {
         let mut out = String::new();
         for node in &self.nodes {
-            // An empty value is a parse error in FTL, and a blank node is already
-            // `Problem::Empty` — the document says so somewhere the author can read it.
-            if node.kind != NodeKind::Note && !node.text.is_empty() {
+            // Only text the player reads: a line, or the label a hub shows over its
+            // choices. A note is author-facing, and the logic kinds never show theirs.
+            // An empty value is a parse error in FTL — a value of nothing but blanks too,
+            // since the parser skips the blanks and finds nothing — and a blank node is
+            // already `Problem::Empty`, so the document says so where the author reads it.
+            if matches!(node.kind, NodeKind::Speech | NodeKind::Hub) && !node.text.trim().is_empty()
+            {
                 out += &Self::ftl_entry(&format!("node-{}", node.id), &node.text);
             }
         }
@@ -2117,7 +2212,16 @@ impl Doc {
     /// blank lines are indented for the same reason. A brace opens a placeable, so text
     /// carrying one is escaped, and in a *single* pass: chaining two `replace` calls would
     /// mangle the braces the first one inserted.
+    ///
+    /// Two things a line may not open with are shielded behind `{""}`, an empty string
+    /// literal — a placeable that renders as nothing and that a line *may* open with. In a
+    /// block value a line whose first mark is `[`, `*` or `.` is a variant, a default
+    /// variant or an attribute, and the parser keeps the lines before it and drops the rest
+    /// as junk without a word; "...I suppose." is ordinary dialogue. And the blanks after
+    /// `=` are skipped, so a value starting with a space would lose it.
     fn ftl_entry(key: &str, value: &str) -> String {
+        const SHIELD: &str = "{\"\"}";
+
         let mut escaped = String::with_capacity(value.len());
         for c in value.chars() {
             match c {
@@ -2128,11 +2232,16 @@ impl Doc {
         }
 
         if !escaped.contains('\n') {
-            return format!("{key} = {escaped}\n");
+            let shield = if escaped.starts_with(' ') { SHIELD } else { "" };
+            return format!("{key} = {shield}{escaped}\n");
         }
         let mut out = format!("{key} =\n");
         for line in escaped.lines() {
-            out += &format!("    {line}\n");
+            let shield = match line.trim_start().chars().next() {
+                Some('[' | '*' | '.') => SHIELD,
+                _ => "",
+            };
+            out += &format!("    {shield}{line}\n");
         }
         out
     }
@@ -2348,7 +2457,8 @@ impl Doc {
                             out += &format!("- {} → {}\n", edge.branch, reference(last, edge.to));
                         }
                     }
-                    (_, [edge]) if edge.label.trim().is_empty() => {
+                    // A once-only choice is listed even alone, so its marker is written.
+                    (_, [edge]) if edge.label.trim().is_empty() && !edge.once => {
                         out += &format!("\n→ {}\n", reference(last, edge.to));
                     }
                     (_, exits) => {
@@ -5731,5 +5841,285 @@ mod tests {
         let (x, y) = box_exit((0.0, 0.0), 100.0, 40.0, (200.0, 20.0));
         assert_eq!((x, y), (50.0, 5.0));
         assert_eq!(box_exit((3.0, 4.0), 10.0, 10.0, (3.0, 4.0)), (3.0, 4.0));
+    }
+
+    /// A drag from a jump's port when it already has a target is what the author means by
+    /// "point it here instead"; anything `add_edge` refuses, `link` refuses too, and
+    /// `can_link` says so *before* the view checkpoints.
+    #[test]
+    fn link_retargets_a_jump_and_refuses_what_add_edge_would() {
+        let mut doc = Doc::default();
+        let jump = doc.add_node(0.0, 0.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let first = spoken(&mut doc, 300.0, 0.0);
+        let second = spoken(&mut doc, 300.0, 200.0);
+        let note = doc.add_node(300.0, 400.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+
+        assert!(doc.can_link(jump, first));
+        assert!(doc.link(jump, first));
+        assert!(!doc.can_link(jump, first), "already the target");
+        assert!(doc.can_link(jump, second));
+        assert!(doc.link(jump, second));
+        assert_eq!(
+            doc.choices(jump),
+            vec![(second, "")],
+            "one target, the new one"
+        );
+
+        assert!(!doc.can_link(jump, note));
+        assert!(!doc.link(jump, note));
+        assert!(!doc.can_link(first, note));
+        assert!(!doc.link(first, note));
+        assert!(!doc.can_link(first, first));
+        assert_eq!(
+            doc.choices(jump),
+            vec![(second, "")],
+            "a refused link changes nothing"
+        );
+    }
+
+    #[test]
+    fn can_link_agrees_with_link_on_every_pair() {
+        let mut doc = Doc::sample();
+        let note = doc.add_node(0.0, 900.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        let ids: Vec<NodeId> = doc.nodes.iter().map(|n| n.id).collect();
+        for &from in &ids {
+            for &to in &ids {
+                let mut copy = Doc::from_json(&doc.to_json()).unwrap();
+                assert_eq!(
+                    doc.can_link(from, to),
+                    copy.link(from, to),
+                    "can_link and link disagree on {from} → {to}"
+                );
+            }
+        }
+    }
+
+    /// Tab off a note, or off a jump that already has its one target, used to make the
+    /// node and silently fail to connect it — an orphan parked where a child would go.
+    #[test]
+    fn branch_from_refuses_a_note_and_a_jump_with_a_target() {
+        let mut doc = Doc::default();
+        let note = doc.add_node(0.0, 0.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        let jump = doc.add_node(0.0, 300.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let landing = spoken(&mut doc, 300.0, 300.0);
+        assert!(doc.add_edge(jump, landing));
+        let (nodes, edges) = (doc.nodes.len(), doc.edges.len());
+
+        assert!(!doc.can_branch(note));
+        assert!(doc.branch_from(note).is_none());
+        assert!(!doc.can_branch(jump));
+        assert!(doc.branch_from(jump).is_none());
+        assert_eq!(
+            (doc.nodes.len(), doc.edges.len()),
+            (nodes, edges),
+            "nothing was added"
+        );
+
+        let empty_jump = doc.add_node(0.0, 600.0);
+        doc.node_mut(empty_jump).unwrap().kind = NodeKind::Jump;
+        assert!(
+            doc.can_branch(empty_jump),
+            "a jump with no target yet takes one"
+        );
+        let child = doc.branch_from(empty_jump).expect("branches");
+        assert!(doc.has_edge(empty_jump, child));
+    }
+
+    /// A double-click on any canvas but the main one used to make a node nobody could see.
+    #[test]
+    fn add_node_on_lands_on_the_canvas_named() {
+        let mut doc = Doc::default();
+        let id = doc.add_node_on("chapter1", 10.0, 20.0);
+        let node = doc.node(id).unwrap();
+        assert_eq!(
+            (node.flow.as_str(), node.x, node.y),
+            ("chapter1", 10.0, 20.0)
+        );
+        assert_eq!(doc.hit_test("chapter1", 15.0, 25.0), Some(id));
+        assert_eq!(doc.hit_test("", 15.0, 25.0), None);
+    }
+
+    /// The parser skips the blanks after `=` and finds no value, which is a parse error
+    /// — and the document already calls such a node empty.
+    #[test]
+    fn ftl_skips_a_node_that_is_blank_after_trimming() {
+        let mut doc = Doc::default();
+        let id = doc.add_node(0.0, 0.0);
+        doc.node_mut(id).unwrap().text = "  \n  ".into();
+
+        assert!(doc.problems().contains(&Problem::Empty(id)));
+        assert_eq!(doc.to_ftl(), "");
+    }
+
+    /// In a block value a line opening with `[`, `*` or `.` is syntax, and the reference
+    /// parser keeps the lines before it and drops the rest as junk. An empty string
+    /// literal in front is a placeable that renders as nothing and that a line may open
+    /// with. Leading spaces on a one-line value are skipped the same way.
+    #[test]
+    fn ftl_shields_a_line_the_parser_would_read_as_syntax() {
+        let mut doc = Doc::default();
+        let id = doc.add_node(0.0, 0.0);
+        doc.node_mut(id).unwrap().text = "Options:\n* rooms\n  .hidden\n[bracket\nplain".into();
+        let ftl = doc.to_ftl();
+        let body = ftl.split_once('\n').expect("a block value").1;
+
+        assert_eq!(
+            body,
+            "    Options:\n    {\"\"}* rooms\n    {\"\"}  .hidden\n    {\"\"}[bracket\n    plain\n"
+        );
+
+        doc.node_mut(id).unwrap().text = "  after a gap".into();
+        assert_eq!(
+            doc.to_ftl(),
+            format!("node-{id} = {{\"\"}}  after a gap\n"),
+            "the leading spaces survive behind the shield"
+        );
+        doc.node_mut(id).unwrap().text = ".single line".into();
+        assert_eq!(
+            doc.to_ftl(),
+            format!("node-{id} = .single line\n"),
+            "inline text may open with a dot; only a block line may not"
+        );
+    }
+
+    /// Text on a jump, an instruction or a condition is shown nowhere the player looks, so
+    /// a translator must never be asked to translate it; a hub's label is shown over its
+    /// choices and stays in.
+    #[test]
+    fn ftl_leaves_the_logic_kinds_out() {
+        let mut doc = Doc::default();
+        for kind in [NodeKind::Jump, NodeKind::Instruction, NodeKind::Condition] {
+            let id = doc.add_node(0.0, 0.0);
+            let node = doc.node_mut(id).unwrap();
+            node.kind = kind;
+            node.text = "stray".into();
+        }
+        assert_eq!(doc.to_ftl(), "");
+
+        let hub = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(hub).unwrap();
+        node.kind = NodeKind::Hub;
+        node.text = "Anything else?".into();
+        assert_eq!(doc.to_ftl(), format!("node-{hub} = Anything else?\n"));
+    }
+
+    /// Greek writes a final sigma differently, and a string-wise lowercase picks one form
+    /// while a char-wise one picks the other; a name in capitals must still be found.
+    #[test]
+    fn find_word_folds_a_final_sigma() {
+        assert_eq!(find_word("Ask ΟΔΥΣΣΕΥΣ about the sea", "Οδυσσευς"), Some(4));
+        assert_eq!(find_word("Ask Οδυσσευς about the sea", "ΟΔΥΣΣΕΥΣ"), Some(4));
+    }
+
+    /// Lowercasing `İ` yields two chars, so an index into the folded text is not an index
+    /// into the original — and `snippet` indexes the original.
+    #[test]
+    fn find_word_returns_an_index_into_the_original_text() {
+        let text = format!("{} Mara", "İ".repeat(16));
+        assert_eq!(find_word(&text, "Mara"), Some(17));
+        assert!(
+            snippet(&text, "Mara").ends_with("Mara"),
+            "the name stays in view"
+        );
+    }
+
+    /// `tag:#` is a tag not typed yet, not the empty prefix every tag starts with.
+    #[test]
+    fn a_tag_filter_with_no_tag_yet_filters_nothing() {
+        let mut doc = Doc::default();
+        let tagged = spoken(&mut doc, 0.0, 0.0);
+        doc.add_tag(&[tagged], "todo");
+        let plain = doc.add_node(0.0, 200.0);
+        doc.node_mut(plain).unwrap().text = "hello".into();
+
+        assert!(doc.query("tag:#").is_empty());
+        assert_eq!(
+            doc.query("tag:# hello"),
+            vec![plain],
+            "the rest is plain search"
+        );
+        assert_eq!(doc.query("tag:#todo"), vec![tagged]);
+    }
+
+    /// The marker went missing on exactly the shape a once-only choice most often has:
+    /// one unlabelled way forward.
+    #[test]
+    fn a_once_only_single_choice_is_marked_in_the_screenplay() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 0.0, 300.0);
+        doc.add_edge(a, b);
+        doc.add_edge(c, b);
+        doc.edges[0].once = true;
+
+        assert!(doc.to_screenplay().contains("- (once) *(continue)* → §"));
+    }
+
+    /// A pin wired to a node that is gone is a pin wired to nothing.
+    #[test]
+    fn an_unwired_pin_is_reported_when_its_edge_dangles() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let check = doc.add_node(0.0, 0.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(check, "paid", Some(Value::Bool(true)), Cmp::Eq);
+        let no = spoken(&mut doc, 300.0, 200.0);
+        doc.edges.push(Edge {
+            from: check,
+            to: 999,
+            label: String::new(),
+            branch: true,
+            once: false,
+        });
+        doc.add_edge(check, no);
+        doc.edges[1].branch = false;
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::UnwiredBranch(check, true)));
+        assert!(!problems.contains(&Problem::UnwiredBranch(check, false)));
+    }
+
+    /// `kind_picker` keeps the field, so the search must not read it on a kind nobody
+    /// speaks at — the same rule `references` and `stats` already follow.
+    #[test]
+    fn a_hub_is_not_found_by_the_speaker_it_no_longer_has() {
+        let mut doc = Doc::default();
+        let hub = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(hub).unwrap();
+        node.speaker = "Innkeeper".into();
+        node.text = "Anything else?".into();
+        node.kind = NodeKind::Hub;
+
+        assert!(doc.query("innkeeper").is_empty());
+        assert!(doc.query("speaker:inn").is_empty());
+        assert_eq!(
+            doc.query("anything"),
+            vec![hub],
+            "its label is still searched"
+        );
+    }
+
+    /// The problem row for an edge has to select it: a cross-flow edge is drawn on neither
+    /// canvas, so the row is the only way to reach it.
+    #[test]
+    fn a_problem_about_an_edge_names_the_edge() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.move_to_flow(&[b], "chapter2");
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::CrossFlowEdge(0)));
+        assert_eq!(Problem::CrossFlowEdge(0).edge(), Some(0));
+        assert_eq!(Problem::DanglingEdge(3).edge(), Some(3));
+        assert_eq!(Problem::DuplicateEdge(4).edge(), Some(4));
+        assert_eq!(Problem::DeadEnd(a).edge(), None);
     }
 }
