@@ -1,5 +1,8 @@
+#[cfg(all(feature = "automation", unix))]
+mod automation;
 mod doc;
 mod text_input;
+mod theme;
 
 use doc::{
     Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp,
@@ -7,15 +10,16 @@ use doc::{
     read_backup, split_set, with_default_extension,
 };
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, PathPromptOptions, Pixels,
-    Point, PromptLevel, Render, Rgba, ScrollWheelEvent, SharedString, Window, WindowBounds,
-    WindowHandle, WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, rgba,
-    size,
+    AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollWheelEvent, SharedString,
+    Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas, deferred, div, point,
+    prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
 use text_input::TextInput;
+use theme::Typography;
 
 actions!(
     palaver,
@@ -41,27 +45,33 @@ actions!(
         Open,
         Play,
         PlayFromHere,
-        StopPlay
+        StopPlay,
+        ToggleProblems,
+        ShowHelp
     ]
 );
 
 /// Height of the menu bar. Mouse positions are window-relative, so this is also the
 /// offset between window coordinates and the canvas pane below the bar.
 const MENU_H: f32 = 30.0;
+/// Height of the status bar under the three panes. It makes the canvas pane shorter at the
+/// *bottom*, and hit tests measure from the top-left, so — unlike `MENU_H` — it is not
+/// subtracted in `window_pos`. Only `pane_center` has to know, since that is the one place
+/// the pane's height is read.
+const STATUS_H: f32 = 26.0;
+/// How long a status message stays up before it clears itself.
+const STATUS_FOR: Duration = Duration::from_secs(6);
 /// Width of the inspector on the right.
 const SIDEBAR_W: f32 = 280.0;
 /// Width of the global-variables pane on the left. With [`SIDEBAR_W`] and [`MENU_H`], this
 /// is what bounds the canvas — and what `window_pos` has to subtract off every mouse event.
-const VARS_W: f32 = 200.0;
+const VARS_W: f32 = 220.0;
 
 /// How much one pixel of scroll changes the zoom. Multiplicative, so a scroll up and an
 /// equal scroll down cancel out exactly.
 const ZOOM_PER_PIXEL: f32 = 1.0015;
 /// Zoom step for the keyboard commands. `1 / 1.25 == 0.8`, so in-then-out is a round trip.
 const ZOOM_STEP: f32 = 1.25;
-/// Node and label text size at 1:1, matching the `text_sm` the rest of the UI uses.
-const BASE_TEXT: f32 = 14.0;
-
 /// What `var_input` is asking for, which is the placeholder it shows: the pane's `+` declares
 /// into one list or the other, and the field is shared. One function so `Editor::new` and the
 /// tab handler cannot disagree.
@@ -73,8 +83,10 @@ fn declare_hint(pane: SidePane) -> &'static str {
     }
 }
 
-/// The colours a character can be tinted, cycled by clicking the swatch. Drawn from the
-/// colours already in this file, and it lives here rather than in `doc.rs` for the same
+/// The colours a character can be tinted, cycled by clicking the swatch. The one set of hex
+/// literals outside `theme.rs`, deliberately: these values are written into `.dln` files, so
+/// they are document data, and retuning one would orphan every saved character using it.
+/// It lives here rather than in `doc.rs` for the same
 /// reason `problem_text` does: the model stores the colour, the view chooses it. There is no
 /// colour-picker widget in the crate, and a click-cycle is the idiom everywhere else in it.
 const CAST_COLORS: [u32; 8] = [
@@ -141,6 +153,17 @@ const MENUS: &[MenuSpec] = &[
         ],
     ),
     (
+        "View",
+        &[
+            ("Problems", "Ctrl+Shift+M", |e, w, cx| {
+                e.on_toggle_problems(&ToggleProblems, w, cx)
+            }),
+            ("Keyboard shortcuts", "F1", |e, w, cx| {
+                e.on_show_help(&ShowHelp, w, cx)
+            }),
+        ],
+    ),
+    (
         "Play",
         &[
             ("Play conversation", "F5", |e, w, cx| {
@@ -153,33 +176,6 @@ const MENUS: &[MenuSpec] = &[
         ],
     ),
 ];
-
-const EDGE_COLOR: Rgba = Rgba {
-    r: 0.49,
-    g: 0.49,
-    b: 0.55,
-    a: 1.0,
-};
-const ACCENT_COLOR: Rgba = Rgba {
-    r: 0.48,
-    g: 0.64,
-    b: 0.97,
-    a: 1.0,
-};
-/// A condition's two pins. Drawn as well as labelled, so which branch an edge leaves by is
-/// never something the author has to guess at.
-const TRUE_COLOR: Rgba = Rgba {
-    r: 0.55,
-    g: 0.91,
-    b: 0.60,
-    a: 1.0,
-};
-const FALSE_COLOR: Rgba = Rgba {
-    r: 1.0,
-    g: 0.48,
-    b: 0.48,
-    a: 1.0,
-};
 
 /// A document's display name, or a placeholder while it has no file yet.
 fn document_name(path: Option<&std::path::Path>) -> String {
@@ -237,8 +233,18 @@ struct Editor {
     text_dirty: bool,
     /// Where the document was last saved or loaded from.
     path: Option<PathBuf>,
-    /// Outcome of the last save or load, shown in the sidebar.
+    /// Outcome of the last save or load, shown in the status bar until it clears itself.
     status: Option<String>,
+    /// Bumped by every `set_status`, so a message's expiry timer can tell it is still the
+    /// message that started it and not clear a newer one.
+    status_gen: u32,
+    /// The find overlay is open. The query lives in `search_input`, which is not rendered
+    /// while this is `false`.
+    searching: bool,
+    /// The problems drawer, opened from the status bar's badge.
+    problems_open: bool,
+    /// The keyboard-and-mouse cheat sheet.
+    help_open: bool,
     /// Last title pushed to the platform, so `render` only sets it on change.
     title: String,
     /// Name of the menu whose dropdown is open.
@@ -425,6 +431,10 @@ impl Editor {
             text_dirty: false,
             path: None,
             status: None,
+            status_gen: 0,
+            searching: false,
+            problems_open: false,
+            help_open: false,
             title: String::new(),
             open_menu: None,
             closing: false,
@@ -706,9 +716,25 @@ impl Editor {
         }
     }
 
+    /// Shows a message in the status bar and clears it after [`STATUS_FOR`]. A message that
+    /// stayed forever would be stale the moment the next edit made it untrue.
     fn set_status(&mut self, status: String, cx: &mut Context<Self>) {
         self.status = Some(status);
+        self.status_gen = self.status_gen.wrapping_add(1);
+        let generation = self.status_gen;
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_FOR).await;
+            this.update(cx, |this, cx| {
+                // A newer message has its own timer; this one is not its to clear.
+                if this.status_gen == generation {
+                    this.status = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Loads the selection's content into the sidebar fields, starting a fresh editing session.
@@ -743,6 +769,12 @@ impl Editor {
             .update(cx, |input, cx| input.set_content(&alias, cx));
         self.label_input
             .update(cx, |input, cx| input.set_content(&label, cx));
+        let kind = selection
+            .only_node()
+            .and_then(|id| self.doc.node(id))
+            .map_or(NodeKind::Speech, |node| node.kind);
+        self.text_input
+            .update(cx, |input, cx| input.set_placeholder(text_prompt(kind), cx));
         self.edited = selection;
         self.text_dirty = false;
     }
@@ -817,7 +849,7 @@ impl Editor {
         let size = window.viewport_size();
         (
             (f32::from(size.width) - SIDEBAR_W - VARS_W) / 2.0,
-            (f32::from(size.height) - MENU_H) / 2.0,
+            (f32::from(size.height) - MENU_H - STATUS_H) / 2.0,
         )
     }
 
@@ -841,10 +873,10 @@ impl Editor {
                     return None;
                 }
                 let color = match (self.selection == Selection::Edge(index), e.branch) {
-                    (true, _) => ACCENT_COLOR,
-                    _ if !self.doc.is_condition(e.from) => EDGE_COLOR,
-                    (false, true) => TRUE_COLOR,
-                    (false, false) => FALSE_COLOR,
+                    (true, _) => theme::ACCENT,
+                    _ if !self.doc.is_condition(e.from) => theme::EDGE,
+                    (false, true) => theme::TRUE,
+                    (false, false) => theme::FALSE,
                 };
                 Some((
                     self.screen_pos(out_port(from)),
@@ -1109,8 +1141,41 @@ impl Editor {
         cx.notify();
     }
 
+    /// Opens the find overlay with the field focused, ready to type. The field is only in
+    /// the tree while `searching` is set; focusing it in the same turn works because the
+    /// handle exists before the element does, the way `insert_node` focuses the speaker field.
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.searching = true;
         window.focus(&self.search_input.read(cx).focus_handle(cx));
+        cx.notify();
+    }
+
+    fn on_toggle_problems(&mut self, _: &ToggleProblems, _: &mut Window, cx: &mut Context<Self>) {
+        self.problems_open = !self.problems_open;
+        cx.notify();
+    }
+
+    fn on_show_help(&mut self, _: &ShowHelp, _: &mut Window, cx: &mut Context<Self>) {
+        self.help_open = !self.help_open;
+        cx.notify();
+    }
+
+    /// Closes the find overlay, the problems drawer and the cheat sheet. True when there was
+    /// something to close, which is how Escape knows it has already done its job. The query
+    /// is cleared with the overlay, so find always opens on a clean slate.
+    fn dismiss_overlays(&mut self, cx: &mut Context<Self>) -> bool {
+        let any = self.searching || self.problems_open || self.help_open;
+        if self.searching {
+            self.search_input
+                .update(cx, |input, cx| input.set_content("", cx));
+        }
+        self.searching = false;
+        self.problems_open = false;
+        self.help_open = false;
+        if any {
+            cx.notify();
+        }
+        any
     }
 
     /// Creates a node already connected to the selected one and drops the cursor in its
@@ -1169,7 +1234,12 @@ impl Editor {
                 // Centred on the view rather than parked at its origin, so the node lands
                 // where you are already looking.
                 let (x, y) = self.view.to_doc(Self::pane_center(window));
-                let id = self.doc.add_node(x - NODE_W / 2.0, y - NODE_H / 2.0);
+                // Slid down past anything already standing there: dropped dead on top of
+                // another node, the new one hid it, and a second Ctrl+6 hid the first.
+                let (x, y) = self
+                    .doc
+                    .free_spot(&self.flow, x - NODE_W / 2.0, y - NODE_H / 2.0);
+                let id = self.doc.add_node(x, y);
                 // Onto the canvas being looked at. The branch arm needs no equivalent:
                 // `branch_from` inherits the parent's, and switching canvas drops the
                 // selection, so a parent is always on this one.
@@ -1206,7 +1276,12 @@ impl Editor {
         }
     }
 
+    /// Escape. Closes an overlay if one is open and only otherwise stops the play-through,
+    /// so Escape peels back one layer at a time instead of doing both at once.
     fn on_stop_play(&mut self, _: &StopPlay, _: &mut Window, cx: &mut Context<Self>) {
+        if self.dismiss_overlays(cx) {
+            return;
+        }
         self.play = None;
         cx.notify();
     }
@@ -1297,8 +1372,40 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, _: &mut Context<Self>) {
+    /// Escape from inside a text field. Closes the find overlay when that is where the
+    /// field is, since the overlay is nothing but that field and its results.
+    fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, cx: &mut Context<Self>) {
+        if self.searching {
+            self.dismiss_overlays(cx);
+        }
         window.focus(&self.focus_handle);
+    }
+
+    /// Switches the left pane's tab. A rename aimed at the list you just left would rename
+    /// the wrong thing, so switching tabs puts the shared field back to declaring.
+    fn switch_pane(&mut self, pane: SidePane, cx: &mut Context<Self>) {
+        self.pane = pane;
+        self.renaming = None;
+        self.set = String::new();
+        self.var_input.update(cx, |input, cx| {
+            input.set_content("", cx);
+            // The hint is how one field says which list its `+` adds to.
+            input.set_placeholder(declare_hint(pane), cx);
+        });
+        cx.notify();
+    }
+
+    /// Puts another flow on the canvas. Only the view moves, so no checkpoint: which canvas
+    /// you are looking at is not a document edit. The selection goes, though — nodes on the
+    /// canvas you left are neither drawn nor hit-testable, so leaving them selected would let
+    /// the inspector edit an invisible node and `Tab` branch off one, which is the only way
+    /// to author a `CrossFlowEdge`.
+    fn show_flow(&mut self, flow: &str, cx: &mut Context<Self>) {
+        if self.flow != flow {
+            self.flow = flow.to_string();
+            self.select(Selection::None, cx);
+        }
+        cx.notify();
     }
 }
 
@@ -1323,6 +1430,9 @@ impl Render for Editor {
         let lines = self.edge_lines();
         let pending = self.pending_edge();
         let view = self.view;
+        // Once per frame, for the status bar's badge, the drawer and the inspector's summary.
+        let problems = self.doc.problems();
+        let canvas_w = f32::from(window.viewport_size().width) - VARS_W - SIDEBAR_W;
 
         // The `"Editor"` context and every action listener live here, at the root, not on
         // the canvas: gpui matches a binding against the focused element's *ancestors*, and
@@ -1337,6 +1447,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
             .on_action(cx.listener(Self::on_find))
+            .on_action(cx.listener(Self::on_toggle_problems))
+            .on_action(cx.listener(Self::on_show_help))
             .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_new_hub))
             .on_action(cx.listener(Self::on_new_jump))
@@ -1352,10 +1464,12 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_play))
             .on_action(cx.listener(Self::on_play_from_here))
             .on_action(cx.listener(Self::on_stop_play))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
-            .text_sm()
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::BODY))
             .child(self.menu_bar(cx))
             .child(
                 div()
@@ -1365,8 +1479,15 @@ impl Render for Editor {
                     .overflow_hidden()
                     .child(self.vars_pane(cx))
                     .child(self.canvas_pane(lines, pending, view, cx))
-                    .child(self.sidebar(cx)),
+                    .child(self.sidebar(&problems, cx)),
             )
+            .child(self.status_bar(&problems, cx))
+            // Overlays come last so they paint above everything, and are only in the tree
+            // while open: the find field in particular is not rendered when closed.
+            .when(self.searching, |this| {
+                this.child(self.search_overlay(canvas_w, cx))
+            })
+            .when(self.help_open, |this| this.child(self.help_overlay(cx)))
     }
 }
 
@@ -1379,10 +1500,10 @@ impl Editor {
             .h(px(MENU_H))
             .items_center()
             .px_1()
-            .bg(rgb(0x26262c))
+            .bg(theme::PANE)
             .border_b_1()
-            .border_color(rgb(0x3a3a44))
-            .text_color(rgb(0xd6d6dd))
+            .border_color(theme::DIVIDER)
+            .text_color(theme::TEXT)
             .children(MENUS.iter().map(|(name, items)| {
                 let open = self.open_menu == Some(*name);
                 div()
@@ -1393,8 +1514,8 @@ impl Editor {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .when(open, |this| this.bg(rgb(0x3a3a44)))
-                            .hover(|style| style.bg(rgb(0x33333c)))
+                            .when(open, |this| this.bg(theme::PRESSED))
+                            .hover(|style| style.bg(theme::HOVER))
                             .child(*name)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_menu = (!open).then_some(*name);
@@ -1422,7 +1543,7 @@ impl Editor {
             .flex_1()
             .h_full()
             .overflow_hidden()
-            .bg(rgb(0x1e1e22))
+            .bg(theme::CANVAS)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_pan_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1454,7 +1575,7 @@ impl Editor {
                             draw(from, to, color);
                         }
                         if let Some((from, to)) = pending {
-                            draw(from, to, ACCENT_COLOR);
+                            draw(from, to, theme::ACCENT);
                         }
                     },
                 )
@@ -1463,7 +1584,6 @@ impl Editor {
                 .left(px(0.))
                 .size_full(),
             )
-            .children(self.edge_labels())
             .children(self.doc.nodes_in(&self.flow).map(|node| {
                 let playing = self.play.as_ref().and_then(|path| path.last().copied());
                 let jump_target = (node.kind == NodeKind::Jump)
@@ -1477,9 +1597,12 @@ impl Editor {
                     self.selection.nodes().contains(&node.id),
                     playing == Some(node.id),
                     jump_target,
-                    speaker_color(&self.doc, &node.speaker, 0x9ecbff),
+                    speaker_color(&self.doc, &node.speaker, theme::SPEAKER_DEFAULT),
                 )
             }))
+            // Over the nodes, not under them: a label that a node box painted over was cut off
+            // mid-word. Each is bounded to the gap it sits in, so it covers no text anyway.
+            .children(self.edge_labels())
             .children(
                 self.doc
                     .nodes_in(&self.flow)
@@ -1496,16 +1619,40 @@ impl Editor {
                         .top(origin.y)
                         .w(size.x)
                         .h(size.y)
-                        .bg(rgba(0x7aa2f722))
+                        .bg(theme::ACCENT_WASH)
                         .border_1()
-                        .border_color(ACCENT_COLOR),
+                        .border_color(theme::ACCENT),
                 )
             })
     }
 
-    /// Choice text, centred on each labelled edge.
+    /// Choice text on each labelled edge, as a pill centred on the line's midpoint.
+    ///
+    /// The width is the *gap* the line crosses. An edge runs from a node's right edge to the
+    /// next one's left edge, so its midpoint is the middle of that gap, and a label wider than
+    /// the gap ran underneath a node box and was cut off mid-word. Bounded to the gap it
+    /// covers no text, whatever the order things paint in. What does not fit wraps to a
+    /// second line and then ends in `…` — see `Typography::one_line` for why the ellipsis
+    /// needs the clamp rather than `truncate()`.
     fn edge_labels(&self) -> Vec<impl IntoElement> {
-        const W: f32 = 120.0;
+        /// Room left either side of the pill, so it never touches a port or a box: a port
+        /// dot is `2 * PORT_R` across and centred on the gap's edge, so this clears it with a
+        /// few units to spare.
+        const MARGIN: f32 = 2.0 * PORT_R + 10.0;
+        /// What a label may be where there is no gap to fit it in: an edge running back
+        /// across the graph, where every width is equally arbitrary.
+        const BACK_W: f32 = 120.0;
+        const MIN_W: f32 = 48.0;
+        const MAX_W: f32 = 200.0;
+        /// What a character of the label font may take at 1:1, deliberately over the real
+        /// average (~6.8): the estimate is a *width given to the text*, so one that is short
+        /// wraps a word in the middle ("As" / "k"), while one that is long only pads a pill.
+        const CHAR_W: f32 = 7.4;
+        const PAD_X: f32 = 6.0;
+        /// A pill's border, both sides, plus a little slack for the rounding gpui does.
+        const FRAME: f32 = 6.0;
+        /// Two lines of label text with the pill's padding, in document units.
+        const H: f32 = 48.0;
 
         self.doc
             .edges
@@ -1521,22 +1668,22 @@ impl Editor {
             .filter_map(|edge| {
                 let (text, color) = if self.doc.is_condition(edge.from) {
                     match edge.branch {
-                        true => ("true".to_string(), TRUE_COLOR),
-                        false => ("false".to_string(), FALSE_COLOR),
+                        true => ("true".to_string(), theme::TRUE),
+                        false => ("false".to_string(), theme::FALSE),
                     }
                 } else if self.doc.is_once(edge) {
                     // Shown on the canvas as well as in the inspector, the way a condition's
                     // branch is: a flag you have to click every edge to find is guessed at.
-                    // In front of the label, not after it: the slot is a fixed width and
-                    // a long choice is already truncated, so a marker on the end is one
-                    // you cannot see. `is_once`, not the bare flag, so one left behind by a
-                    // kind change is not drawn where the inspector offers no toggle for it.
+                    // In front of the label, not after it: a long choice is truncated, so a
+                    // marker on the end is one you cannot see. `is_once`, not the bare flag,
+                    // so one left behind by a kind change is not drawn where the inspector
+                    // offers no toggle for it.
                     (
                         format!("(once) {}", edge.label).trim_end().to_string(),
-                        rgba(0x9a9aa6ff),
+                        theme::TEXT_MUTED,
                     )
                 } else {
-                    (edge.label.clone(), rgba(0x9a9aa6ff))
+                    (edge.label.clone(), theme::TEXT_MUTED)
                 };
                 let (from_node, to_node) = (self.doc.node(edge.from)?, self.doc.node(edge.to)?);
                 // Skipped for the reason `edge_lines` skips it, and through the same test so
@@ -1546,24 +1693,45 @@ impl Editor {
                 }
                 let from = out_port(from_node);
                 let to = in_port(to_node);
+                let gap = to.0 - from.0;
+                let fit = if gap > 0.0 { gap - MARGIN } else { BACK_W };
                 let mid = self.screen_pos(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
-                let width = self.view.scale(W);
+                // A *definite* width for the pill, estimated from the text and capped at the
+                // gap. Left to size itself against a `max_w`, gpui measured it at its full
+                // width first and then wrapped one line wider than the box, clipping it on
+                // both sides with no ellipsis; given a width it wraps and truncates the way a
+                // node's text does. Generous per character, so a label that fits stays on one
+                // line, and a short one is not stretched to the gap.
+                let wanted = text.chars().count() as f32 * CHAR_W + 2.0 * PAD_X + FRAME;
+                let pill = wanted.min(fit.clamp(MIN_W, MAX_W));
+                let width = self.view.scale(MAX_W);
+                let height = self.view.scale(H);
                 Some(
-                    // Fixed width and centred content, so the label centres without measuring it.
+                    // A fixed box the pill is centred in, so it centres on the line without
+                    // being measured — and so one line or two sits on the same midpoint.
                     div()
                         .absolute()
                         .left(mid.x - px(width / 2.0))
-                        .top(mid.y - px(self.view.scale(18.)))
+                        .top(mid.y - px(height / 2.0))
                         .w(px(width))
+                        .h(px(height))
                         .flex()
+                        .items_center()
                         .justify_center()
-                        .text_size(px(self.view.scale(BASE_TEXT)))
+                        .text_size(px(self.view.scale(theme::SMALL)))
                         .child(
                             div()
-                                .px_1()
-                                .bg(rgb(0x1e1e22))
+                                .w(px(self.view.scale(pill)))
+                                .px(px(self.view.scale(PAD_X)))
+                                .py(px(self.view.scale(2.0)))
+                                .rounded_md()
+                                .bg(theme::RAISED)
+                                .border_1()
+                                .border_color(theme::OUTLINE)
                                 .text_color(color)
-                                .truncate()
+                                .text_center()
+                                .text_ellipsis()
+                                .line_clamp(2)
                                 .child(text),
                         ),
                 )
@@ -1571,52 +1739,105 @@ impl Editor {
             .collect()
     }
 
-    /// Search box and results, above the inspector so both stay usable at once.
-    fn search_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        /// Beyond this the list stops being scannable, and the sidebar would need to scroll.
-        const MAX_ROWS: usize = 20;
+    /// Find, as a card over the top of the canvas: opened by Ctrl+F, closed by Escape. It
+    /// lived at the head of the inspector, which made the one control that is about the
+    /// whole document the first thing in a panel about the selection — and left a permanent
+    /// text field on screen for something used in bursts.
+    ///
+    /// It stays open while you click through results, so a run of hits can be walked; the
+    /// canvas is still live underneath it for the same reason.
+    fn search_overlay(&self, canvas_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        /// Beyond this the list stops being scannable, even scrolled.
+        const MAX_ROWS: usize = 50;
+        const CARD_W: f32 = 420.0;
 
         let query = self.search_input.read(cx).content().to_string();
-        // ponytail: rescans every node each frame, but only while a query is active — which
-        // is never while dragging. Cache it if searching a huge graph ever stutters.
+        // ponytail: rescans every node each frame, but only while the overlay is open and a
+        // query is typed — which is never while dragging. Cache it if searching a huge graph
+        // ever stutters.
         let hits = self.doc.find(&query);
+        let typed = !query.trim().is_empty();
         let more = hits.len().saturating_sub(MAX_ROWS);
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(self.search_input.clone())
-            .when(!query.trim().is_empty(), |this| {
-                this.when(hits.is_empty(), |this| {
-                    this.child(div().text_color(rgb(0x6c6c78)).child("No matches."))
-                })
-                .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
-                    let label = node_label(&self.doc, self.doc.node(id)?);
-                    Some(
-                        div()
-                            .id(("search-result", id))
-                            .px_1()
-                            .rounded_sm()
-                            .truncate()
-                            .text_color(rgb(0xb8b8c4))
-                            .hover(|style| style.bg(rgb(0x33333c)))
-                            .child(label)
-                            .on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    this.jump_to(id, window, cx)
-                                }),
-                            ),
-                    )
-                }))
-                .when(more > 0, |this| {
-                    this.child(
-                        div()
-                            .text_color(rgb(0x6c6c78))
-                            .child(format!("…and {more} more")),
-                    )
-                })
-            })
+        deferred(
+            div()
+                .absolute()
+                .top(px(MENU_H + 12.0))
+                .left(px(VARS_W + ((canvas_w - CARD_W) / 2.0).max(8.0)))
+                .w(px(CARD_W))
+                .occlude()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .bg(theme::RAISED)
+                .border_1()
+                .border_color(theme::OUTLINE)
+                .rounded_md()
+                .shadow_lg()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .child(self.search_input.clone())
+                .child(
+                    div()
+                        .id("search-results")
+                        .flex()
+                        .flex_col()
+                        .max_h(px(280.0))
+                        .overflow_y_scroll()
+                        .when(!typed, |this| {
+                            this.child(
+                                div()
+                                    .px_1()
+                                    .type_hint()
+                                    .child("Search speakers, lines and aliases."),
+                            )
+                        })
+                        .when(typed && hits.is_empty(), |this| {
+                            this.child(div().px_1().type_hint().child("No matches."))
+                        })
+                        .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
+                            let node = self.doc.node(id)?;
+                            let (glyph, _, color) = kind_style(node.kind);
+                            Some(
+                                div()
+                                    .id(("search-result", id))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::HOVER))
+                                    .child(div().flex_none().w_4().text_color(color).child(glyph))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .one_line()
+                                            .text_color(theme::TEXT)
+                                            .child(node_label(&self.doc, node)),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.jump_to(id, window, cx)
+                                    })),
+                            )
+                        }))
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .type_hint()
+                                    .child(format!("…and {more} more")),
+                            )
+                        }),
+                ),
+        )
     }
 
     /// The document's global variables, in a pane of their own on the left — they belong to
@@ -1685,53 +1906,62 @@ impl Editor {
             .flex_none()
             .h_full()
             .p_3()
-            .bg(rgb(0x26262c))
+            .bg(theme::PANE)
             .border_r_1()
-            .border_color(rgb(0x3a3a44))
-            .text_color(rgb(0xd6d6dd))
-            // Two tabs over one list container, styled like `kind_picker` and wrapping for
-            // the same reason it does.
+            .border_color(theme::DIVIDER)
+            .text_color(theme::TEXT)
+            // A segmented control in equal thirds. Chips that wrapped left "Flows" alone on a
+            // second line, and "Variables (now)" while playing was wider than the pane; the
+            // live state is a line of its own below instead of a longer label.
             .child(
-                div().flex().flex_wrap().gap_1().children(
-                    [
-                        (
-                            SidePane::Variables,
-                            match playing {
-                                Some(_) => "Variables (now)",
-                                None => "Variables",
-                            },
-                            "pane-variables",
-                        ),
-                        (SidePane::Cast, "Cast", "pane-cast"),
-                        (SidePane::Flows, "Flows", "pane-flows"),
-                    ]
-                    .map(|(pane, label, element_id)| {
-                        let on = pane == self.pane;
-                        div()
-                            .id(element_id)
-                            .px_2()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .bg(if on { rgb(0x3a3a44) } else { rgb(0x2b2b33) })
-                            .text_color(if on { rgb(0xd6d6dd) } else { rgb(0x8a8a96) })
-                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
-                            .child(label)
-                            // A rename aimed at the list you just left would rename the wrong
-                            // thing, so switching tabs puts the shared field back to declaring.
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pane = pane;
-                                this.renaming = None;
-                                this.set = String::new();
-                                this.var_input.update(cx, |input, cx| {
-                                    input.set_content("", cx);
-                                    // The hint is how one field says which list its `+` adds to.
-                                    input.set_placeholder(declare_hint(pane), cx);
-                                });
-                                cx.notify();
-                            }))
-                    }),
-                ),
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .gap(px(2.0))
+                    .p(px(2.0))
+                    .rounded_md()
+                    .bg(theme::CANVAS)
+                    .children(
+                        [
+                            (SidePane::Variables, "Variables", "pane-variables"),
+                            (SidePane::Cast, "Cast", "pane-cast"),
+                            (SidePane::Flows, "Flows", "pane-flows"),
+                        ]
+                        .map(|(pane, label, element_id)| {
+                            let on = pane == self.pane;
+                            div()
+                                .id(element_id)
+                                .flex_1()
+                                .flex()
+                                .justify_center()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(theme::SMALL))
+                                .font_weight(if on {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .when(on, |this| this.bg(theme::PRESSED))
+                                .text_color(if on { theme::TEXT } else { theme::TEXT_FAINT })
+                                .hover(|style| style.text_color(theme::TEXT))
+                                .child(label)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.switch_pane(pane, cx)),
+                                )
+                        }),
+                    ),
             )
+            .when(playing.is_some() && self.pane == SidePane::Variables, |this| {
+                this.child(
+                    div()
+                        .type_hint()
+                        .text_color(theme::PLAYING)
+                        .child("Live values — read-only"),
+                )
+            })
             .child(
                 // The list scrolls, not the pane: the heading above and the declare field
                 // below stay put however many variables the document holds. `min_h(0)` is
@@ -1772,8 +2002,8 @@ impl Editor {
                                         .child(
                                             div()
                                                 .flex_grow()
-                                                .text_color(rgb(0x8a8a96))
-                                                .truncate()
+                                                .type_label()
+                                                .one_line()
                                                 .child(header.clone().unwrap_or_else(|| {
                                                     "(ungrouped)".to_string()
                                                 })),
@@ -1807,11 +2037,12 @@ impl Editor {
                         Rename::Set(name) => format!("Rename set \"{name}\""),
                         Rename::Item(name) => format!("Rename \"{name}\""),
                     };
-                    this.child(div().text_color(rgb(0x8a8a96)).truncate().child(what))
+                    this.child(div().type_label().one_line().child(what))
                 })
                 // Only above the variables, and not while the field holds a set name.
                 .when(pane == SidePane::Variables && !renaming_set, |this| {
-                    this.child(self.set_picker(&set, &sets, cx))
+                    this.child(div().type_section().pt_2().child("DECLARE IN SET"))
+                        .child(self.set_picker(&set, &sets, cx))
                 })
                 .child(
                 div()
@@ -1829,9 +2060,9 @@ impl Editor {
                             .px_2()
                             .rounded_sm()
                             .cursor_pointer()
-                            .bg(rgb(0x2b2b33))
-                            .text_color(rgb(0x8a8a96))
-                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                            .bg(theme::RAISED)
+                            .text_color(theme::TEXT_MUTED)
+                            .hover(|style| style.text_color(theme::TEXT))
                             .child(if is_rename { "✓" } else { "+" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let typed = this.var_input.read(cx).content().to_string();
@@ -1941,8 +2172,8 @@ impl Editor {
                                 .px_1()
                                 .rounded_sm()
                                 .cursor_pointer()
-                                .text_color(rgb(0x6c6c78))
-                                .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                                .text_color(theme::TEXT_FAINT)
+                                .hover(|style| style.text_color(theme::TEXT))
                                 .child("✗")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.renaming = None;
@@ -1989,8 +2220,8 @@ impl Editor {
             .px_1()
             .rounded_sm()
             .cursor_pointer()
-            .text_color(rgb(0xf7c96a))
-            .hover(|style| style.bg(rgb(0x33333c)))
+            .text_color(theme::ACCENT)
+            .hover(|style| style.bg(theme::HOVER))
             .child(n.to_string())
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.edit_value(target.clone(), n, cx);
@@ -2014,8 +2245,8 @@ impl Editor {
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(rgb(0x8a8a96))
-                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .text_color(theme::TEXT_MUTED)
+                    .hover(|style| style.text_color(theme::TEXT))
                     .child("✓")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let Some(target) = target.clone() else {
@@ -2082,10 +2313,10 @@ impl Editor {
                     .px_2()
                     .rounded_sm()
                     .cursor_pointer()
-                    .bg(if on { rgb(0x3a3a44) } else { rgb(0x2b2b33) })
-                    .text_color(if on { rgb(0xd6d6dd) } else { rgb(0x8a8a96) })
-                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
-                    .truncate()
+                    .bg(if on { theme::PRESSED } else { theme::RAISED })
+                    .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
+                    .hover(|style| style.text_color(theme::TEXT))
+                    .one_line()
                     .child(label)
                     // Only aims the field, so no checkpoint — same as a `\u{270e}`.
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2104,8 +2335,8 @@ impl Editor {
             .px_1()
             .rounded_sm()
             .cursor_pointer()
-            .text_color(rgb(0x6c6c78))
-            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .text_color(theme::TEXT_FAINT)
+            .hover(|style| style.text_color(theme::TEXT))
             .child("\u{270e}")
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.renaming = Some(Rename::Set(set.clone()));
@@ -2152,14 +2383,14 @@ impl Editor {
                     .id(("var-toggle", i))
                     .flex()
                     .gap_2()
-                    .flex_grow()
-                    .truncate()
-                    .text_color(if on { rgb(0xf7c96a) } else { rgb(0xb8b8c4) })
-                    .child(if on { "☑" } else { "☐" })
-                    .child(label)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(if on { theme::TRUE } else { theme::TEXT })
+                    .child(div().flex_none().child(if on { "☑" } else { "☐" }))
+                    .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .when(playing.is_none(), |this| {
                         this.cursor_pointer()
-                            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                            .hover(|style| style.text_color(theme::TEXT))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.doc.checkpoint();
                                 this.doc.set_default(&name, Value::Bool(!on));
@@ -2172,18 +2403,18 @@ impl Editor {
                 Value::Int(n) => div()
                     .flex()
                     .gap_2()
-                    .flex_grow()
-                    .truncate()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .items_center()
-                    .text_color(rgb(0xb8b8c4))
-                    .child(div().flex_grow().truncate().child(label))
+                    .text_color(theme::TEXT)
+                    .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .child(if editing {
                         self.value_editor(cx).into_any_element()
                     } else if playing.is_some() {
                         // Read-only while playing, like everything else in the pane.
                         div()
                             .px_1()
-                            .text_color(rgb(0xf7c96a))
+                            .text_color(theme::TEXT)
                             .child(n.to_string())
                             .into_any_element()
                     } else {
@@ -2201,8 +2432,12 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(if is_int { rgb(0xf7c96a) } else { rgb(0x6c6c78) })
-                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .text_color(if is_int {
+                            theme::ACCENT
+                        } else {
+                            theme::TEXT_FAINT
+                        })
+                        .hover(|style| style.text_color(theme::TEXT))
                         .child("#")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.doc.checkpoint();
@@ -2228,8 +2463,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::TEXT))
                         .child("✎")
                         // Not an edit yet, so no checkpoint — it only aims
                         // the field the declare button already uses.
@@ -2250,8 +2485,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::DANGER))
                         .child("×")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.doc.checkpoint();
@@ -2297,29 +2532,19 @@ impl Editor {
             .child(
                 div()
                     .id(("flow-name", i))
-                    .flex_grow()
-                    .truncate()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .one_line()
                     .cursor_pointer()
-                    .text_color(if on { rgb(0xd6d6dd) } else { rgb(0xb8b8c4) })
-                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
+                    .hover(|style| style.text_color(theme::TEXT))
                     .child(if main { "(main)".to_string() } else { flow })
-                    // Only the view moves, so no checkpoint: which canvas you are looking
-                    // at is not a document edit. The selection goes, though — nodes on the
-                    // canvas you left are neither drawn nor hit-testable, so leaving them
-                    // selected would let the inspector edit an invisible node and `Tab`
-                    // branch off one, which is the only way to author a `CrossFlowEdge`.
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.flow != to_show {
-                            this.flow.clone_from(&to_show);
-                            this.select(Selection::None, cx);
-                        }
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(move |this, _, _, cx| this.show_flow(&to_show, cx))),
             )
             .child(
                 div()
                     .flex_none()
-                    .text_color(rgb(0x6c6c78))
+                    .text_color(theme::TEXT_FAINT)
                     .child(count.to_string()),
             )
             .when(!playing && selected > 0 && !on, |this| {
@@ -2329,8 +2554,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::TEXT))
                         .child("→")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let ids = this.selection.nodes().to_vec();
@@ -2364,8 +2589,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::TEXT))
                         .child("\u{270e}")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2381,8 +2606,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::DANGER))
                         .child("\u{d7}")
                         // The nodes come back to the main flow rather than going with it:
                         // deleting a canvas must not delete what is drawn on it.
@@ -2447,9 +2672,10 @@ impl Editor {
             )
             .child(
                 div()
-                    .flex_grow()
-                    .truncate()
-                    .text_color(rgb(0xb8b8c4))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .one_line()
+                    .text_color(theme::TEXT)
                     .child(name),
             )
             .when(!playing, |this| {
@@ -2459,8 +2685,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::TEXT))
                         .child("✎")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2476,8 +2702,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(rgb(0x6c6c78))
-                        .hover(|style| style.text_color(rgb(0xff7a7a)))
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::DANGER))
                         .child("×")
                         // Undeclaring only: the nodes keep saying the name, and the problem
                         // list is what points out that nobody declared it.
@@ -2515,13 +2741,13 @@ impl Editor {
     /// leading out of it. Replaces the inspector while it is up, so the sidebar is never
     /// both an editor and a player.
     fn play_panel(&self, path: &[NodeId], cx: &mut Context<Self>) -> impl IntoElement {
-        let row = |id: (&'static str, usize), label: String, color: u32| {
+        let row = |id: (&'static str, usize), label: String, color: Rgba| {
             div()
                 .id(id)
                 .px_1()
                 .rounded_sm()
-                .text_color(rgb(color))
-                .hover(|style| style.bg(rgb(0x33333c)))
+                .text_color(color)
+                .hover(|style| style.bg(theme::HOVER))
                 .child(label)
         };
 
@@ -2537,10 +2763,14 @@ impl Editor {
                     .flex()
                     .flex_row()
                     .justify_between()
-                    .child(div().text_color(rgb(0x9ecbff)).child("Playing"))
-                    .child(row(("play-stop", 0), "Stop".into(), 0x8a8a96).on_click(
-                        cx.listener(|this, _, window, cx| this.on_stop_play(&StopPlay, window, cx)),
-                    )),
+                    .child(div().type_title().child("Playing"))
+                    .child(
+                        row(("play-stop", 0), "Stop".into(), theme::TEXT_MUTED).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.on_stop_play(&StopPlay, window, cx)
+                            }),
+                        ),
+                    ),
             )
             .map(|this| {
                 // The node can be deleted from the canvas mid-play; say so rather than
@@ -2548,7 +2778,7 @@ impl Editor {
                 let Some(node) = node else {
                     return this.child(
                         div()
-                            .text_color(rgb(0xff7a7a))
+                            .text_color(theme::DANGER)
                             .child("This node has been deleted."),
                     );
                 };
@@ -2558,7 +2788,7 @@ impl Editor {
                 if !self.doc.pauses_play(current) {
                     return this.child(
                         div()
-                            .text_color(rgb(0xff7a7a))
+                            .text_color(theme::DANGER)
                             .child("The flow stops here — nothing leads on."),
                     );
                 }
@@ -2571,7 +2801,7 @@ impl Editor {
                 this.when(!speaker.is_empty(), |this| {
                     this.child(
                         div()
-                            .text_color(speaker_color(&self.doc, speaker, 0x8a8a96))
+                            .text_color(speaker_color(&self.doc, speaker, theme::SPEAKER_DEFAULT))
                             .child(speaker.to_string()),
                     )
                 })
@@ -2579,9 +2809,7 @@ impl Editor {
                 // choices with nothing above them rather than an "unwritten" placeholder.
                 .when(!(is_hub && text.is_empty()), |this| {
                     this.child(if text.is_empty() {
-                        div()
-                            .text_color(rgb(0x6c6c78))
-                            .child("(no line written yet)")
+                        div().type_hint().child("(no line written yet)")
                     } else {
                         div().child(text.to_string())
                     })
@@ -2593,7 +2821,7 @@ impl Editor {
                 self.effects_fired(path)
                     .into_iter()
                     .map(|(var, op, value)| {
-                        div().text_color(rgb(0x8ce99a)).child(format!(
+                        div().text_color(theme::KIND_INSTRUCTION).child(format!(
                             "{var} {} {}",
                             set_text(op),
                             value_text(value)
@@ -2619,11 +2847,11 @@ impl Editor {
                         if self.doc.spent(path, current, to) {
                             return div()
                                 .px_1()
-                                .text_color(rgb(0x6c6c78))
+                                .text_color(theme::TEXT_DISABLED)
                                 .child(format!("→ {label} (already taken)"))
                                 .into_any_element();
                         }
-                        row(("play-choice", i), format!("→ {label}"), 0xd6d6dd)
+                        row(("play-choice", i), format!("→ {label}"), theme::TEXT)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.play_advance(to, window, cx)
                             }))
@@ -2638,13 +2866,7 @@ impl Editor {
                     .choices(current)
                     .iter()
                     .all(|&(to, _)| self.doc.spent(path, current, to)),
-                |this| {
-                    this.child(
-                        div()
-                            .text_color(rgb(0x6c6c78))
-                            .child("End of conversation."),
-                    )
-                },
+                |this| this.child(div().type_hint().child("End of conversation.")),
             )
             .child(
                 div()
@@ -2654,21 +2876,23 @@ impl Editor {
                     // Offered only when there is an earlier node the player actually saw:
                     // the invisible run walked through to get here is not a step back.
                     .when(self.doc.step_back(&mut path.to_vec()), |this| {
-                        this.child(row(("play-nav", 0), "← Back".into(), 0x8a8a96).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                let Some(mut path) = this.play.take() else {
-                                    return;
-                                };
-                                this.doc.step_back(&mut path);
-                                this.follow(&path, window);
-                                this.play = Some(path);
-                                cx.notify();
-                            }),
-                        ))
+                        this.child(
+                            row(("play-nav", 0), "← Back".into(), theme::TEXT_MUTED).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    let Some(mut path) = this.play.take() else {
+                                        return;
+                                    };
+                                    this.doc.step_back(&mut path);
+                                    this.follow(&path, window);
+                                    this.play = Some(path);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
                     })
                     .child(
-                        row(("play-nav", 1), "Restart".into(), 0x8a8a96).on_click(cx.listener(
-                            |this, _, window, cx| {
+                        row(("play-nav", 1), "Restart".into(), theme::TEXT_MUTED).on_click(
+                            cx.listener(|this, _, window, cx| {
                                 let Some(path) = this.play.as_ref() else {
                                     return;
                                 };
@@ -2676,77 +2900,393 @@ impl Editor {
                                 // opens on an instruction runs it again.
                                 let seed = path[0];
                                 this.start_play(seed, window, cx);
-                            },
-                        )),
+                            }),
+                        ),
                     ),
             )
     }
 
-    /// Everything wrong with the document, worst first. Clicking a row jumps to the node.
-    fn problems_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        /// Same ceiling as the search results, for the same reason.
-        const MAX_ROWS: usize = 20;
-
-        // ponytail: revalidates the whole document each frame. Cheap at this scale, and a
-        // cache would need invalidating on every edit, undo and load.
-        let problems = self.doc.problems();
-        let more = problems.len().saturating_sub(MAX_ROWS);
+    /// The strip under the three panes: what is true of the *document and the view* rather
+    /// than of the selection — problems, which canvas, the zoom, what the last action did, and
+    /// whether there is unsaved work. All of it used to be stacked in the inspector at the
+    /// same weight as the fields it sat between, and changed the inspector's height as it
+    /// came and went.
+    fn status_bar(&self, problems: &[Problem], cx: &mut Context<Self>) -> impl IntoElement {
+        let errors = problems
+            .iter()
+            .filter(|p| p.severity() == Severity::Error)
+            .count();
+        let warnings = problems.len() - errors;
+        let flow = if self.flow.is_empty() {
+            "main".to_string()
+        } else {
+            self.flow.clone()
+        };
+        let cell = |id: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h_full()
+                .px_2()
+                .type_hint()
+        };
 
         div()
+            .relative()
             .flex()
-            .flex_col()
-            .gap_1()
-            .when(!problems.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_color(rgb(0x8a8a96))
-                        .child(format!("Problems ({})", problems.len())),
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .h(px(STATUS_H))
+            .bg(theme::PANE)
+            .border_t_1()
+            .border_color(theme::DIVIDER)
+            .child(
+                cell("problems-badge")
+                    .cursor_pointer()
+                    .when(self.problems_open, |this| this.bg(theme::PRESSED))
+                    .hover(|style| style.bg(theme::HOVER))
+                    .map(|this| match (errors, warnings) {
+                        (0, 0) => this
+                            .child(div().text_color(theme::SUCCESS).child("✓"))
+                            .child("No problems"),
+                        (errors, warnings) => this
+                            .when(errors > 0, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .text_color(theme::DANGER)
+                                        .child("✕")
+                                        .child(errors.to_string()),
+                                )
+                            })
+                            .when(warnings > 0, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .text_color(theme::WARNING)
+                                        .child("▲")
+                                        .child(warnings.to_string()),
+                                )
+                            }),
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_problems(&ToggleProblems, window, cx)
+                    })),
+            )
+            .child(
+                cell("flow-cell")
+                    .child("Flow")
+                    .child(div().text_color(theme::TEXT_MUTED).child(flow)),
+            )
+            // A click resets to 100%, which is the thing you want a zoom readout for.
+            .child(
+                cell("zoom-cell")
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                    .child(format!("{}%", (self.view.zoom * 100.0).round()))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_zoom_reset(&ZoomReset, window, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px_2()
+                    .one_line()
+                    .text_size(px(theme::SMALL))
+                    .text_color(theme::TEXT_MUTED)
+                    .children(self.status.clone()),
+            )
+            .child(
+                cell("file-cell")
+                    .child(self.file_name())
+                    .when(self.doc.is_dirty(), |this| {
+                        this.child(div().text_color(theme::WARNING).child("●"))
+                    }),
+            )
+            .child(
+                cell("help-button")
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                    .when(self.help_open, |this| this.bg(theme::PRESSED))
+                    .child("?")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.on_show_help(&ShowHelp, window, cx)),
+                    ),
+            )
+            .when(self.problems_open, |this| {
+                this.child(self.problems_drawer(problems, cx))
+            })
+    }
+
+    /// Everything wrong with the document, worst first, in a card that opens upward from the
+    /// status bar's badge. Clicking a row jumps to the node — or selects the edge, for the
+    /// problems a click on the canvas cannot reach. It stays open while you do, so a list can
+    /// be worked down; Escape or the badge closes it.
+    fn problems_drawer(&self, problems: &[Problem], cx: &mut Context<Self>) -> impl IntoElement {
+        /// Scrolls, so this only bounds the work done per frame.
+        const MAX_ROWS: usize = 100;
+        let more = problems.len().saturating_sub(MAX_ROWS);
+
+        deferred(
+            div()
+                .absolute()
+                .bottom(px(STATUS_H))
+                .left(px(8.0))
+                .w(px(480.0))
+                .occlude()
+                .flex()
+                .flex_col()
+                .bg(theme::RAISED)
+                .border_1()
+                .border_color(theme::OUTLINE)
+                .rounded_md()
+                .shadow_lg()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
                 )
-                .children(
-                    problems
-                        .iter()
-                        .take(MAX_ROWS)
-                        .enumerate()
-                        .map(|(i, problem)| {
-                            let color = match problem.severity() {
-                                Severity::Error => rgb(0xff7a7a),
-                                Severity::Warning => rgb(0xb8b8c4),
-                            };
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(theme::DIVIDER)
+                        .child(div().type_label().child("Problems"))
+                        .child(div().type_hint().child(format!("{}", problems.len()))),
+                )
+                .child(
+                    div()
+                        .id("problems-list")
+                        .flex()
+                        .flex_col()
+                        .p_1()
+                        .max_h(px(280.0))
+                        .overflow_y_scroll()
+                        .when(problems.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .flex()
+                                    .gap_2()
+                                    .type_hint()
+                                    .child(div().text_color(theme::SUCCESS).child("✓"))
+                                    .child("Nothing to fix."),
+                            )
+                        })
+                        .children(
+                            problems
+                                .iter()
+                                .take(MAX_ROWS)
+                                .enumerate()
+                                .map(|(i, problem)| {
+                                    // Severity lives on the glyph, not the sentence: a whole row in
+                                    // amber made three routine dead ends the loudest thing on
+                                    // screen. An error's text stays a tier brighter, since it is
+                                    // the one that means the document is broken.
+                                    let (glyph, color, text) = match problem.severity() {
+                                        Severity::Error => ("✕", theme::DANGER, theme::TEXT),
+                                        Severity::Warning => {
+                                            ("▲", theme::WARNING, theme::TEXT_MUTED)
+                                        }
+                                    };
+                                    let (node, edge) = (problem.node(), problem.edge());
+                                    div()
+                                        .id(("problem", i))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w_4()
+                                                .text_size(px(theme::SMALL))
+                                                .text_color(color)
+                                                .child(glyph),
+                                        )
+                                        // `min_w(0)` + the clamp is what makes the ellipsis appear
+                                        // instead of the row being clipped mid-word.
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .one_line()
+                                                .text_color(text)
+                                                .child(problem_text(problem, &self.doc)),
+                                        )
+                                        .when(node.is_some() || edge.is_some(), |this| {
+                                            this.cursor_pointer()
+                                                .hover(|style| style.bg(theme::HOVER))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        // An edge problem selects its edge, since a
+                                                        // click on the canvas cannot: a duplicate lies
+                                                        // under its original and a cross-flow edge is
+                                                        // drawn nowhere. Selected, it can be deleted
+                                                        // like any other.
+                                                        if let Some(index) = edge {
+                                                            this.select_edge(index, window, cx);
+                                                        } else if let Some(id) = node {
+                                                            this.jump_to(id, window, cx);
+                                                        }
+                                                    },
+                                                ))
+                                        })
+                                }),
+                        )
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .type_hint()
+                                    .child(format!("…and {more} more")),
+                            )
+                        }),
+                ),
+        )
+    }
+
+    /// Every command and gesture, over a dimmed window. The shortcuts are read straight off
+    /// `MENUS`, so the sheet is the menus' own table and cannot fall out of step with them;
+    /// only the mouse gestures, which no menu holds, are written out here.
+    fn help_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The mouse map, as `on_mouse_down` has it. Alt+left and middle both pan.
+        const MOUSE: &[(&str, &str)] = &[
+            ("Connect two nodes", "Drag from a port"),
+            ("New node", "Double-click the canvas"),
+            ("Select several", "Drag on empty canvas"),
+            ("Add to selection", "Shift-click"),
+            ("Pan", "Middle-drag or Alt-drag"),
+            ("Zoom", "Scroll"),
+            ("Back to the canvas", "Esc"),
+        ];
+        let group = |title: &str, rows: Vec<(String, String)>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .w(px(250.0))
+                .child(div().type_section().pb_1().child(title.to_uppercase()))
+                .children(rows.into_iter().map(|(what, keys)| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .child(
                             div()
-                                .id(("problem", i))
+                                .min_w(px(0.0))
+                                .one_line()
+                                .text_color(theme::TEXT_MUTED)
+                                .child(what),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
                                 .px_1()
                                 .rounded_sm()
-                                .truncate()
-                                .text_color(color)
-                                .child(problem_text(problem, &self.doc))
-                                .when_some(problem.node(), |this, id| {
-                                    this.hover(|style| style.bg(rgb(0x33333c))).on_click(
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.jump_to(id, window, cx)
-                                        }),
-                                    )
-                                })
-                                // An edge problem selects its edge, since a click on the
-                                // canvas cannot: a duplicate lies under its original and a
-                                // cross-flow edge is drawn nowhere. Selected, it can be
-                                // deleted like any other.
-                                .when_some(problem.edge(), |this, index| {
-                                    this.hover(|style| style.bg(rgb(0x33333c))).on_click(
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.select_edge(index, window, cx)
-                                        }),
-                                    )
-                                })
-                        }),
+                                .bg(theme::CANVAS)
+                                .type_hint()
+                                .text_color(theme::TEXT)
+                                .child(keys),
+                        )
+                }))
+        };
+
+        deferred(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::SCRIM)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.help_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
                 )
-                .when(more > 0, |this| {
-                    this.child(
-                        div()
-                            .text_color(rgb(0x6c6c78))
-                            .child(format!("…and {more} more")),
-                    )
-                })
-            })
+                .child(
+                    div()
+                        .id("help-card")
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .max_h(px(640.0))
+                        .overflow_y_scroll()
+                        .p_5()
+                        .bg(theme::RAISED)
+                        .border_1()
+                        .border_color(theme::OUTLINE)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .child(div().type_title().child("Keyboard & mouse"))
+                                .child(div().type_hint().child("Esc to close")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap_x_6()
+                                .gap_y_4()
+                                .w(px(540.0))
+                                .children(MENUS.iter().map(|(name, items)| {
+                                    group(
+                                        name,
+                                        items
+                                            .iter()
+                                            .map(|(label, keys, _)| {
+                                                (label.to_string(), keys.to_string())
+                                            })
+                                            .collect(),
+                                    )
+                                }))
+                                .child(group(
+                                    "Mouse",
+                                    MOUSE
+                                        .iter()
+                                        .map(|(what, how)| (what.to_string(), how.to_string()))
+                                        .collect(),
+                                )),
+                        ),
+                ),
+        )
     }
 
     /// What the node is. What a conversion keeps and drops is `Doc::set_kind`'s to decide,
@@ -2755,27 +3295,38 @@ impl Editor {
     fn kind_picker(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
 
-        // Wraps: six labels do not fit across `SIDEBAR_W`, and without this the last kind
-        // is simply clipped off the right edge — present but unreachable.
-        div().flex().flex_wrap().gap_1().children(
+        // A grid, not a wrapping row: six labels do not fit across `SIDEBAR_W`, and wrapping
+        // them left a ragged second row with one chip alone on it. Three even columns hold
+        // the longest label ("Instruction") with room to spare.
+        div().grid().grid_cols(3).gap_1().children(
             [
-                (NodeKind::Speech, "Speech", "kind-speech"),
-                (NodeKind::Hub, "Hub", "kind-hub"),
-                (NodeKind::Jump, "Jump", "kind-jump"),
-                (NodeKind::Instruction, "Instruction", "kind-instruction"),
-                (NodeKind::Condition, "Condition", "kind-condition"),
-                (NodeKind::Note, "Note", "kind-note"),
+                (NodeKind::Speech, "kind-speech"),
+                (NodeKind::Hub, "kind-hub"),
+                (NodeKind::Jump, "kind-jump"),
+                (NodeKind::Instruction, "kind-instruction"),
+                (NodeKind::Condition, "kind-condition"),
+                (NodeKind::Note, "kind-note"),
             ]
-            .map(|(kind, label, element_id)| {
+            .map(|(kind, element_id)| {
                 let on = kind == current;
+                let (glyph, label, color) = kind_style(kind);
                 div()
                     .id(element_id)
-                    .px_2()
-                    .rounded_sm()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .py_1()
+                    .rounded_md()
                     .cursor_pointer()
-                    .bg(if on { rgb(0x3a3a44) } else { rgb(0x2b2b33) })
-                    .text_color(if on { rgb(0xd6d6dd) } else { rgb(0x8a8a96) })
-                    .hover(|style| style.text_color(rgb(0xd6d6dd)))
+                    .text_size(px(theme::SMALL))
+                    .bg(if on { theme::PRESSED } else { theme::RAISED })
+                    .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
+                    .hover(|style| style.text_color(theme::TEXT))
+                    // The glyph keeps its kind's colour whether or not the chip is on, so the
+                    // picker doubles as the key to what the canvas draws.
+                    .child(div().text_color(color).child(glyph))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.doc.node(id).is_none_or(|node| node.kind == kind) {
@@ -2783,6 +3334,9 @@ impl Editor {
                         }
                         this.doc.checkpoint();
                         this.doc.set_kind(id, kind);
+                        // Changing kind in place does not reload the fields.
+                        this.text_input
+                            .update(cx, |input, cx| input.set_placeholder(text_prompt(kind), cx));
                         cx.notify();
                     }))
             }),
@@ -2804,14 +3358,14 @@ impl Editor {
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(rgb(0x8a8a96)).child(match mode {
+            .child(div().type_label().child(match mode {
                 VarRow::Sets => "Sets",
                 VarRow::Checks => "Checks",
             }))
             .when(self.doc.variables.is_empty(), |this| {
                 this.child(
                     div()
-                        .text_color(rgb(0x6c6c78))
+                        .type_hint()
                         .child("Declare one in the Variables pane first."),
                 )
             })
@@ -2841,10 +3395,10 @@ impl Editor {
                         // A flag is a checkbox; a number has no box to tick, so it shows the
                         // operator there instead and the value beside the name.
                         let (glyph, color) = match current {
-                            None => ("—", rgb(0x6c6c78)),
-                            Some((Value::Bool(true), _)) => ("☑", rgb(0x8ce99a)),
-                            Some((Value::Bool(false), _)) => ("☐", rgb(0xf7c96a)),
-                            Some((Value::Int(_), op)) => (op, rgb(0x8ce99a)),
+                            None => ("—", theme::TEXT_FAINT),
+                            Some((Value::Bool(true), _)) => ("☑", theme::TRUE),
+                            Some((Value::Bool(false), _)) => ("☐", theme::FALSE),
+                            Some((Value::Int(_), op)) => (op, theme::ACCENT),
                         };
                         let number = match current {
                             Some((Value::Int(n), _)) => Some(n),
@@ -2865,11 +3419,12 @@ impl Editor {
                                     .id(("var-row", i))
                                     .flex()
                                     .gap_2()
-                                    .flex_grow()
-                                    .truncate()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .one_line()
                                     .cursor_pointer()
                                     .text_color(color)
-                                    .hover(|style| style.bg(rgb(0x33333c)))
+                                    .hover(|style| style.bg(theme::HOVER))
                                     .child(glyph)
                                     .child(variable.name.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2952,8 +3507,8 @@ impl Editor {
             .flex()
             .gap_2()
             .cursor_pointer()
-            .text_color(if on { TRUE_COLOR } else { FALSE_COLOR })
-            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .text_color(if on { theme::TRUE } else { theme::FALSE })
+            .hover(|style| style.text_color(theme::TEXT))
             .child(if on {
                 "☑ true branch"
             } else {
@@ -2979,8 +3534,8 @@ impl Editor {
             .flex()
             .gap_2()
             .cursor_pointer()
-            .text_color(rgb(if on { 0xd6d6dd } else { 0x8a8a96 }))
-            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
+            .hover(|style| style.text_color(theme::TEXT))
             .child(if on { "☑ once only" } else { "☐ once only" })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.doc.edges.get(index).is_none() {
@@ -3001,8 +3556,8 @@ impl Editor {
             .flex()
             .gap_2()
             .cursor_pointer()
-            .text_color(if on { rgb(0xf7c96a) } else { rgb(0x8a8a96) })
-            .hover(|style| style.text_color(rgb(0xd6d6dd)))
+            .text_color(if on { theme::ENDING } else { theme::TEXT_MUTED })
+            .hover(|style| style.text_color(theme::TEXT))
             .child(if on { "☑" } else { "☐" })
             .child("Ending")
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3018,135 +3573,313 @@ impl Editor {
     }
 
     /// Inspector for the selected node or edge.
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The inspector: scoped to the selection, and nothing else. Find, the problem list, the
+    /// key hints and the last status message used to be stacked in here at the same weight as
+    /// the fields; each now has the surface its scope belongs to (the find overlay, the
+    /// problems drawer, the cheat sheet, the status bar). What is left scrolls, so a tall
+    /// Sets list never pushes a field off the bottom of a short window.
+    fn sidebar(&self, problems: &[Problem], cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(SIDEBAR_W))
+            .h_full()
+            .bg(theme::PANE)
+            .border_l_1()
+            .border_color(theme::DIVIDER)
+            .text_color(theme::TEXT)
+            .child(
+                div()
+                    .id("inspector")
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p_3()
+                    .child(self.inspector(problems, cx)),
+            )
+    }
+
+    /// What the sidebar shows for the current state: the player while playing, otherwise
+    /// the selection's own fields, or a summary of the document when nothing is selected.
+    fn inspector(&self, problems: &[Problem], cx: &mut Context<Self>) -> AnyElement {
         let field = |label: &str, input: &Entity<TextInput>| {
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(rgb(0x8a8a96)).child(label.to_string()))
+                .child(div().type_label().child(label.to_string()))
                 .child(input.clone())
         };
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .p_3()
-            .bg(rgb(0x26262c))
-            .border_l_1()
-            .border_color(rgb(0x3a3a44))
-            .text_color(rgb(0xd6d6dd))
-            .child(self.search_panel(cx))
-            .when_some(self.play.clone(), |this, path| {
-                this.child(self.play_panel(&path, cx))
-            })
-            .when(self.play.is_none(), |this| {
-                this.map(|this| match (self.selection.only_node(), &self.selection) {
-                    (Some(id), _) => {
-                        // Each kind shows the fields it actually has: a jump has none of
-                        // its own, and a hub has no speaker because nobody speaks at one.
-                        let kind = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
-                        this.child(
-                            div()
-                                .text_color(rgb(0x9ecbff))
-                                .child(node_number(&self.doc, id)),
-                        )
-                        .child(self.kind_picker(id, cx))
-                        // Outside every kind guard on purpose: an alias is orthogonal to
-                        // `NodeKind` the way `end` is, and a game may want to enter a
-                        // conversation at a hub or a condition too.
-                        .child(field("Alias", &self.alias_input))
-                        .when(kind == NodeKind::Speech, |this| {
-                            this.child(field("Speaker", &self.speaker_input))
-                        })
-                        .when(
-                            matches!(kind, NodeKind::Speech | NodeKind::Hub | NodeKind::Note),
-                            |this| {
-                                let label = match kind {
-                                    NodeKind::Hub => "Label",
-                                    NodeKind::Note => "Note",
-                                    _ => "Text",
-                                };
-                                this.child(field(label, &self.text_input))
-                            },
-                        )
-                        .when(kind == NodeKind::Instruction, |this| {
-                            this.child(self.var_rows(id, VarRow::Sets, cx))
-                        })
-                        .when(kind == NodeKind::Condition, |this| {
-                            this.child(self.var_rows(id, VarRow::Checks, cx))
-                        })
-                        .when(kind == NodeKind::Speech, |this| {
-                            this.child(self.end_toggle(id, cx))
-                        })
-                    }
-                    (None, Selection::Nodes(ids)) => this
-                        .child(
-                            div()
-                                .text_color(rgb(0x9ecbff))
-                                .child(format!("{} nodes selected", ids.len())),
-                        )
-                        .child(
-                            div()
-                                .text_color(rgb(0x6c6c78))
-                                .child("Drag any of them to move the group."),
-                        ),
-                    (None, Selection::Edge(index)) => {
-                        let index = *index;
-                        let edge = self.doc.edges.get(index);
-                        let title = match edge {
-                            Some(edge) => format!(
-                                "{} → {}",
-                                node_number(&self.doc, edge.from),
-                                node_number(&self.doc, edge.to)
-                            ),
-                            None => "Edge".into(),
-                        };
-                        // Out of a condition this edge is a pin, not a choice: the player
-                        // never picks it, so a label would be text nobody ever reads.
-                        let from_condition =
-                            edge.is_some_and(|edge| self.doc.is_condition(edge.from));
-                        this.child(div().text_color(rgb(0x9ecbff)).child(title))
-                            .when(from_condition, |this| {
-                                this.child(self.branch_toggle(index, cx))
-                            })
-                            .when(!from_condition, |this| {
-                                this.child(field("Choice", &self.label_input))
-                            })
-                            // Only where the player is the one choosing. Out of an
-                            // instruction or a jump the walk has to take the edge it finds,
-                            // so a once-only flag there would be a promise nothing keeps.
-                            .when(
-                                edge.is_some_and(|edge| self.doc.pauses_play(edge.from)),
-                                |this| this.child(self.once_toggle(index, cx)),
-                            )
-                    }
-                    _ => this.child(
-                        div()
-                            .text_color(rgb(0x6c6c78))
-                            .child("Select a node or an edge to edit it."),
-                    ),
-                })
-            })
-            .child(self.problems_panel(cx))
-            .child(
+        if let Some(path) = self.play.clone() {
+            return self.play_panel(&path, cx).into_any_element();
+        }
+
+        match (self.selection.only_node(), &self.selection) {
+            (Some(id), _) => {
+                // Each kind shows the fields it actually has: a jump has none of its own,
+                // and a hub has no speaker because nobody speaks at one.
+                let kind = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
+                let (glyph, name, color) = kind_style(kind);
+                let text_label = match kind {
+                    NodeKind::Hub => "Label",
+                    NodeKind::Note => "Note",
+                    _ => "Text",
+                };
                 div()
-                    .mt_auto()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .text_color(rgb(0x6c6c78))
-                    .when_some(self.status.clone(), |this, status| this.child(status))
-                    .when(self.selection != Selection::None, |this| {
-                        this.child("Esc — back to canvas")
+                    .gap_4()
+                    .child(inspector_header(
+                        glyph,
+                        color,
+                        name,
+                        node_number(&self.doc, id),
+                    ))
+                    .child(section("Type", self.kind_picker(id, cx)))
+                    .when(kind == NodeKind::Speech, |this| {
+                        this.child(section(
+                            "Content",
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(field("Speaker", &self.speaker_input))
+                                .child(field("Text", &self.text_input)),
+                        ))
                     })
-                    .child("Middle-drag pans · Shift-click adds to the selection")
-                    .child("Ctrl+N new · Ctrl+S save · Ctrl+O open"),
-            )
+                    .when(matches!(kind, NodeKind::Hub | NodeKind::Note), |this| {
+                        this.child(section("Content", field(text_label, &self.text_input)))
+                    })
+                    .when(kind == NodeKind::Instruction, |this| {
+                        this.child(section("Logic", self.var_rows(id, VarRow::Sets, cx)))
+                    })
+                    .when(kind == NodeKind::Condition, |this| {
+                        this.child(section("Logic", self.var_rows(id, VarRow::Checks, cx)))
+                    })
+                    // A jump has no fields of its own, which read as a broken inspector.
+                    .when(kind == NodeKind::Jump, |this| {
+                        this.child(section(
+                            "Target",
+                            div().type_hint().child(
+                                "Drag from this node's port to the node it should jump to. \
+                                 The box names it.",
+                            ),
+                        ))
+                    })
+                    // Outside every kind guard on purpose: an alias is orthogonal to
+                    // `NodeKind` the way `end` is, and a game may want to enter a
+                    // conversation at a hub or a condition too.
+                    .child(section(
+                        "Identity",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(field("Alias", &self.alias_input))
+                            .when(kind == NodeKind::Speech, |this| {
+                                this.child(self.end_toggle(id, cx))
+                            }),
+                    ))
+                    .into_any_element()
+            }
+            (None, Selection::Nodes(ids)) => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(inspector_header(
+                    "#",
+                    theme::ACCENT,
+                    "Selection",
+                    format!("{} nodes", ids.len()),
+                ))
+                .child(
+                    div()
+                        .type_hint()
+                        .child("Drag any of them to move the group."),
+                )
+                .into_any_element(),
+            (None, Selection::Edge(index)) => {
+                let index = *index;
+                let edge = self.doc.edges.get(index);
+                let ends = match edge {
+                    Some(edge) => format!(
+                        "{} → {}",
+                        node_number(&self.doc, edge.from),
+                        node_number(&self.doc, edge.to)
+                    ),
+                    None => "a missing edge".into(),
+                };
+                // Out of a condition this edge is a pin, not a choice: the player never picks
+                // it, so a label would be text nobody ever reads.
+                let from_condition = edge.is_some_and(|edge| self.doc.is_condition(edge.from));
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(inspector_header(
+                        "→",
+                        theme::EDGE,
+                        if from_condition { "Branch" } else { "Choice" },
+                        ends,
+                    ))
+                    .child(if from_condition {
+                        section("Branch", self.branch_toggle(index, cx)).into_any_element()
+                    } else {
+                        section(
+                            "Text",
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(self.label_input.clone())
+                                // Only where the player is the one choosing. Out of an
+                                // instruction or a jump the walk has to take the edge it
+                                // finds, so a once-only flag there would be a promise
+                                // nothing keeps.
+                                .when(
+                                    edge.is_some_and(|edge| self.doc.pauses_play(edge.from)),
+                                    |this| this.child(self.once_toggle(index, cx)),
+                                ),
+                        )
+                        .into_any_element()
+                    })
+                    .into_any_element()
+            }
+            _ => {
+                // What the document is, while nothing in it is selected: the inspector's
+                // empty state, which used to be one line telling you to select something.
+                let stat = |label: &str, value: String, color: Rgba| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .child(div().text_color(theme::TEXT_MUTED).child(label.to_string()))
+                        .child(div().text_color(color).child(value))
+                };
+                let errors = problems
+                    .iter()
+                    .filter(|p| p.severity() == Severity::Error)
+                    .count();
+                let (problem_text, problem_color) = match (problems.len(), errors) {
+                    (0, _) => ("None".to_string(), theme::SUCCESS),
+                    (n, 0) => (n.to_string(), theme::WARNING),
+                    (n, _) => (n.to_string(), theme::DANGER),
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(inspector_header(
+                        "≡",
+                        theme::TEXT_MUTED,
+                        "Document",
+                        self.file_name(),
+                    ))
+                    .child(section(
+                        "Overview",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(stat("Nodes", self.doc.nodes.len().to_string(), theme::TEXT))
+                            .child(stat(
+                                "Conversations",
+                                self.doc.roots().len().to_string(),
+                                theme::TEXT,
+                            ))
+                            .child(stat(
+                                "Variables",
+                                self.doc.variables.len().to_string(),
+                                theme::TEXT,
+                            ))
+                            .child(stat(
+                                "Cast",
+                                self.doc.characters.len().to_string(),
+                                theme::TEXT,
+                            ))
+                            // The main flow is always there and never listed.
+                            .child(stat(
+                                "Flows",
+                                (self.doc.all_flows().len() + 1).to_string(),
+                                theme::TEXT,
+                            ))
+                            .child(stat("Problems", problem_text, problem_color)),
+                    ))
+                    .child(section(
+                        "Tips",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .type_hint()
+                            .child(if self.doc.nodes.is_empty() {
+                                "Double-click the canvas to add the first node."
+                            } else {
+                                "Click a node or an edge to edit it."
+                            })
+                            .child("Ctrl+F finds a node.")
+                            .child("F1 lists every shortcut."),
+                    ))
+                    .into_any_element()
+            }
+        }
     }
+}
+
+/// A named group in the inspector. The rule and the small capitals are what separate one
+/// group of fields from the next: with neither, Alias, Speaker and Text were three lines of
+/// the same weight, and the rarely-touched one sat first.
+fn section(title: &str, body: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .pt_4()
+        .border_t_1()
+        .border_color(theme::DIVIDER)
+        .child(div().type_section().child(title.to_uppercase()))
+        .child(body)
+}
+
+/// What the inspector is about: a glyph chip in the thing's colour, its name, and where it
+/// is. The one heavy, large element in the pane, so the eye lands here first.
+fn inspector_header(
+    glyph: &'static str,
+    color: Rgba,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_8()
+                .rounded_md()
+                .bg(theme::RAISED)
+                .text_size(px(theme::TITLE))
+                .text_color(color)
+                .child(glyph),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.0))
+                .child(div().type_title().one_line().child(title.into()))
+                .child(div().type_hint().one_line().child(subtitle.into())),
+        )
 }
 
 /// Deferred so it paints above the canvas instead of under it.
@@ -3158,9 +3891,9 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
             .left(px(0.))
             .w(px(220.))
             .py_1()
-            .bg(rgb(0x2b2b33))
+            .bg(theme::RAISED)
             .border_1()
-            .border_color(rgb(0x4a4a57))
+            .border_color(theme::OUTLINE)
             .rounded_md()
             .shadow_md()
             // The panel overlaps the canvas, whose mouse-down handler would otherwise
@@ -3179,9 +3912,9 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
                     .gap_4()
                     .px_2()
                     .py_1()
-                    .hover(|style| style.bg(rgb(0x3a3a44)))
+                    .hover(|style| style.bg(theme::PRESSED))
                     .child(*label)
-                    .child(div().text_color(rgb(0x8a8a96)).child(*shortcut))
+                    .child(div().type_hint().child(*shortcut))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_menu = None;
                         run(this, window, cx);
@@ -3272,9 +4005,9 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
         .top(px(y - r))
         .size(px(r * 2.0))
         .rounded_full()
-        .bg(rgb(0x3a3a44))
+        .bg(theme::PRESSED)
         .border_2()
-        .border_color(rgb(0x7d7d8c))
+        .border_color(theme::EDGE)
 }
 
 /// The colour every line a character speaks is tinted, or `fallback` when nobody declared
@@ -3308,7 +4041,7 @@ fn node_box(
         .top(px(y))
         .w(px(view.scale(NODE_W)))
         .h(px(view.scale(NODE_H)))
-        .text_size(px(view.scale(BASE_TEXT)))
+        .text_size(px(view.scale(theme::CANVAS_TEXT)))
         .overflow_hidden()
         .flex()
         .flex_col()
@@ -3316,14 +4049,14 @@ fn node_box(
         // reads chrome-heavy at 0.25x and thin at 3x. Scale them too if that starts to grate.
         .gap_1()
         .p_2()
-        .bg(rgb(0x2b2b33))
+        .bg(theme::RAISED)
         .border_1()
         // Where the play-through is standing outranks an ending; the selection outranks both.
         .border_color(match (selected, playing, node.is_ending()) {
-            (true, _, _) => rgb(0x7aa2f7),
-            (false, true, _) => rgb(0x8ce99a),
-            (false, false, true) => rgb(0xf7c96a),
-            (false, false, false) => rgb(0x4a4a57),
+            (true, _, _) => theme::ACCENT,
+            (false, true, _) => theme::PLAYING,
+            (false, false, true) => theme::ENDING,
+            (false, false, false) => theme::OUTLINE,
         })
         .rounded_md()
         .shadow_md()
@@ -3334,13 +4067,13 @@ fn node_box(
                         .flex_none()
                         .w_full()
                         .text_color(speaker)
-                        .truncate()
+                        .one_line()
                         .child(node.speaker.clone()),
                 )
                 .child(
                     div()
                         .w_full()
-                        .text_color(rgb(0xd6d6dd))
+                        .text_color(theme::TEXT)
                         .text_ellipsis()
                         .line_clamp(3)
                         .child(node.text.clone()),
@@ -3349,8 +4082,8 @@ fn node_box(
             // line — an unnamed hub in a graph of hubs is not worth much.
             NodeKind::Hub => this.justify_center().items_center().child(
                 div()
-                    .text_color(rgb(0x9a9aa6))
-                    .truncate()
+                    .text_color(theme::KIND_HUB)
+                    .one_line()
                     .child(match node.text.trim() {
                         "" => "◇".to_string(),
                         label => format!("◇ {label}"),
@@ -3359,8 +4092,8 @@ fn node_box(
             NodeKind::Jump => this.justify_center().child(
                 div()
                     .w_full()
-                    .text_color(rgb(0xc3a6f7))
-                    .truncate()
+                    .text_color(theme::KIND_JUMP)
+                    .one_line()
                     .child(match jump_target {
                         Some(target) => format!("↪ {target}"),
                         None => "↪ nowhere".into(),
@@ -3368,67 +4101,100 @@ fn node_box(
             ),
             // The writes as they read on the page, which is the whole point of logic being
             // a node: `⚙ paid = true` is legible without opening anything.
-            NodeKind::Instruction => this
-                .justify_center()
-                .child(div().flex_none().text_color(rgb(0x8ce99a)).child("⚙"))
-                .child(
-                    div()
-                        .w_full()
-                        .text_color(rgb(0xd6d6dd))
-                        .text_ellipsis()
-                        .line_clamp(2)
-                        .child(match node.effects.as_slice() {
-                            [] => "(sets nothing)".to_string(),
-                            effects => effects
-                                .iter()
-                                .map(|e| {
-                                    format!("{} {} {}", e.var, set_text(e.op), value_text(e.value))
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        }),
-                ),
+            NodeKind::Instruction => this.justify_center().child(glyph_row(
+                kind_style(NodeKind::Instruction).0,
+                theme::KIND_INSTRUCTION,
+                div()
+                    .text_color(theme::TEXT)
+                    .text_ellipsis()
+                    .line_clamp(3)
+                    .child(match node.effects.as_slice() {
+                        [] => "(sets nothing)".to_string(),
+                        effects => effects
+                            .iter()
+                            .map(|e| {
+                                format!("{} {} {}", e.var, set_text(e.op), value_text(e.value))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }),
+            )),
             // The checks as articy writes them — `? paid == true` — with no parser behind
             // it; the inspector edits them with the same picker an instruction uses.
-            NodeKind::Condition => this
-                .justify_center()
-                .child(div().flex_none().text_color(rgb(0xf7c96a)).child("?"))
-                .child(
-                    div()
-                        .w_full()
-                        .text_color(rgb(0xd6d6dd))
-                        .text_ellipsis()
-                        .line_clamp(2)
-                        .child(match node.conditions.as_slice() {
-                            [] => "(checks nothing)".to_string(),
-                            conditions => conditions
-                                .iter()
-                                .map(|c| {
-                                    format!("{} {} {}", c.var, cmp_text(c.op), value_text(c.want))
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        }),
-                ),
+            NodeKind::Condition => this.justify_center().child(glyph_row(
+                kind_style(NodeKind::Condition).0,
+                theme::KIND_CONDITION,
+                div()
+                    .text_color(theme::TEXT)
+                    .text_ellipsis()
+                    .line_clamp(3)
+                    .child(match node.conditions.as_slice() {
+                        [] => "(checks nothing)".to_string(),
+                        conditions => conditions
+                            .iter()
+                            .map(|c| format!("{} {} {}", c.var, cmp_text(c.op), value_text(c.want)))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }),
+            )),
             // Its own font, so a note never reads as a line somebody says: italic, muted,
             // and no speaker line to share the box with. Same footprint as every other
             // kind — hit-testing is arithmetic over `NODE_W`/`NODE_H`.
-            NodeKind::Note => this
-                .child(div().flex_none().text_color(rgb(0xf7c96a)).child("▤"))
-                .child(
-                    div()
-                        .w_full()
-                        // Its own face, not just its own colour: the bundled UI font has
-                        // no italic, so `.italic()` alone renders identically to a line of
-                        // dialogue. A serif is the one thing on the canvas that is not.
-                        .font_family("Noto Serif")
-                        .italic()
-                        .text_color(rgb(0x9a9aa6))
-                        .text_ellipsis()
-                        .line_clamp(4)
-                        .child(node.text.clone()),
-                ),
+            NodeKind::Note => this.child(glyph_row(
+                kind_style(NodeKind::Note).0,
+                theme::KIND_NOTE,
+                div()
+                    // Its own face, not just its own colour: the bundled UI font has no
+                    // italic, so `.italic()` alone renders identically to a line of
+                    // dialogue. A serif is the one thing on the canvas that is not.
+                    .font_family(theme::NOTE_FONT)
+                    .italic()
+                    .text_color(theme::TEXT_MUTED)
+                    .text_ellipsis()
+                    .line_clamp(4)
+                    .child(node.text.clone()),
+            )),
         })
+}
+
+/// What the shared text field asks for, which depends on what it is editing: one field
+/// serves a line, a hub's label and a note, and a hub's "Label" said "Line of dialog".
+fn text_prompt(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Hub => "Optional label, e.g. \"Anything else?\"",
+        NodeKind::Note => "A note to yourself",
+        _ => "Line of dialog",
+    }
+}
+
+/// A kind's glyph beside its content instead of above it. Stacked, the glyph took a whole
+/// line of a box that is only `NODE_H` tall — the one line an instruction's second effect or
+/// a note's fourth line of text needed. `flex_1` + `min_w_0` is what gives the content a
+/// width to wrap and clip to, since it sits in a row now rather than filling a column.
+fn glyph_row(glyph: &'static str, color: Rgba, content: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .gap_2()
+        .items_start()
+        .child(div().flex_none().text_color(color).child(glyph))
+        .child(div().flex_1().min_w(px(0.0)).child(content))
+}
+
+/// How a kind introduces itself — glyph, name and colour. The canvas box, the inspector
+/// header and the kind picker all read it, so they cannot disagree about what a hub looks
+/// like. `Speech` has no glyph of its own on the canvas (its speaker header says who is
+/// talking), so its pilcrow is only for the chip, the header and the find results. A quote
+/// mark was the obvious choice and was unreadable at chip size: it rendered as a speck.
+fn kind_style(kind: NodeKind) -> (&'static str, &'static str, Rgba) {
+    match kind {
+        NodeKind::Speech => ("¶", "Speech", theme::KIND_SPEECH),
+        NodeKind::Hub => ("◇", "Hub", theme::KIND_HUB),
+        NodeKind::Jump => ("↪", "Jump", theme::KIND_JUMP),
+        NodeKind::Instruction => ("⚙", "Instruction", theme::KIND_INSTRUCTION),
+        NodeKind::Condition => ("?", "Condition", theme::KIND_CONDITION),
+        NodeKind::Note => ("▤", "Note", theme::KIND_NOTE),
+    }
 }
 
 /// A value as the canvas and the play panel both write it.
@@ -3510,6 +4276,8 @@ fn main() {
             KeyBinding::new("ctrl--", ZoomOut, Some("Editor")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
+            KeyBinding::new("ctrl-shift-m", ToggleProblems, Some("Editor")),
+            KeyBinding::new("f1", ShowHelp, Some("Editor")),
             // Ctrl+1 duplicates Tab so the number row is whole; the menu advertises Tab,
             // which is the older and better key for the kind you reach for most.
             KeyBinding::new("ctrl-1", Branch, Some("Editor")),
@@ -3568,6 +4336,11 @@ fn main() {
         handle
             .update(cx, |this, window, cx| this.offer_recovery(window, cx))
             .unwrap();
+
+        // Development builds only: a socket a script drives the editor through, so it can be
+        // put into a state and screenshotted. See `automation.rs`.
+        #[cfg(all(feature = "automation", unix))]
+        handle.update(cx, automation::start).unwrap();
 
         cx.on_window_closed(|cx| cx.quit()).detach();
         cx.activate(true);

@@ -2,7 +2,8 @@
 //!
 //! Upstream code: keep edits minimal so it can be re-synced against a newer gpui.
 //! Local changes: made public, added `new`/`set_content`/`set_placeholder`/`bind_keys`, ctrl-based
-//! (rather than cmd-based) keybindings, dark styling, example harness removed.
+//! (rather than cmd-based) keybindings, dark styling from `crate::theme` with an accent border
+//! while focused, example harness removed.
 
 use std::ops::Range;
 
@@ -11,9 +12,11 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine, actions, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
+    WrappedLine, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
+
+use crate::theme;
 
 actions!(
     text_input,
@@ -460,7 +463,7 @@ struct PrepaintState {
 fn text_and_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextRun>) {
     let style = window.text_style();
     let (display_text, text_color) = if input.content.is_empty() {
-        (input.placeholder.clone(), hsla(0., 0., 1., 0.3))
+        (input.placeholder.clone(), theme::TEXT_FAINT.into())
     } else {
         (input.content.clone(), style.color)
     };
@@ -512,7 +515,7 @@ fn text_and_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextR
             &run,
             input.selected_range.clone(),
             TextRun {
-                background_color: Some(rgba(0x7aa2f755).into()),
+                background_color: Some(theme::ACCENT_SELECTION.into()),
                 ..run.clone()
             },
         )
@@ -676,7 +679,8 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.is_focused(window);
         div()
             .flex()
             .key_context("TextInput")
@@ -701,15 +705,19 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
             .line_height(px(20.))
-            .text_size(px(14.))
+            .text_size(px(theme::BODY))
             .child(
                 div()
                     .min_h(px(20. + 4. * 2.))
                     .w_full()
                     .p(px(4.))
-                    .bg(rgb(0x1e1e22))
+                    .bg(theme::CANVAS)
                     .border_1()
-                    .border_color(rgb(0x4a4a57))
+                    .border_color(if focused {
+                        theme::ACCENT
+                    } else {
+                        theme::OUTLINE
+                    })
                     .rounded_md()
                     .child(TextElement { input: cx.entity() }),
             )

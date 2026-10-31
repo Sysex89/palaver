@@ -84,8 +84,10 @@ pub fn node_center(node: &Node) -> (f32, f32) {
     (node.x + NODE_W / 2.0, node.y + NODE_H / 2.0)
 }
 
-/// Horizontal gap between a node and one branched off it.
-pub const GAP_X: f32 = 100.0;
+/// Horizontal gap between a node and one branched off it. The choice label sits in this gap,
+/// so it is what a label can be: at 100 a label of any real length was cut to a few words,
+/// and 160 holds a short question ("Is the pass open?") on one line.
+pub const GAP_X: f32 = 160.0;
 /// Vertical gap between siblings sharing a parent.
 pub const GAP_Y: f32 = 30.0;
 
@@ -652,6 +654,19 @@ impl Doc {
         edge.once && self.pauses_play(edge.from)
     }
 
+    /// The top of every conversation: the nodes nothing links to, notes excepted. One per
+    /// independent conversation the author has drawn, which is what the inspector's
+    /// summary counts — and what [`Doc::problems`] walks from, so the two cannot disagree
+    /// about what a start is.
+    pub fn roots(&self) -> Vec<NodeId> {
+        self.nodes
+            .iter()
+            .filter(|n| n.kind != NodeKind::Note)
+            .filter(|n| !self.edges.iter().any(|e| e.to == n.id))
+            .map(|n| n.id)
+            .collect()
+    }
+
     /// Every fault in the document, errors first. An empty document has none at all.
     // ponytail: rebuilt from scratch on every call, which is once per frame. A cache
     // would need invalidating on every edit, undo and load; revisit past a few thousand nodes.
@@ -679,13 +694,7 @@ impl Doc {
         // halves matter — counting notes as roots would let a document of nothing but notes
         // suppress `NoStart`, and skipping only the roots would report every note unreachable.
         let in_graph = |n: &&Node| n.kind != NodeKind::Note;
-        let roots: Vec<NodeId> = self
-            .nodes
-            .iter()
-            .filter(in_graph)
-            .filter(|n| !self.edges.iter().any(|e| e.to == n.id))
-            .map(|n| n.id)
-            .collect();
+        let roots = self.roots();
         if roots.is_empty() {
             found.push(Problem::NoStart);
         }
@@ -1092,11 +1101,33 @@ impl Doc {
         true
     }
 
+    /// Where a node wanting to stand at `(x, y)` on `flow` can actually go: the same spot
+    /// when it is clear, otherwise slid down a row at a time until it is. Only the nodes on
+    /// that canvas count — a node on another flow is not drawn there, so it cannot be
+    /// covered. A node *touching* another is not covered by it: the gap between rows is what
+    /// keeps a stack of them from reading as one box, so a node has to clear
+    /// [`GAP_Y`] below its neighbour rather than merely not overlap it.
+    // ponytail: O(nodes) per row slid, and only slides down. A dense column pays one scan per
+    // occupied row; index nodes by cell if a document ever has thousands in one column.
+    pub fn free_spot(&self, flow: &str, x: f32, y: f32) -> (f32, f32) {
+        let mut y = y;
+        // Bounded, so a pathological document cannot hang the editor on a menu click.
+        for _ in 0..self.nodes.len() + 1 {
+            let covered = self
+                .nodes_in(flow)
+                .any(|n| (n.x - x).abs() < NODE_W && (n.y - y).abs() < NODE_H + GAP_Y);
+            if !covered {
+                break;
+            }
+            y += NODE_H + GAP_Y;
+        }
+        (x, y)
+    }
+
     /// Adds a node connected to `from`, to its right and below any children it already
-    /// has, so a fan of choices stacks downward. None when `from` is gone, and then
+    /// has, so a fan of choices stacks downward. Slides further down past anything else in
+    /// the way, children or not, via [`Doc::free_spot`]. None when `from` is gone, and then
     /// nothing is added.
-    // ponytail: only avoids siblings; it can land on an unrelated node elsewhere in the
-    // graph. Scan every node for a collision if that starts to bite.
     pub fn branch_from(&mut self, from: NodeId) -> Option<NodeId> {
         let parent = self.node(from)?;
         let (x, mut y) = (parent.x + NODE_W + GAP_X, parent.y);
@@ -1112,6 +1143,7 @@ impl Doc {
         }
 
         let flow = parent.flow.clone();
+        let (x, y) = self.free_spot(&flow, x, y);
         let id = self.add_node(x, y);
         // Branching lands on the canvas the parent is drawn on, so Tab never creates a node
         // the author cannot see.
@@ -1800,34 +1832,34 @@ impl Doc {
             "Innkeeper",
             "You look lost, traveler.",
         );
-        let ask = node(&mut doc, 360.0, 140.0, "Player", "Where am I?");
-        let rude = node(&mut doc, 360.0, 380.0, "Player", "None of your business.");
+        let ask = node(&mut doc, 420.0, 140.0, "Player", "Where am I?");
+        let rude = node(&mut doc, 420.0, 380.0, "Player", "None of your business.");
         let answer = node(
             &mut doc,
-            660.0,
+            780.0,
             140.0,
             "Innkeeper",
             "Sern's Rest. Last inn before the pass.",
         );
-        let sulk = node(&mut doc, 660.0, 380.0, "Innkeeper", "Suit yourself.");
+        let sulk = node(&mut doc, 780.0, 380.0, "Innkeeper", "Suit yourself.");
 
         // The hub is the point the conversation keeps coming back to. Nobody speaks at
         // one, so it has a label and no speaker.
-        let more = doc.add_node(960.0, 140.0);
+        let more = doc.add_node(1140.0, 140.0);
         let n = doc.node_mut(more).unwrap();
         n.kind = NodeKind::Hub;
         n.text = "Anything else?".into();
 
         let rooms = node(
             &mut doc,
-            1260.0,
+            1500.0,
             20.0,
             "Innkeeper",
             "Two coppers a night, and the fire stays lit.",
         );
         let pass = node(
             &mut doc,
-            1260.0,
+            1500.0,
             160.0,
             "Innkeeper",
             "Snowed shut since Tuesday. Nobody's crossing.",
@@ -1838,7 +1870,7 @@ impl Doc {
 
         // Logic is graph structure: the instruction that records the question and the
         // condition that reads it back are both nodes you can see on the canvas.
-        let noted = doc.add_node(1560.0, 160.0);
+        let noted = doc.add_node(1860.0, 160.0);
         doc.node_mut(noted).unwrap().kind = NodeKind::Instruction;
         doc.set_effect(
             noted,
@@ -1847,22 +1879,22 @@ impl Doc {
             SetOp::Set,
         );
 
-        let check = doc.add_node(1260.0, 300.0);
+        let check = doc.add_node(1500.0, 300.0);
         doc.node_mut(check).unwrap().kind = NodeKind::Condition;
         doc.set_condition(check, "asked_about_pass", Some(Value::Bool(true)), Cmp::Eq);
 
         let warned = node(
             &mut doc,
-            1560.0,
+            1860.0,
             300.0,
             "Innkeeper",
             "Mind the drifts on the road out.",
         );
-        let farewell = node(&mut doc, 1560.0, 440.0, "Innkeeper", "Safe travels, then.");
+        let farewell = node(&mut doc, 1860.0, 440.0, "Innkeeper", "Safe travels, then.");
 
         // One jump serves every branch that returns to the hub, so the canvas carries no
         // long edge doubling back across it.
-        let back = doc.add_node(1860.0, 60.0);
+        let back = doc.add_node(2220.0, 60.0);
         doc.node_mut(back).unwrap().kind = NodeKind::Jump;
 
         edge(&mut doc, greet, ask, "Ask");
@@ -2673,6 +2705,98 @@ mod tests {
         assert_eq!(a.x, b.x, "siblings share a column");
         assert_eq!(b.y, a.y + NODE_H + GAP_Y, "the second sits below the first");
         assert_eq!(doc.edges.iter().filter(|e| e.from == parent).count(), 2);
+    }
+
+    #[test]
+    fn free_spot_leaves_a_clear_spot_alone() {
+        let mut doc = Doc::default();
+        doc.add_node(0.0, 0.0);
+
+        assert_eq!(
+            doc.free_spot("", 600.0, 0.0),
+            (600.0, 0.0),
+            "another column"
+        );
+        assert_eq!(doc.free_spot("", 0.0, 500.0), (0.0, 500.0), "well below it");
+    }
+
+    #[test]
+    fn free_spot_slides_down_past_a_node_it_would_cover() {
+        let mut doc = Doc::default();
+        doc.add_node(100.0, 100.0);
+
+        // Dead on top, and also merely overlapping by a few pixels: both are covered.
+        let row = NODE_H + GAP_Y;
+        assert_eq!(doc.free_spot("", 100.0, 100.0), (100.0, 100.0 + row));
+        assert_eq!(doc.free_spot("", 150.0, 140.0), (150.0, 140.0 + row));
+    }
+
+    #[test]
+    fn free_spot_keeps_the_gap_between_rows() {
+        let mut doc = Doc::default();
+        doc.add_node(0.0, 0.0);
+
+        // Touching the node above is not clear: it would read as one tall box.
+        let touching = NODE_H;
+        assert!(doc.free_spot("", 0.0, touching).1 > touching);
+        // Exactly one row down is clear.
+        let row = NODE_H + GAP_Y;
+        assert_eq!(doc.free_spot("", 0.0, row), (0.0, row));
+    }
+
+    #[test]
+    fn free_spot_slides_past_a_whole_stack() {
+        let mut doc = Doc::default();
+        let row = NODE_H + GAP_Y;
+        for i in 0..3 {
+            doc.add_node(0.0, i as f32 * row);
+        }
+
+        assert_eq!(doc.free_spot("", 0.0, 0.0), (0.0, 3.0 * row));
+    }
+
+    #[test]
+    fn free_spot_only_counts_the_canvas_it_is_asked_about() {
+        let mut doc = Doc::default();
+        let elsewhere = doc.add_node(0.0, 0.0);
+        doc.node_mut(elsewhere).unwrap().flow = "tavern".into();
+
+        assert_eq!(doc.free_spot("", 0.0, 0.0), (0.0, 0.0), "not drawn on main");
+        assert_eq!(doc.free_spot("tavern", 0.0, 0.0).1, NODE_H + GAP_Y);
+    }
+
+    #[test]
+    fn branch_from_slides_past_an_unrelated_node() {
+        let mut doc = Doc::default();
+        let parent = doc.add_node(0.0, 0.0);
+        // Exactly where the first child would land, and nothing to do with the parent.
+        let squatter = doc.add_node(NODE_W + GAP_X, 0.0);
+
+        let child = doc.branch_from(parent).unwrap();
+
+        let (c, s) = (doc.node(child).unwrap(), doc.node(squatter).unwrap());
+        assert_eq!(c.x, s.x);
+        assert!(c.y >= s.y + NODE_H + GAP_Y, "stacked below, not on top");
+        assert!(doc.has_edge(parent, child));
+    }
+
+    #[test]
+    fn roots_are_the_tops_of_conversations_and_never_a_note() {
+        let mut doc = Doc::default();
+        let (a, b, c) = (
+            doc.add_node(0.0, 0.0),
+            doc.add_node(300.0, 0.0),
+            doc.add_node(0.0, 300.0),
+        );
+        let note = doc.add_node(0.0, 600.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        doc.add_edge(a, b);
+
+        assert_eq!(
+            doc.roots(),
+            vec![a, c],
+            "b is linked to; the note is not in the graph"
+        );
     }
 
     #[test]
