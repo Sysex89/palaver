@@ -18,7 +18,7 @@ use std::time::Duration;
 use text_input::TextInput;
 
 actions!(
-    papugai,
+    palaver,
     [
         DeleteNode,
         Undo,
@@ -1305,7 +1305,7 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = format!(
-            "papugai — {}{}{}",
+            "palaver — {}{}{}",
             self.file_name(),
             // Omitted on the main flow, so a document that never made one reads as it did.
             if self.flow.is_empty() {

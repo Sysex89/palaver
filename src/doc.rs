@@ -33,7 +33,7 @@ pub fn with_default_extension(path: PathBuf, ext: &str) -> PathBuf {
 // Suffix the name with `std::process::id()` and offer the newest dead pid's file when
 // running two copies at once stops being hypothetical.
 pub fn autosave_path() -> PathBuf {
-    std::env::temp_dir().join("papugai-recovery.dln")
+    std::env::temp_dir().join("palaver-recovery.dln")
 }
 
 /// A crashed session's document and the file it came from, so recovery restores the file
@@ -3688,7 +3688,7 @@ mod tests {
         doc.add_node(0.0, 0.0);
         assert!(doc.is_dirty());
 
-        let path = std::env::temp_dir().join("papugai-dirty-test.json");
+        let path = std::env::temp_dir().join("palaver-dirty-test.json");
         doc.save(&path).expect("save");
         assert!(!doc.is_dirty(), "saving clears dirty");
 
@@ -3709,7 +3709,7 @@ mod tests {
         doc.checkpoint();
         let added = doc.add_node(10.0, 20.0);
 
-        let origin = PathBuf::from("/tmp/papugai-backup-test.dln");
+        let origin = PathBuf::from("/tmp/palaver-backup-test.dln");
         doc.write_backup(Some(&origin)).expect("write backup");
         assert!(
             doc.is_dirty(),
