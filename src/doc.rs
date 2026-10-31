@@ -249,6 +249,33 @@ pub struct Node {
     pub conditions: Vec<Condition>,
 }
 
+/// A field the current kind does not show is *ignored*, not erased. Changing a node's kind
+/// leaves `speaker`, `text` and `end` where they were, so Speech → Hub → Speech loses
+/// nothing — which means every reader has to ask the kind first, and these are the
+/// questions it asks. Without them a hidden field keeps acting: a stale `end` silenced
+/// `DeadEnd` on a hub, and an instruction's leftover line went out to translators.
+impl Node {
+    /// Marked as an ending *and* a kind the toggle is offered on. Only a speech node
+    /// shows the toggle, so only a speech node's flag may count.
+    pub fn is_ending(&self) -> bool {
+        self.end && self.kind == NodeKind::Speech
+    }
+
+    /// The text the player reads at this node: a line of dialogue, or a hub's label.
+    /// A note's text is the author's, and every other kind hides the field.
+    pub fn player_text(&self) -> Option<&str> {
+        match self.kind {
+            NodeKind::Speech | NodeKind::Hub => Some(&self.text),
+            _ => None,
+        }
+    }
+
+    /// Who is talking — only ever on a speech node, see [`Node::player_text`].
+    pub fn player_speaker(&self) -> Option<&str> {
+        (self.kind == NodeKind::Speech).then_some(self.speaker.as_str())
+    }
+}
+
 /// A write an [`NodeKind::Instruction`] node performs when the flow passes through it. At
 /// most one per variable per node — [`Doc::set_effect`] upserts rather than appends — so
 /// the order they are stored in can never change the outcome.
@@ -427,10 +454,16 @@ pub fn split_set(name: &str) -> (Option<&str>, &str) {
 /// The other half of [`split_set`]: a set and a rest joined back into the one name that is
 /// the key. An empty set means no set, so this is what lets the declare field hold only the
 /// rest while the picker holds the set — and the view never has to know the rule is a dot.
+///
+/// A blank rest joins to a blank name, not to `"{set}."`: the chip stays picked between
+/// declares, so a `+` clicked on an empty field would otherwise mint a variable called
+/// `shop.` that [`split_set`] then files as ungrouped. Blank is what every name check
+/// already refuses.
 pub fn join_set(set: &str, rest: &str) -> String {
-    match set.is_empty() {
-        true => rest.to_string(),
-        false => format!("{set}.{rest}"),
+    match (set.is_empty(), rest.is_empty()) {
+        (true, _) => rest.to_string(),
+        (false, true) => String::new(),
+        (false, false) => format!("{set}.{rest}"),
     }
 }
 
@@ -495,11 +528,12 @@ pub enum Problem {
     /// twice. [`Doc::add_edge`] refuses one, so only a merge can make it — which is the
     /// gap random ids opened by making a `.dln` auto-merge legal again.
     DuplicateEdge(usize),
-    /// An ordinary edge whose two ends sit on different canvases. Authoring cannot make
-    /// one — a drag needs both ends visible, so both are in one flow — and nothing draws
-    /// it, so it is a lie about the graph in the way a jump's second target would be. Only
-    /// a hand-edit or a merge produces one, which is the category `DanglingEdge` is in.
-    /// A jump's edge is exempt: crossing flows is exactly what the kind is for.
+    /// An ordinary edge whose two ends sit on different canvases. Nothing draws it, so it
+    /// is a lie about the graph in the way a jump's second target would be. A drag cannot
+    /// make one, but moving part of a conversation to another flow does — that is how a
+    /// graph is split — so [`Doc::move_to_flow`] counts the ones it creates and the row
+    /// selects the edge, since neither canvas can be clicked on to reach it. A jump's edge
+    /// is exempt: crossing flows is exactly what the kind is for.
     CrossFlowEdge(usize),
 }
 
@@ -523,10 +557,28 @@ impl Problem {
             | Problem::UnwiredBranch(id, _)
             | Problem::DuplicateAlias(id, _)
             | Problem::UnknownSpeaker(id, _) => Some(*id),
+            Problem::DanglingEdge(_)
+            | Problem::NoStart
+            | Problem::DuplicateEdge(_)
+            | Problem::CrossFlowEdge(_) => None,
+        }
+    }
+
+    /// The edge to select, when the problem is about one rather than a node. The row
+    /// selects *this* index rather than leaving it to a click on the canvas: a duplicate
+    /// lies under the original, which `Doc::edge_at` finds first, and a cross-flow edge is
+    /// drawn on no canvas at all.
+    pub fn edge(&self) -> Option<usize> {
+        match self {
+            Problem::DanglingEdge(index)
+            | Problem::DuplicateEdge(index)
+            | Problem::CrossFlowEdge(index) => Some(*index),
             _ => None,
         }
     }
 
+    // Spelled out, with no catch-all: the severity split is load-bearing, so a new variant
+    // has to be placed in it on purpose rather than defaulting to a warning.
     pub fn severity(&self) -> Severity {
         match self {
             Problem::DanglingEdge(_)
@@ -535,7 +587,12 @@ impl Problem {
             | Problem::TypeMismatch(..)
             | Problem::DuplicateAlias(..)
             | Problem::CrossFlowEdge(_) => Severity::Error,
-            _ => Severity::Warning,
+            Problem::Unreachable(_)
+            | Problem::DeadEnd(_)
+            | Problem::Empty(_)
+            | Problem::UnwiredBranch(..)
+            | Problem::UnknownSpeaker(..)
+            | Problem::DuplicateEdge(_) => Severity::Warning,
         }
     }
 }
@@ -583,8 +640,16 @@ impl Doc {
     pub fn spent(&self, path: &[NodeId], from: NodeId, to: NodeId) -> bool {
         self.edges
             .iter()
-            .any(|e| e.from == from && e.to == to && e.once)
+            .any(|e| e.from == from && e.to == to && self.is_once(e))
             && path.windows(2).any(|w| w[0] == from && w[1] == to)
+    }
+
+    /// Whether this edge is a once-only choice. The flag alone is not enough: it only
+    /// means something where the player is the one choosing, which is also the only place
+    /// the inspector offers the toggle — so a flag left behind when the node became an
+    /// instruction or a jump is neither drawn nor honoured, rather than drawn and stuck.
+    pub fn is_once(&self, edge: &Edge) -> bool {
+        edge.once && self.pauses_play(edge.from)
     }
 
     /// Every fault in the document, errors first. An empty document has none at all.
@@ -648,7 +713,7 @@ impl Doc {
             self.nodes
                 .iter()
                 .filter(in_graph)
-                .filter(|n| !n.end && !self.edges.iter().any(|e| e.from == n.id))
+                .filter(|n| !n.is_ending() && !self.edges.iter().any(|e| e.from == n.id))
                 .map(|n| Problem::DeadEnd(n.id)),
         );
         // An empty node is one with none of whatever it exists to hold: dialogue for a
@@ -1181,10 +1246,10 @@ impl Doc {
         renames.len()
     }
 
-    /// Removes the flag and every effect that writes it, returning how many effects went
-    /// with it — an effect naming a variable nothing declares has no meaning, so leaving
-    /// them behind is not an option. It is one checkpoint's worth of change, so a single
-    /// undo brings the variable and all of its effects back together.
+    /// Removes the flag and every effect and check naming it, returning how many went with
+    /// it — a reference to a variable nothing declares has no meaning, so leaving them
+    /// behind is not an option. It is one checkpoint's worth of change, so a single undo
+    /// brings the variable and all of its references back together.
     pub fn remove_variable(&mut self, name: &str) -> usize {
         self.variables.retain(|v| v.name != name);
         let mut dropped = 0;
@@ -1200,8 +1265,8 @@ impl Doc {
     /// Renames the flag and every effect and check that names it, returning how many
     /// references moved. The mirror of [`Doc::remove_variable`], and possible at all
     /// because the name *is* the key: a rename is a find-and-replace, and there is nowhere
-    /// else for a reference to hide. Any third field that ever stores a variable name has
-    /// to join both functions.
+    /// else for a reference to hide. Any new field that ever stores a variable name has to
+    /// join this, [`Doc::remove_variable`], [`Doc::retype_variable`] and [`Doc::rename_set`].
     ///
     /// Returns 0 without touching anything when nothing is called `from`. The view checks
     /// [`Doc::variable_name_free`] for `to` before it checkpoints, the same way the add
@@ -1482,11 +1547,60 @@ impl Doc {
     }
 
     /// Moves every listed node to a canvas, the way [`Doc::move_nodes`] shifts them.
-    /// Unknown ids are skipped. This is how a graph that got too big is split up.
-    pub fn move_to_flow(&mut self, ids: &[NodeId], flow: &str) {
+    /// Unknown ids are skipped. This is how a graph that got too big is split up — and
+    /// splitting one cuts the edges between the half that moved and the half that stayed,
+    /// so it returns how many of those now cross flows. Each is a
+    /// [`Problem::CrossFlowEdge`] until its source becomes a jump; the view says so at the
+    /// moment of the move rather than leaving the author to find an edge neither canvas
+    /// draws.
+    pub fn move_to_flow(&mut self, ids: &[NodeId], flow: &str) -> usize {
         for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
             node.flow = flow.to_string();
         }
+        self.edges
+            .iter()
+            .filter(|e| ids.contains(&e.from) || ids.contains(&e.to))
+            .filter(|e| match (self.node(e.from), self.node(e.to)) {
+                (Some(from), Some(to)) => from.flow != to.flow && from.kind != NodeKind::Jump,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Turns a node into another kind, dropping whatever the new kind cannot hold. False
+    /// when there is no such node or it already is that kind, so the view can ask before
+    /// it checkpoints.
+    ///
+    /// Two different rules, deliberately. *Edges and logic* are cut, because keeping them
+    /// would be a lie the graph tells: a note holds no edges at either end, a jump keeps
+    /// only its first target (the one-target rule [`Doc::add_edge`] enforces), and effects
+    /// and checks are their kind's content, not a property bag every node carries. *Text,
+    /// speaker and `end`* are kept, because a hidden field is ignored rather than acted on
+    /// (see [`Node::is_ending`]) — so Speech → Hub → Speech loses nothing.
+    pub fn set_kind(&mut self, id: NodeId, kind: NodeKind) -> bool {
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        if node.kind == kind {
+            return false;
+        }
+        node.kind = kind;
+        if kind != NodeKind::Instruction {
+            node.effects.clear();
+        }
+        if kind != NodeKind::Condition {
+            node.conditions.clear();
+        }
+        match kind {
+            NodeKind::Note => self.edges.retain(|e| e.from != id && e.to != id),
+            NodeKind::Jump => {
+                let mut kept = false;
+                self.edges
+                    .retain(|e| e.from != id || !std::mem::replace(&mut kept, true));
+            }
+            _ => {}
+        }
+        true
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -1557,16 +1671,24 @@ impl Doc {
     /// key [`Doc::rename_character`] finds and replaces.
     pub fn to_ftl(&self) -> String {
         let mut out = String::new();
+        // Only what a player can read. A note is the author's, and a kind that hides its
+        // text field — an instruction that used to be a line — would ship a translator a
+        // string nobody sees and nobody can edit.
         for node in &self.nodes {
             // An empty value is a parse error in FTL, and a blank node is already
             // `Problem::Empty` — the document says so somewhere the author can read it.
-            if node.kind != NodeKind::Note && !node.text.is_empty() {
-                out += &Self::ftl_entry(&format!("node-{}", node.id), &node.text);
+            if let Some(text) = node.player_text().filter(|t| !t.is_empty()) {
+                out += &Self::ftl_entry(&format!("node-{}", node.id), text);
             }
         }
-        // No note filter needed here: `add_edge` refuses an edge with a note at either end.
+        // A label is a choice only where the player chooses: out of a condition it is a
+        // pin, out of an instruction or a jump the walk takes the edge unread. Notes need
+        // no filter here — `add_edge` refuses an edge with a note at either end.
         for edge in &self.edges {
-            if !edge.label.is_empty() {
+            let chosen = self
+                .node(edge.from)
+                .is_some_and(|n| n.player_text().is_some());
+            if chosen && !edge.label.is_empty() {
                 out += &Self::ftl_entry(&format!("edge-{}-{}", edge.from, edge.to), &edge.label);
             }
         }
@@ -3933,8 +4055,8 @@ mod tests {
         assert_eq!(path.last(), Some(&there));
     }
 
-    /// Authoring cannot make one — a drag needs both ends visible — so only a hand-edit or
-    /// a merge does, and nothing draws it.
+    /// Nothing draws one. A drag cannot make one, but a move to another flow can — see
+    /// `moving_half_a_conversation_counts_the_edges_it_cuts`.
     #[test]
     fn a_non_jump_edge_across_flows_is_a_problem() {
         let mut doc = Doc::default();
@@ -4180,5 +4302,175 @@ mod tests {
 
         let expected = format!("node-{a} = ") + "a {\"{\"}b{\"}\"} c\n";
         assert_eq!(doc.to_ftl(), expected);
+    }
+
+    /// The chip stays picked between declares, so a `+` on an empty field reaches here
+    /// with a set and no rest — and must not come back as a name `shop.` that passes.
+    #[test]
+    fn a_set_with_a_blank_rest_joins_to_nothing() {
+        let doc = Doc::default();
+        assert_eq!(join_set("shop", ""), "");
+        assert!(!doc.variable_name_free(&join_set("shop", "")));
+    }
+
+    /// Splitting a graph is what the move is for, so the cut is reported, not refused —
+    /// and only the edges this move cut, not the whole selection's.
+    #[test]
+    fn moving_half_a_conversation_counts_the_edges_it_cuts() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(a, b);
+        doc.add_edge(b, c);
+
+        assert_eq!(doc.move_to_flow(&[b, c], "chapter1"), 1);
+        assert!(doc.problems().contains(&Problem::CrossFlowEdge(0)));
+        // Moving the rest after them heals the cut.
+        assert_eq!(doc.move_to_flow(&[a], "chapter1"), 0);
+        assert!(!doc.problems().iter().any(|p| p.edge().is_some()));
+    }
+
+    /// A jump's edge is the one that is *meant* to cross, so it is not counted.
+    #[test]
+    fn moving_a_jumps_target_cuts_nothing() {
+        let mut doc = Doc::default();
+        let hop = doc.add_node(0.0, 0.0);
+        let there = spoken(&mut doc, 300.0, 0.0);
+        doc.node_mut(hop).unwrap().kind = NodeKind::Jump;
+        doc.add_edge(hop, there);
+
+        assert_eq!(doc.move_to_flow(&[there], "chapter1"), 0);
+    }
+
+    /// An edge problem names its edge, so the row can select what no canvas click reaches.
+    #[test]
+    fn edge_problems_name_their_edge() {
+        assert_eq!(Problem::CrossFlowEdge(3).edge(), Some(3));
+        assert_eq!(Problem::DuplicateEdge(1).edge(), Some(1));
+        assert_eq!(Problem::DanglingEdge(0).edge(), Some(0));
+        assert_eq!(Problem::NoStart.edge(), None);
+        assert_eq!(Problem::DeadEnd(7).edge(), None);
+    }
+
+    #[test]
+    fn set_kind_to_note_drops_every_edge_touching_it() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(a, b);
+        doc.add_edge(b, c);
+
+        assert!(doc.set_kind(b, NodeKind::Note));
+        assert!(doc.edges.is_empty());
+        assert!(
+            !doc.set_kind(b, NodeKind::Note),
+            "already a note: nothing to do"
+        );
+    }
+
+    #[test]
+    fn set_kind_to_jump_keeps_only_the_first_target() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 300.0, 200.0);
+        let into = spoken(&mut doc, -300.0, 0.0);
+        doc.add_edge(into, a);
+        doc.add_edge(a, b);
+        doc.add_edge(a, c);
+
+        doc.set_kind(a, NodeKind::Jump);
+        let out: Vec<NodeId> = doc
+            .edges
+            .iter()
+            .filter(|e| e.from == a)
+            .map(|e| e.to)
+            .collect();
+        assert_eq!(out, vec![b]);
+        assert!(doc.has_edge(into, a), "edges *into* a jump are untouched");
+    }
+
+    /// Logic is cut, text is kept: Speech → Instruction → Speech gives the line back.
+    #[test]
+    fn set_kind_cuts_logic_but_keeps_text() {
+        let mut doc = Doc::default();
+        doc.add_variable("met");
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "Hello.".into();
+        doc.set_kind(a, NodeKind::Instruction);
+        doc.set_effect(a, "met", Some(Value::Bool(true)), SetOp::Set);
+
+        doc.set_kind(a, NodeKind::Speech);
+        let node = doc.node(a).unwrap();
+        assert!(node.effects.is_empty());
+        assert_eq!(node.text, "Hello.");
+    }
+
+    /// The toggle is only offered on a speech node, so a flag left on a hub by a kind
+    /// change must not quietly silence `DeadEnd`.
+    #[test]
+    fn a_hidden_end_flag_does_not_excuse_a_dead_end() {
+        let mut doc = Doc::default();
+        let start = spoken(&mut doc, 0.0, 0.0);
+        let last = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(start, last);
+        doc.node_mut(last).unwrap().end = true;
+
+        doc.set_kind(last, NodeKind::Hub);
+        assert!(doc.problems().contains(&Problem::DeadEnd(last)));
+    }
+
+    /// A once-only flag left behind out of an instruction is not one: the walk takes
+    /// the edge it finds, so nothing would ever keep the promise.
+    #[test]
+    fn once_only_counts_only_where_the_player_chooses() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.edges[0].once = true;
+        assert!(doc.is_once(&doc.edges[0]));
+        assert!(doc.spent(&[a, b], a, b));
+
+        doc.set_kind(a, NodeKind::Instruction);
+        assert!(!doc.is_once(&doc.edges[0]));
+        assert!(!doc.spent(&[a, b], a, b));
+    }
+
+    /// Only text a player reads goes out: not an instruction's leftover line, not a
+    /// condition's leftover choice label.
+    #[test]
+    fn ftl_skips_text_the_player_never_sees() {
+        let mut doc = Doc::default();
+        let said = spoken(&mut doc, 0.0, 0.0);
+        let was_line = spoken(&mut doc, 300.0, 0.0);
+        let check = spoken(&mut doc, 600.0, 0.0);
+        let after = spoken(&mut doc, 900.0, 0.0);
+        doc.add_edge(said, was_line);
+        doc.add_edge(check, after);
+        doc.edges[0].label = "Go on.".into();
+        doc.edges[1].label = "Old choice".into();
+        doc.node_mut(was_line).unwrap().text = "Stale line".into();
+        doc.set_kind(was_line, NodeKind::Instruction);
+        doc.set_kind(check, NodeKind::Condition);
+
+        let ftl = doc.to_ftl();
+        assert!(ftl.contains(&format!("node-{said} =")));
+        assert!(ftl.contains("Go on."));
+        assert!(!ftl.contains("Stale line"));
+        assert!(!ftl.contains("Old choice"));
+    }
+
+    #[test]
+    fn only_a_speech_node_has_a_speaker() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().speaker = "Innkeeper".into();
+        assert_eq!(doc.node(a).unwrap().player_speaker(), Some("Innkeeper"));
+
+        doc.set_kind(a, NodeKind::Hub);
+        assert_eq!(doc.node(a).unwrap().player_speaker(), None);
     }
 }

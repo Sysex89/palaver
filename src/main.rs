@@ -100,7 +100,7 @@ const MENUS: &[MenuSpec] = &[
             ("Save As…", "Ctrl+Shift+S", |e, w, cx| {
                 e.on_save_as(&SaveAs, w, cx)
             }),
-            ("Export Fluent…", "", |e, w, cx| {
+            ("Export Fluent…", "Ctrl+E", |e, w, cx| {
                 e.on_export_fluent(&ExportFluent, w, cx)
             }),
         ],
@@ -1279,6 +1279,24 @@ impl Editor {
         cx.notify();
     }
 
+    /// Selects an edge by index and shows whichever end of it still exists — the source
+    /// first, which for a cross-flow edge is the canvas whose node needs to become a jump.
+    /// Focuses the canvas so Delete reaches it straight from the problem row.
+    fn select_edge(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edge) = self.doc.edges.get(index) else {
+            return;
+        };
+        let end = [edge.from, edge.to]
+            .into_iter()
+            .find(|id| self.doc.node(*id).is_some());
+        if let Some(id) = end {
+            self.show(id, window);
+        }
+        self.select(Selection::Edge(index), cx);
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
     fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, _: &mut Context<Self>) {
         window.focus(&self.focus_handle);
     }
@@ -1306,7 +1324,34 @@ impl Render for Editor {
         let pending = self.pending_edge();
         let view = self.view;
 
+        // The `"Editor"` context and every action listener live here, at the root, not on
+        // the canvas: gpui matches a binding against the focused element's *ancestors*, and
+        // every text field sits in the vars pane or the sidebar, beside the canvas rather
+        // than inside it. On the canvas, Ctrl+S while typing a line simply did nothing.
         div()
+            .key_context("Editor")
+            .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
+            .on_action(cx.listener(Self::on_find))
+            .on_action(cx.listener(Self::on_branch))
+            .on_action(cx.listener(Self::on_new_hub))
+            .on_action(cx.listener(Self::on_new_jump))
+            .on_action(cx.listener(Self::on_new_instruction))
+            .on_action(cx.listener(Self::on_new_condition))
+            .on_action(cx.listener(Self::on_new_note))
+            .on_action(cx.listener(Self::on_focus_canvas))
+            .on_action(cx.listener(Self::on_new))
+            .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_save_as))
+            .on_action(cx.listener(Self::on_export_fluent))
+            .on_action(cx.listener(Self::on_open))
+            .on_action(cx.listener(Self::on_play))
+            .on_action(cx.listener(Self::on_play_from_here))
+            .on_action(cx.listener(Self::on_stop_play))
             .flex()
             .flex_col()
             .size_full()
@@ -1360,7 +1405,9 @@ impl Editor {
             }))
     }
 
-    /// The graph itself. Owns the mouse and key handling, so sidebar clicks never reach it.
+    /// The graph itself. Owns the mouse handling, so sidebar clicks never reach it, and
+    /// the focus: its `"Canvas"` context is where the keys that mean something else in a
+    /// text field are bound — Delete, Backspace and Tab — so they never fire from one.
     fn canvas_pane(
         &self,
         lines: Vec<(Point<Pixels>, Point<Pixels>, Rgba)>,
@@ -1369,35 +1416,13 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .key_context("Editor")
+            .key_context("Canvas")
             .track_focus(&self.focus_handle)
             .relative()
             .flex_1()
             .h_full()
             .overflow_hidden()
             .bg(rgb(0x1e1e22))
-            .on_action(cx.listener(Self::on_delete))
-            .on_action(cx.listener(Self::on_undo))
-            .on_action(cx.listener(Self::on_redo))
-            .on_action(cx.listener(Self::on_zoom_in))
-            .on_action(cx.listener(Self::on_zoom_out))
-            .on_action(cx.listener(Self::on_zoom_reset))
-            .on_action(cx.listener(Self::on_find))
-            .on_action(cx.listener(Self::on_branch))
-            .on_action(cx.listener(Self::on_new_hub))
-            .on_action(cx.listener(Self::on_new_jump))
-            .on_action(cx.listener(Self::on_new_instruction))
-            .on_action(cx.listener(Self::on_new_condition))
-            .on_action(cx.listener(Self::on_new_note))
-            .on_action(cx.listener(Self::on_focus_canvas))
-            .on_action(cx.listener(Self::on_new))
-            .on_action(cx.listener(Self::on_save))
-            .on_action(cx.listener(Self::on_save_as))
-            .on_action(cx.listener(Self::on_export_fluent))
-            .on_action(cx.listener(Self::on_open))
-            .on_action(cx.listener(Self::on_play))
-            .on_action(cx.listener(Self::on_play_from_here))
-            .on_action(cx.listener(Self::on_stop_play))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_pan_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1489,7 +1514,9 @@ impl Editor {
             // though the player never chooses one, so the empty-label skip lets them past.
             .filter(|edge| {
                 !self.doc.is_jump(edge.from)
-                    && (!edge.label.is_empty() || self.doc.is_condition(edge.from) || edge.once)
+                    && (!edge.label.is_empty()
+                        || self.doc.is_condition(edge.from)
+                        || self.doc.is_once(edge))
             })
             .filter_map(|edge| {
                 let (text, color) = if self.doc.is_condition(edge.from) {
@@ -1497,14 +1524,13 @@ impl Editor {
                         true => ("true".to_string(), TRUE_COLOR),
                         false => ("false".to_string(), FALSE_COLOR),
                     }
-                } else if edge.once {
+                } else if self.doc.is_once(edge) {
                     // Shown on the canvas as well as in the inspector, the way a condition's
                     // branch is: a flag you have to click every edge to find is guessed at.
                     // In front of the label, not after it: the slot is a fixed width and
                     // a long choice is already truncated, so a marker on the end is one
-                    // you cannot see. Shown on the canvas as well as in the inspector for
-                    // the reason a condition's branch is — a flag you have to click every
-                    // edge to find is a flag that gets guessed at.
+                    // you cannot see. `is_once`, not the bare flag, so one left behind by a
+                    // kind change is not drawn where the inspector offers no toggle for it.
                     (
                         format!("(once) {}", edge.label).trim_end().to_string(),
                         rgba(0x9a9aa6ff),
@@ -1869,8 +1895,6 @@ impl Editor {
                                             cx,
                                         );
                                     }
-                                    // A colour off the palette, so a new cast comes out tinted
-                                    // apart without anybody picking one.
                                     // Renaming a canvas carries every node standing on it,
                                     // and the one on screen with them.
                                     (Some(Rename::Item(old)), SidePane::Flows) => {
@@ -1887,6 +1911,8 @@ impl Editor {
                                             cx,
                                         );
                                     }
+                                    // A colour off the palette, so a new cast comes out tinted
+                                    // apart without anybody picking one.
                                     (None, SidePane::Cast) => {
                                         let color = CAST_COLORS
                                             [this.doc.characters.len() % CAST_COLORS.len()];
@@ -2310,11 +2336,23 @@ impl Editor {
                             let ids = this.selection.nodes().to_vec();
                             let count = ids.len();
                             this.doc.checkpoint();
-                            this.doc.move_to_flow(&ids, &to_move);
+                            let cut = this.doc.move_to_flow(&ids, &to_move);
                             let s = if count == 1 { "" } else { "s" };
                             // The nodes just left this canvas, so nothing is selected on it.
                             this.select(Selection::None, cx);
-                            this.set_status(format!("Moved {count} node{s}."), cx);
+                            // Said now, since neither canvas will ever draw the edges cut.
+                            let status = match cut {
+                                0 => format!("Moved {count} node{s}."),
+                                1 => format!(
+                                    "Moved {count} node{s} — 1 edge now crosses flows; \
+                                     make its source a Jump."
+                                ),
+                                cut => format!(
+                                    "Moved {count} node{s} — {cut} edges now cross flows; \
+                                     make their sources Jumps."
+                                ),
+                            };
+                            this.set_status(status, cx);
                             cx.notify();
                         })),
                 )
@@ -2525,8 +2563,11 @@ impl Editor {
                     );
                 }
 
-                let speaker = node.speaker.trim();
-                let text = node.text.trim();
+                // Through the kind, not the raw fields: a hub that used to be a line still
+                // carries the old speaker, and nobody speaks at a hub.
+                let speaker = node.player_speaker().unwrap_or("").trim();
+                let text = node.player_text().unwrap_or("").trim();
+                let is_hub = node.kind == NodeKind::Hub;
                 this.when(!speaker.is_empty(), |this| {
                     this.child(
                         div()
@@ -2534,12 +2575,16 @@ impl Editor {
                             .child(speaker.to_string()),
                     )
                 })
-                .child(if text.is_empty() {
-                    div()
-                        .text_color(rgb(0x6c6c78))
-                        .child("(no line written yet)")
-                } else {
-                    div().child(text.to_string())
+                // A blank hub is complete — `Problem::Empty` exempts it — so it shows its
+                // choices with nothing above them rather than an "unwritten" placeholder.
+                .when(!(is_hub && text.is_empty()), |this| {
+                    this.child(if text.is_empty() {
+                        div()
+                            .text_color(rgb(0x6c6c78))
+                            .child("(no line written yet)")
+                    } else {
+                        div().child(text.to_string())
+                    })
                 })
             })
             // What the instructions walked through on the way here did. Without this the
@@ -2674,11 +2719,21 @@ impl Editor {
                                 .truncate()
                                 .text_color(color)
                                 .child(problem_text(problem, &self.doc))
-                                // A dangling edge has no live node to jump to, so its row is inert.
                                 .when_some(problem.node(), |this, id| {
                                     this.hover(|style| style.bg(rgb(0x33333c))).on_click(
                                         cx.listener(move |this, _, window, cx| {
                                             this.jump_to(id, window, cx)
+                                        }),
+                                    )
+                                })
+                                // An edge problem selects its edge, since a click on the
+                                // canvas cannot: a duplicate lies under its original and a
+                                // cross-flow edge is drawn nowhere. Selected, it can be
+                                // deleted like any other.
+                                .when_some(problem.edge(), |this, index| {
+                                    this.hover(|style| style.bg(rgb(0x33333c))).on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.select_edge(index, window, cx)
                                         }),
                                     )
                                 })
@@ -2694,15 +2749,13 @@ impl Editor {
             })
     }
 
-    /// What the node is. Switching to a note drops every edge touching it and switching to
-    /// a jump drops every outgoing edge but the first,
-    /// keeping the one-target invariant `Doc::add_edge` enforces — otherwise the extra
-    /// edges would stop being drawn and the canvas would quietly lie about the graph. It
-    /// is checkpointed like any other edit, so an undo brings them back.
+    /// What the node is. What a conversion keeps and drops is `Doc::set_kind`'s to decide,
+    /// where it can be tested; this only checkpoints first, so an undo brings back every
+    /// edge and effect the change cut.
     fn kind_picker(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.doc.node(id).map_or(NodeKind::Speech, |node| node.kind);
 
-        // Wraps: five labels do not fit across `SIDEBAR_W`, and without this the last kind
+        // Wraps: six labels do not fit across `SIDEBAR_W`, and without this the last kind
         // is simply clipped off the right edge — present but unreachable.
         div().flex().flex_wrap().gap_1().children(
             [
@@ -2729,32 +2782,7 @@ impl Editor {
                             return;
                         }
                         this.doc.checkpoint();
-                        if let Some(node) = this.doc.node_mut(id) {
-                            node.kind = kind;
-                        }
-                        // A note holds no edges at either end, so converting to one drops
-                        // every edge that touched it — the same lie an undrawn edge out of
-                        // a jump would be, and one undo brings them all back.
-                        if kind == NodeKind::Note {
-                            this.doc.edges.retain(|e| e.from != id && e.to != id);
-                        }
-                        if kind == NodeKind::Jump {
-                            let mut kept = false;
-                            this.doc
-                                .edges
-                                .retain(|e| e.from != id || !std::mem::replace(&mut kept, true));
-                        }
-                        // Effects and checks are their kind's content, not a property every
-                        // node carries. Leaving them on a node that no longer runs them
-                        // would be the same lie as an undrawn edge out of a jump.
-                        if let Some(node) = this.doc.node_mut(id) {
-                            if kind != NodeKind::Instruction {
-                                node.effects.clear();
-                            }
-                            if kind != NodeKind::Condition {
-                                node.conditions.clear();
-                            }
-                        }
+                        this.doc.set_kind(id, kind);
                         cx.notify();
                     }))
             }),
@@ -2767,11 +2795,10 @@ impl Editor {
     /// twice. Both kinds share this so the two editors cannot drift apart — the model keeps
     /// `effects` and `conditions` apart because the *names* would lie, not the widgets.
     fn var_rows(&self, id: NodeId, mode: VarRow, cx: &mut Context<Self>) -> impl IntoElement {
-        // ponytail: capped like the sibling panels. Past this the sidebar needs to scroll,
-        // which is the actual fix rather than a bigger cap.
-        const MAX_ROWS: usize = 8;
-
-        let more = self.doc.variables.len().saturating_sub(MAX_ROWS);
+        // Scrolls rather than capping like the sibling panels: a cap here was not a shorter
+        // list but an unreachable variable — the ninth one declared could be neither set
+        // nor checked from anywhere. Bounded so the rest of the inspector stays on screen.
+        const ROWS_H: f32 = 240.0;
 
         div()
             .flex()
@@ -2788,13 +2815,15 @@ impl Editor {
                         .child("Declare one in the Variables pane first."),
                 )
             })
-            .children(
-                self.doc
-                    .variables
-                    .iter()
-                    .take(MAX_ROWS)
-                    .enumerate()
-                    .map(|(i, variable)| {
+            .child(
+                div()
+                    .id("var-rows")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .max_h(px(ROWS_H))
+                    .overflow_y_scroll()
+                    .children(self.doc.variables.iter().enumerate().map(|(i, variable)| {
                         let name = variable.name.clone();
                         let int = matches!(variable.default, Value::Int(_));
                         // What the node holds now: the value, and the operator glyph that
@@ -2910,15 +2939,8 @@ impl Editor {
                             .when_some(number.filter(|_| !editing), |this, n| {
                                 this.child(self.number_cell(("var-num", i), n, target, cx))
                             })
-                    }),
+                    })),
             )
-            .when(more > 0, |this| {
-                this.child(
-                    div()
-                        .text_color(rgb(0x6c6c78))
-                        .child(format!("…and {more} more")),
-                )
-            })
     }
 
     /// Flips which pin of a condition an edge leaves by. A discrete edit, so it checkpoints
@@ -3297,7 +3319,7 @@ fn node_box(
         .bg(rgb(0x2b2b33))
         .border_1()
         // Where the play-through is standing outranks an ending; the selection outranks both.
-        .border_color(match (selected, playing, node.end) {
+        .border_color(match (selected, playing, node.is_ending()) {
             (true, _, _) => rgb(0x7aa2f7),
             (false, true, _) => rgb(0x8ce99a),
             (false, false, true) => rgb(0xf7c96a),
@@ -3476,8 +3498,11 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>, zoom: f32) -> Option<Path
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
-            KeyBinding::new("delete", DeleteNode, Some("Editor")),
-            KeyBinding::new("backspace", DeleteNode, Some("Editor")),
+            // `"Canvas"`, not `"Editor"`: these three mean something else in a text field,
+            // and the canvas is the only place focus can be without being in one.
+            KeyBinding::new("delete", DeleteNode, Some("Canvas")),
+            KeyBinding::new("backspace", DeleteNode, Some("Canvas")),
+            KeyBinding::new("tab", Branch, Some("Canvas")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Editor")),
             KeyBinding::new("ctrl-=", ZoomIn, Some("Editor")),
@@ -3485,7 +3510,6 @@ fn main() {
             KeyBinding::new("ctrl--", ZoomOut, Some("Editor")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
-            KeyBinding::new("tab", Branch, Some("Editor")),
             // Ctrl+1 duplicates Tab so the number row is whole; the menu advertises Tab,
             // which is the older and better key for the kind you reach for most.
             KeyBinding::new("ctrl-1", Branch, Some("Editor")),
@@ -3499,9 +3523,11 @@ fn main() {
             KeyBinding::new("ctrl-s", Save, Some("Editor")),
             KeyBinding::new("ctrl-shift-s", SaveAs, Some("Editor")),
             KeyBinding::new("ctrl-o", Open, Some("Editor")),
+            KeyBinding::new("ctrl-e", ExportFluent, Some("Editor")),
             KeyBinding::new("f5", Play, Some("Editor")),
             KeyBinding::new("shift-f5", PlayFromHere, Some("Editor")),
-            // A no-op when nothing is playing; the field's own escape is scoped elsewhere.
+            // A no-op when nothing is playing. In a field the deeper `"TextInput"` binding
+            // below wins, so escape there leaves the field instead of stopping play.
             KeyBinding::new("escape", StopPlay, Some("Editor")),
             KeyBinding::new("escape", FocusCanvas, Some("TextInput")),
         ]);
