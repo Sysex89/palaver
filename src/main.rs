@@ -1435,10 +1435,14 @@ impl Editor {
     /// you are looking at is not a document edit. The selection goes, though — nodes on the
     /// canvas you left are neither drawn nor hit-testable, so leaving them selected would let
     /// the inspector edit an invisible node and `Tab` branch off one, which is the only way
-    /// to author a `CrossFlowEdge`.
+    /// to author a `CrossFlowEdge`. The view refits, because the pan and zoom you left were
+    /// aimed at another canvas and may point at nothing here. Choosing the flow you are
+    /// already on changes nothing, so a stray click on its tab does not throw away your pan.
+    /// `show` deliberately does not refit: it centres on one node, which is the point of it.
     fn show_flow(&mut self, flow: &str, cx: &mut Context<Self>) {
         if self.flow != flow {
             self.flow = flow.to_string();
+            self.fit_pending = true;
             self.select(Selection::None, cx);
         }
         cx.notify();
