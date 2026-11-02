@@ -93,6 +93,13 @@ pub const GAP_Y: f32 = 30.0;
 
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 3.0;
+/// Screen pixels left clear round the content when the view is fitted to it.
+pub const FIT_MARGIN: f32 = 40.0;
+/// How far opening a document will shrink it to fit. Below this the text is too small to
+/// read, so a document wider than the pane opens at this zoom with its *start* in view
+/// rather than whole and illegible. The explicit Fit command has no such floor — asking to
+/// see everything is a request for the overview.
+pub const OPEN_FIT_MIN_ZOOM: f32 = 0.5;
 
 /// Where the canvas is looking: `screen = doc * zoom + pan`, with `pan` in screen
 /// pixels so dragging the canvas is the same arithmetic at every zoom level.
@@ -131,6 +138,48 @@ impl View {
     /// Moves the viewport so `doc` lands at `screen`, leaving zoom alone.
     pub fn center_on(&mut self, doc: (f32, f32), screen: (f32, f32)) {
         self.pan = (screen.0 - doc.0 * self.zoom, screen.1 - doc.1 * self.zoom);
+    }
+
+    /// The view that shows `extent` (a document-space box, min corner then max) inside a pane
+    /// of size `pane`, with `margin` screen pixels to spare.
+    ///
+    /// The zoom is whatever fits, but never above 1 — fitting a two-node graph must not blow
+    /// it up to fill the pane — and never below `min_zoom`. Content that fits is centred.
+    /// Content that does *not* fit at that floor is anchored to the top-left instead of being
+    /// centred: its middle is a stretch of the graph nobody asked to see, while its left edge
+    /// is where a conversation starts.
+    pub fn fit(
+        extent: ((f32, f32), (f32, f32)),
+        pane: (f32, f32),
+        margin: f32,
+        min_zoom: f32,
+    ) -> View {
+        let ((min_x, min_y), (max_x, max_y)) = extent;
+        let (w, h) = ((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
+        let (avail_w, avail_h) = (
+            (pane.0 - 2.0 * margin).max(1.0),
+            (pane.1 - 2.0 * margin).max(1.0),
+        );
+        let zoom = (avail_w / w)
+            .min(avail_h / h)
+            .clamp(min_zoom.max(MIN_ZOOM), 1.0);
+        // Where the content's min corner lands on that axis: centred when it fits, else
+        // flush against the margin.
+        let place = |len: f32, avail: f32, pane: f32, min: f32| {
+            let start = if len * zoom <= avail {
+                (pane - len * zoom) / 2.0
+            } else {
+                margin
+            };
+            start - min * zoom
+        };
+        View {
+            pan: (
+                place(w, avail_w, pane.0, min_x),
+                place(h, avail_h, pane.1, min_y),
+            ),
+            zoom,
+        }
     }
 
     /// Zooms by `factor`, keeping whatever sits under `anchor` (in screen coordinates)
@@ -1099,6 +1148,21 @@ impl Doc {
             once: false,
         });
         true
+    }
+
+    /// The box every node on `flow` fits in, as its min corner then its max — what the view
+    /// is fitted to. `None` for an empty canvas, which has nothing to fit.
+    pub fn extent(&self, flow: &str) -> Option<((f32, f32), (f32, f32))> {
+        self.nodes_in(flow).fold(None, |acc, n| {
+            let (lo, hi) = ((n.x, n.y), (n.x + NODE_W, n.y + NODE_H));
+            Some(match acc {
+                None => (lo, hi),
+                Some((a, b)) => (
+                    (a.0.min(lo.0), a.1.min(lo.1)),
+                    (b.0.max(hi.0), b.1.max(hi.1)),
+                ),
+            })
+        })
     }
 
     /// Where a node wanting to stand at `(x, y)` on `flow` can actually go: the same spot
@@ -2705,6 +2769,86 @@ mod tests {
         assert_eq!(a.x, b.x, "siblings share a column");
         assert_eq!(b.y, a.y + NODE_H + GAP_Y, "the second sits below the first");
         assert_eq!(doc.edges.iter().filter(|e| e.from == parent).count(), 2);
+    }
+
+    #[test]
+    fn extent_covers_every_node_on_the_canvas_and_only_that_one() {
+        let mut doc = Doc::default();
+        assert_eq!(doc.extent(""), None, "nothing to fit on an empty canvas");
+        doc.add_node(100.0, 50.0);
+        doc.add_node(400.0, 300.0);
+        let elsewhere = doc.add_node(9000.0, 9000.0);
+        doc.node_mut(elsewhere).unwrap().flow = "tavern".into();
+
+        assert_eq!(
+            doc.extent(""),
+            Some(((100.0, 50.0), (400.0 + NODE_W, 300.0 + NODE_H))),
+            "boxes, not origins, and not the node on another flow"
+        );
+    }
+
+    #[test]
+    fn fit_does_not_magnify_a_small_graph() {
+        let view = View::fit(
+            ((0.0, 0.0), (NODE_W, NODE_H)),
+            (700.0, 700.0),
+            40.0,
+            MIN_ZOOM,
+        );
+
+        assert_eq!(view.zoom, 1.0);
+        let centre = view.to_screen((NODE_W / 2.0, NODE_H / 2.0));
+        assert!(
+            (centre.0 - 350.0).abs() < 0.01 && (centre.1 - 350.0).abs() < 0.01,
+            "centred"
+        );
+    }
+
+    #[test]
+    fn fit_shrinks_a_wide_graph_until_all_of_it_shows() {
+        let extent = ((500.0, 300.0), (2500.0, 700.0));
+        let view = View::fit(extent, (1000.0, 800.0), 40.0, MIN_ZOOM);
+
+        assert!(
+            (view.zoom - 0.46).abs() < 1e-3,
+            "920 px of room for 2000 units"
+        );
+        let (left, top) = view.to_screen(extent.0);
+        let (right, bottom) = view.to_screen(extent.1);
+        assert!(
+            (left - 40.0).abs() < 0.01 && (1000.0 - right - 40.0).abs() < 0.01,
+            "level margins"
+        );
+        assert!(top >= 40.0 && bottom <= 760.0, "and it fits vertically");
+    }
+
+    #[test]
+    fn fit_floors_the_zoom_and_anchors_to_the_start() {
+        // 10000 wide would need 0.092; the floor says 0.5, so it cannot all show.
+        let extent = ((200.0, 100.0), (10200.0, 300.0));
+        let view = View::fit(extent, (700.0, 700.0), 40.0, 0.5);
+
+        assert_eq!(view.zoom, 0.5);
+        assert!(
+            (view.to_screen(extent.0).0 - 40.0).abs() < 0.01,
+            "left edge on the margin"
+        );
+        let (_, top) = view.to_screen(extent.0);
+        let (_, bottom) = view.to_screen(extent.1);
+        assert!(
+            (top + bottom - 700.0).abs() < 0.01,
+            "still centred on the axis that fits"
+        );
+    }
+
+    #[test]
+    fn fit_never_goes_below_the_minimum_zoom() {
+        let view = View::fit(((0.0, 0.0), (100_000.0, 90.0)), (700.0, 700.0), 40.0, 0.0);
+
+        assert_eq!(
+            view.zoom, MIN_ZOOM,
+            "a floor of 0 still means the real minimum"
+        );
     }
 
     #[test]

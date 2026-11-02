@@ -38,6 +38,9 @@ RESET = [
     "flow main",
     "field search",
     "focus canvas",
+    # Opening fits the view, so without this every detail shot would be at whatever zoom the
+    # document opened at. 100% keeps them comparable with the passes before fit existed.
+    "menu View/Actual size",
 ]
 
 SHOTS = [
@@ -63,6 +66,9 @@ SHOTS = [
     # Two nodes dropped with nothing selected, where the view's centre already holds a node:
     # they must stack below it rather than land on top.
     ("19-stacked", ["select none", "menu Node/Note", "select none", "menu Node/Hub"]),
+    # The view the editor opens on is captured separately, before any reset (see main()).
+    # The Fit command is the overview: everything, however small.
+    ("20-fit-all", ["menu View/Fit to view"]),
 ]
 
 
@@ -133,6 +139,17 @@ def main():
         editor = Editor(sock)
         editor.send(f"resize {WINDOW[0]} {WINDOW[1]}")
         time.sleep(1.0)  # first frame, fonts
+
+        # The view the document opens on, before RESET touches the zoom. Skipped by --only
+        # unless asked for by name, like any other shot.
+        if not only or "00-open" in only:
+            try:
+                capture(editor, out_dir / "00-open.png")
+                print(f"  {'00-open':22} {editor.send('state')}")
+                taken += 1
+            except RuntimeError as error:
+                failed.append("00-open")
+                print(f"  {'00-open':22} FAILED: {error}")
 
         for name, commands in SHOTS:
             if only and not any(name.endswith(o) or name == o for o in only):

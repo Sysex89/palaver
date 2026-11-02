@@ -5,9 +5,9 @@ mod text_input;
 mod theme;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind, PORT_R, Problem, SetOp,
-    Severity, Value, VarState, View, clear_backup, in_port, join_set, node_center, out_port,
-    read_backup, split_set, with_default_extension,
+    Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind,
+    OPEN_FIT_MIN_ZOOM, PORT_R, Problem, SetOp, Severity, Value, VarState, View, clear_backup,
+    in_port, join_set, node_center, out_port, read_backup, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -47,7 +47,8 @@ actions!(
         PlayFromHere,
         StopPlay,
         ToggleProblems,
-        ShowHelp
+        ShowHelp,
+        FitView
     ]
 );
 
@@ -122,13 +123,6 @@ const MENUS: &[MenuSpec] = &[
         &[
             ("Undo", "Ctrl+Z", |e, w, cx| e.on_undo(&Undo, w, cx)),
             ("Redo", "Ctrl+Shift+Z", |e, w, cx| e.on_redo(&Redo, w, cx)),
-            ("Zoom in", "Ctrl+=", |e, w, cx| e.on_zoom_in(&ZoomIn, w, cx)),
-            ("Zoom out", "Ctrl+-", |e, w, cx| {
-                e.on_zoom_out(&ZoomOut, w, cx)
-            }),
-            ("Actual size", "Ctrl+0", |e, w, cx| {
-                e.on_zoom_reset(&ZoomReset, w, cx)
-            }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
@@ -155,6 +149,16 @@ const MENUS: &[MenuSpec] = &[
     (
         "View",
         &[
+            ("Zoom in", "Ctrl+=", |e, w, cx| e.on_zoom_in(&ZoomIn, w, cx)),
+            ("Zoom out", "Ctrl+-", |e, w, cx| {
+                e.on_zoom_out(&ZoomOut, w, cx)
+            }),
+            ("Actual size", "Ctrl+0", |e, w, cx| {
+                e.on_zoom_reset(&ZoomReset, w, cx)
+            }),
+            ("Fit to view", "F", |e, w, cx| {
+                e.on_fit_view(&FitView, w, cx)
+            }),
             ("Problems", "Ctrl+Shift+M", |e, w, cx| {
                 e.on_toggle_problems(&ToggleProblems, w, cx)
             }),
@@ -261,6 +265,11 @@ struct Editor {
     /// and the text field the variables list already proved out, and a *third* pane was
     /// rejected because `window_pos` is the one place a new one breaks every hit test.
     pane: SidePane,
+    /// The view wants fitting to the document before the next frame is drawn. Set by anything
+    /// that installs a document; consumed in `render`, because the pane's size is only known
+    /// where there is a window — and so the very first frame, whose size is the real one, is
+    /// fitted rather than guessed at in `new`.
+    fit_pending: bool,
     /// Which canvas is on screen. A flow is a *view* onto the one flat node list, so this
     /// is editor state and never serialized — the whole feature is this filter plus a tab.
     flow: String,
@@ -442,6 +451,7 @@ impl Editor {
             play: None,
             pane: SidePane::default(),
             flow: String::new(),
+            fit_pending: true,
         }
     }
 
@@ -575,6 +585,7 @@ impl Editor {
         clear_backup();
         self.doc = doc;
         self.view = View::default();
+        self.fit_pending = true;
         self.drag = None;
         // Node ids — and flow names — belong to the document that is going away.
         self.play = None;
@@ -846,11 +857,36 @@ impl Editor {
 
     /// Centre of the canvas pane, which is what the keyboard zoom commands anchor on.
     fn pane_center(window: &Window) -> (f32, f32) {
+        let (w, h) = Self::pane_size(window);
+        (w / 2.0, h / 2.0)
+    }
+
+    /// The canvas pane's size: the window less the chrome round it. The one place the pane's
+    /// *height* is read, which is why `STATUS_H` is subtracted here and nowhere else.
+    fn pane_size(window: &Window) -> (f32, f32) {
         let size = window.viewport_size();
         (
-            (f32::from(size.width) - SIDEBAR_W - VARS_W) / 2.0,
-            (f32::from(size.height) - MENU_H - STATUS_H) / 2.0,
+            f32::from(size.width) - SIDEBAR_W - VARS_W,
+            f32::from(size.height) - MENU_H - STATUS_H,
         )
+    }
+
+    /// Fits the view to the canvas on screen, no further out than `min_zoom`. An empty canvas
+    /// has nothing to fit and gets the default view. Pan and zoom only — never an edit, so no
+    /// checkpoint.
+    fn fit_view(&mut self, min_zoom: f32, window: &Window) {
+        self.view = match self.doc.extent(&self.flow) {
+            Some(extent) => View::fit(extent, Self::pane_size(window), FIT_MARGIN, min_zoom),
+            None => View::default(),
+        };
+    }
+
+    /// F, or View → Fit to view: everything on this canvas, however small that makes it. Open
+    /// is gentler (`OPEN_FIT_MIN_ZOOM`) because it has to leave text readable; asking for it
+    /// by name is asking for the overview.
+    fn on_fit_view(&mut self, _: &FitView, window: &mut Window, cx: &mut Context<Self>) {
+        self.fit_view(0.0, window);
+        cx.notify();
     }
 
     /// One entry per edge: the line from the source's out-port to the target's in-port, and
@@ -1427,6 +1463,11 @@ impl Render for Editor {
             self.title = title;
         }
 
+        // Before anything below reads the view. A one-shot, so nothing here runs per frame.
+        if self.fit_pending {
+            self.fit_pending = false;
+            self.fit_view(OPEN_FIT_MIN_ZOOM, window);
+        }
         let lines = self.edge_lines();
         let pending = self.pending_edge();
         let view = self.view;
@@ -1446,6 +1487,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_zoom_in))
             .on_action(cx.listener(Self::on_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
+            .on_action(cx.listener(Self::on_fit_view))
             .on_action(cx.listener(Self::on_find))
             .on_action(cx.listener(Self::on_toggle_problems))
             .on_action(cx.listener(Self::on_show_help))
@@ -4269,6 +4311,8 @@ fn main() {
             KeyBinding::new("delete", DeleteNode, Some("Canvas")),
             KeyBinding::new("backspace", DeleteNode, Some("Canvas")),
             KeyBinding::new("tab", Branch, Some("Canvas")),
+            // Bare `f`, so canvas-only like the three above: in a text field it is a letter.
+            KeyBinding::new("f", FitView, Some("Canvas")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Editor")),
             KeyBinding::new("ctrl-=", ZoomIn, Some("Editor")),
