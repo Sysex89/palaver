@@ -105,8 +105,11 @@ def capture(editor, out):
         raise RuntimeError("spectacle wrote nothing")
     time.sleep(0.2)  # let the write finish
     w, h = png_size(out)
-    # Spectacle includes the frame and its shadow, so the capture is a little larger.
-    if w < WINDOW[0] or h < WINDOW[1] or w > WINDOW[0] + 400:
+    # Spectacle includes the frame and its shadow, so the capture is a little larger, and the
+    # desktop's scale factor multiplies all of it — a size check broke the day the scale
+    # changed. The shape survives both: 1200x800 plus a title bar and shadow is about 1.4:1,
+    # where a maximised or fullscreen window is much wider.
+    if w < WINDOW[0] or h < WINDOW[1] or not 1.25 <= w / h <= 1.55:
         out.rename(out.with_suffix(".wrong-window.png"))
         raise RuntimeError(f"captured {w}x{h} — another window was active")
 

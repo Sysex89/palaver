@@ -60,6 +60,9 @@ const MENU_H: f32 = 30.0;
 /// subtracted in `window_pos`. Only `pane_center` has to know, since that is the one place
 /// the pane's height is read.
 const STATUS_H: f32 = 26.0;
+/// Radius of the ring marking a node nothing links to. Smaller than `PORT_R`, so the handle
+/// you drag from stays the larger and the only interactive-looking one.
+const ROOT_R: f32 = 5.0;
 /// How long a status message stays up before it clears itself.
 const STATUS_FOR: Duration = Duration::from_secs(6);
 /// Width of the inspector on the right.
@@ -1656,6 +1659,14 @@ impl Editor {
                     // `Doc::port_hit_test` skips it for the same reason.
                     .filter(|node| node.kind != NodeKind::Note)
                     .map(|node| port_dot(node, view)),
+            )
+            .children(
+                self.doc
+                    .roots()
+                    .into_iter()
+                    .filter_map(|id| self.doc.node(id))
+                    .filter(|node| node.flow == self.flow)
+                    .map(|node| root_dot(node, view)),
             )
             .when_some(self.marquee_rect(), |this, (origin, size)| {
                 this.child(
@@ -4056,6 +4067,46 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
         .border_color(theme::EDGE)
 }
 
+/// The bar down a node's left edge in its kind's colour, so a graph reads by structure —
+/// dialogue, plumbing, notes — before any of it is read as text. It comes from `kind_style`
+/// and nothing else: a speaker's colour is deliberately not here, because colour on the
+/// box's outline would be confused with the selection and play highlights.
+///
+/// Absolute, so it takes no room from the content and every kind keeps its footprint. The
+/// two left corners follow the box's own rounding (its radius less the 1px border) or the
+/// bar would square off the corner.
+fn kind_strip(kind: NodeKind, view: View) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .bottom(px(0.0))
+        // Floored, so a zoomed-out node still shows its kind.
+        .w(px(view.scale(4.0).max(3.0)))
+        .rounded_tl(px(5.0))
+        .rounded_bl(px(5.0))
+        .bg(kind_style(kind).2)
+}
+
+/// A hollow ring where an edge would arrive, on a node nothing links to — the top of a
+/// conversation. A node that *is* linked to has no dot, on purpose: its arrowhead ends exactly
+/// there, and a dot would sit on the tip and hide the direction the line is going.
+fn root_dot(node: &Node, view: View) -> impl IntoElement {
+    let (x, y) = view.to_screen(in_port(node));
+    // Floored: at the zoom a document opens on, 5 units is a speck, and a 2px border on a
+    // 5px dot leaves no hole — it stops reading as a ring.
+    let r = view.scale(ROOT_R).max(4.0);
+    div()
+        .absolute()
+        .left(px(x - r))
+        .top(px(y - r))
+        .size(px(r * 2.0))
+        .rounded_full()
+        .bg(theme::CANVAS)
+        .border_2()
+        .border_color(theme::EDGE)
+}
+
 /// The colour every line a character speaks is tinted, or `fallback` when nobody declared
 /// that name — so an undeclared cast looks exactly as it did before there was one. The two
 /// places a speaker is drawn share this, and nothing else is tinted: colour on a border or an
@@ -4106,6 +4157,7 @@ fn node_box(
         })
         .rounded_md()
         .shadow_md()
+        .child(kind_strip(node.kind, view))
         .map(|this| match node.kind {
             NodeKind::Speech => this
                 .child(
