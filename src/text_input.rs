@@ -3,7 +3,10 @@
 //! Upstream code: keep edits minimal so it can be re-synced against a newer gpui.
 //! Local changes: made public, added `new`/`set_content`/`set_placeholder`/`bind_keys`, ctrl-based
 //! (rather than cmd-based) keybindings, dark styling from `crate::theme` with an accent border
-//! while focused, example harness removed.
+//! while focused, example harness removed. The text and the cursor are `theme::TEXT`, set here
+//! rather than inherited: upstream inherits the colour and paints the cursor `gpui::blue()`,
+//! which was invisible black-on-dark in any field whose ancestors set no text colour — every
+//! overlay, since they are deferred and sit under nothing that does.
 
 use std::ops::Range;
 
@@ -465,7 +468,7 @@ fn text_and_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextR
     let (display_text, text_color) = if input.content.is_empty() {
         (input.placeholder.clone(), theme::TEXT_FAINT.into())
     } else {
-        (input.content.clone(), style.color)
+        (input.content.clone(), theme::TEXT.into())
     };
 
     let run = TextRun {
@@ -614,7 +617,7 @@ impl Element for TextElement {
                 .map(|pos| {
                     fill(
                         Bounds::new(bounds.origin + pos, size(px(2.), line_height)),
-                        gpui::blue(),
+                        theme::TEXT,
                     )
                 })
         } else {

@@ -28,7 +28,9 @@ use std::time::Duration;
 use gpui::{Context, Focusable, Window, px, size};
 
 use crate::doc::{Doc, NodeKind, clear_backup};
-use crate::{Editor, MENUS, Selection, SidePane, node_number};
+use crate::{
+    Editor, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection, SidePane, node_number,
+};
 
 /// How often the foreground looks for a command. Plenty for a script that sleeps between
 /// every step anyway.
@@ -179,6 +181,22 @@ fn run(
                 return Err(format!("no flow {rest:?}"));
             }
             editor.show_flow(flow, cx);
+            Ok(String::new())
+        }
+
+        // The palette's keys, which a script cannot press into a field it has no focus on:
+        // `palette next`, `palette prev`, `palette run`. Opening it and typing a query are
+        // `menu View/Command palette` and `field palette <text>`.
+        "palette" => {
+            if !editor.palette_open {
+                return Err("the palette is not open".into());
+            }
+            match rest {
+                "next" => editor.on_palette_next(&PaletteNext, window, cx),
+                "prev" => editor.on_palette_prev(&PalettePrev, window, cx),
+                "run" => editor.on_palette_run(&PaletteRun, window, cx),
+                _ => return Err(format!("expected next, prev or run, not {rest:?}")),
+            }
             Ok(String::new())
         }
 
@@ -334,6 +352,7 @@ fn field<'a>(editor: &'a Editor, name: &str) -> Result<&'a gpui::Entity<crate::T
         "alias" => &editor.alias_input,
         "label" => &editor.label_input,
         "search" => &editor.search_input,
+        "palette" => &editor.palette_input,
         "var" => &editor.var_input,
         "value" => &editor.value_input,
         _ => return Err(format!("no field {name:?}")),
@@ -364,6 +383,7 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         ("alias", &editor.alias_input),
         ("label", &editor.label_input),
         ("search", &editor.search_input),
+        ("palette", &editor.palette_input),
         ("var", &editor.var_input),
         ("value", &editor.value_input),
     ]
@@ -376,6 +396,7 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         ("search", editor.searching),
         ("problems", editor.problems_open),
         ("help", editor.help_open),
+        ("palette", editor.palette_open),
     ]
     .into_iter()
     .filter_map(|(name, open)| open.then_some(name))

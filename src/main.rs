@@ -12,9 +12,9 @@ use doc::{
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder,
-    PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollWheelEvent, SharedString,
-    Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas, deferred, div, point,
-    prelude::*, px, rgb, size,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle, ScrollWheelEvent,
+    SharedString, Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas, deferred,
+    div, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -48,7 +48,11 @@ actions!(
         StopPlay,
         ToggleProblems,
         ShowHelp,
-        FitView
+        FitView,
+        ShowPalette,
+        PaletteNext,
+        PalettePrev,
+        PaletteRun
     ]
 );
 
@@ -104,6 +108,48 @@ type MenuAction = fn(&mut Editor, &mut Window, &mut Context<Editor>);
 /// Label, shortcut hint, what it runs.
 type MenuItem = (&'static str, &'static str, MenuAction);
 type MenuSpec = (&'static str, &'static [MenuItem]);
+
+/// The palette's own menu entry. Named once because [`palette_entries`] leaves it out: a
+/// command palette that offers to open the command palette is a list with a dead row in it.
+const PALETTE_LABEL: &str = "Command palette…";
+
+/// The commands the palette offers for `query`, as `(menu, item)` pairs read straight off
+/// `MENUS` — so the palette, the menus and the shortcut sheet are one table and cannot
+/// disagree about what a command is called or what runs.
+///
+/// Every word of the query has to appear somewhere in "Menu Label", in any order, so
+/// `node hub` and `hub node` both find Hub and `fit` finds Fit to view. Ranked by where the
+/// first word lands: the start of a label, then inside one, then only in its menu's name
+/// (`play` lists the whole Play menu). The sort is stable, so ties keep the order of the bar.
+fn palette_entries(query: &str) -> Vec<(&'static str, &'static MenuItem)> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut found: Vec<(u8, &'static str, &'static MenuItem)> = Vec::new();
+    for (menu, items) in MENUS {
+        for item in *items {
+            let (label, _, _) = item;
+            if *label == PALETTE_LABEL {
+                continue;
+            }
+            let label_lc = label.to_lowercase();
+            let haystack = format!("{} {label_lc}", menu.to_lowercase());
+            if !words.iter().all(|word| haystack.contains(word.as_str())) {
+                continue;
+            }
+            let rank = match words.first() {
+                None => 0,
+                Some(word) if label_lc.starts_with(word.as_str()) => 0,
+                Some(word) if label_lc.contains(word.as_str()) => 1,
+                Some(_) => 2,
+            };
+            found.push((rank, menu, item));
+        }
+    }
+    found.sort_by_key(|&(rank, _, _)| rank);
+    found
+        .into_iter()
+        .map(|(_, menu, item)| (menu, item))
+        .collect()
+}
 
 /// Every action the editor has, in the order they appear in the bar.
 const MENUS: &[MenuSpec] = &[
@@ -164,6 +210,9 @@ const MENUS: &[MenuSpec] = &[
             }),
             ("Problems", "Ctrl+Shift+M", |e, w, cx| {
                 e.on_toggle_problems(&ToggleProblems, w, cx)
+            }),
+            (PALETTE_LABEL, "Ctrl+K", |e, w, cx| {
+                e.on_show_palette(&ShowPalette, w, cx)
             }),
             ("Keyboard shortcuts", "F1", |e, w, cx| {
                 e.on_show_help(&ShowHelp, w, cx)
@@ -252,6 +301,18 @@ struct Editor {
     problems_open: bool,
     /// The keyboard-and-mouse cheat sheet.
     help_open: bool,
+    /// The command palette is open. Its query lives in `palette_input`, which like
+    /// `search_input` is not document content and stays out of the `sync_fields` loop.
+    palette_open: bool,
+    palette_input: Entity<TextInput>,
+    /// Which row Enter would run. Reset to the top whenever the query changes, so the best
+    /// match is always the one under the cursor.
+    palette_sel: usize,
+    /// The query `palette_sel` was last reset for, so a cursor move in the field — which
+    /// notifies too — does not throw the selection back to the top.
+    palette_seen: String,
+    /// Scrolls the list to the selected row when the arrow keys walk past the edge of it.
+    palette_scroll: ScrollHandle,
     /// Last title pushed to the platform, so `render` only sets it on change.
     title: String,
     /// Name of the menu whose dropdown is open.
@@ -409,6 +470,16 @@ impl Editor {
         for input in [&search_input, &var_input, &value_input] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
         }
+        let palette_input = cx.new(|cx| TextInput::new("Type a command", cx));
+        cx.observe(&palette_input, |this, input, cx| {
+            let query = input.read(cx).content().to_string();
+            if query != this.palette_seen {
+                this.palette_seen = query;
+                this.palette_sel = 0;
+            }
+            cx.notify();
+        })
+        .detach();
 
         // Crash copies, for as long as the window lives. Spawning during construction is
         // fine: the entity slot exists before this closure runs, and the task cannot be
@@ -447,6 +518,11 @@ impl Editor {
             searching: false,
             problems_open: false,
             help_open: false,
+            palette_open: false,
+            palette_input,
+            palette_sel: 0,
+            palette_seen: String::new(),
+            palette_scroll: ScrollHandle::new(),
             title: String::new(),
             open_menu: None,
             closing: false,
@@ -1184,30 +1260,101 @@ impl Editor {
     /// the tree while `searching` is set; focusing it in the same turn works because the
     /// handle exists before the element does, the way `insert_node` focuses the speaker field.
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_palette(cx);
         self.searching = true;
         window.focus(&self.search_input.read(cx).focus_handle(cx));
         cx.notify();
     }
 
     fn on_toggle_problems(&mut self, _: &ToggleProblems, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_palette(cx);
         self.problems_open = !self.problems_open;
         cx.notify();
     }
 
     fn on_show_help(&mut self, _: &ShowHelp, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_palette(cx);
         self.help_open = !self.help_open;
         cx.notify();
     }
 
-    /// Closes the find overlay, the problems drawer and the cheat sheet. True when there was
+    /// Ctrl+K. Toggles, and opens on a clean slate with the field focused. It closes every
+    /// other overlay first: the palette is modal, and a find card left open underneath it
+    /// would take the focus back the moment it was clicked.
+    fn on_show_palette(&mut self, _: &ShowPalette, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.palette_open;
+        self.dismiss_overlays(cx);
+        if was_open {
+            window.focus(&self.focus_handle);
+        } else {
+            self.palette_open = true;
+            self.palette_sel = 0;
+            window.focus(&self.palette_input.read(cx).focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    /// Closes the palette alone, for the handlers that open another overlay over it.
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.palette_open = false;
+            self.palette_input
+                .update(cx, |input, cx| input.set_content("", cx));
+        }
+    }
+
+    /// Moves the highlighted row, wrapping at both ends so Up from the top reaches the last
+    /// command instead of stopping dead.
+    fn palette_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let query = self.palette_input.read(cx).content().to_string();
+        let rows = palette_entries(&query).len();
+        if rows == 0 {
+            return;
+        }
+        let from = self.palette_sel.min(rows - 1) as isize;
+        self.palette_sel = (from + delta).rem_euclid(rows as isize) as usize;
+        self.palette_scroll.scroll_to_item(self.palette_sel);
+        cx.notify();
+    }
+
+    fn on_palette_next(&mut self, _: &PaletteNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.palette_step(1, cx);
+    }
+
+    fn on_palette_prev(&mut self, _: &PalettePrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.palette_step(-1, cx);
+    }
+
+    /// Enter: runs the highlighted command.
+    fn on_palette_run(&mut self, _: &PaletteRun, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.palette_input.read(cx).content().to_string();
+        let entries = palette_entries(&query);
+        let row = self.palette_sel.min(entries.len().saturating_sub(1));
+        if let Some((_, (_, _, action))) = entries.get(row) {
+            self.run_command(*action, window, cx);
+        }
+    }
+
+    /// Runs a command picked from the palette. The palette closes and the canvas takes the
+    /// focus *first*, so a command that wants somewhere else — Find focuses its own field —
+    /// can have it, and one that closes overlays (Stop) finds none left to close and does
+    /// its real job instead.
+    fn run_command(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_overlays(cx);
+        window.focus(&self.focus_handle);
+        action(self, window, cx);
+    }
+
+    /// Closes the find overlay, the problems drawer, the cheat sheet and the palette. True when there was
     /// something to close, which is how Escape knows it has already done its job. The query
     /// is cleared with the overlay, so find always opens on a clean slate.
     fn dismiss_overlays(&mut self, cx: &mut Context<Self>) -> bool {
-        let any = self.searching || self.problems_open || self.help_open;
+        let any = self.searching || self.problems_open || self.help_open || self.palette_open;
         if self.searching {
             self.search_input
                 .update(cx, |input, cx| input.set_content("", cx));
         }
+        self.close_palette(cx);
         self.searching = false;
         self.problems_open = false;
         self.help_open = false;
@@ -1411,10 +1558,10 @@ impl Editor {
         cx.notify();
     }
 
-    /// Escape from inside a text field. Closes the find overlay when that is where the
-    /// field is, since the overlay is nothing but that field and its results.
+    /// Escape from inside a text field. Closes the find overlay or the palette when that is
+    /// where the field is, since each is nothing but that field and its results.
     fn on_focus_canvas(&mut self, _: &FocusCanvas, window: &mut Window, cx: &mut Context<Self>) {
-        if self.searching {
+        if self.searching || self.palette_open {
             self.dismiss_overlays(cx);
         }
         window.focus(&self.focus_handle);
@@ -1498,6 +1645,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_find))
             .on_action(cx.listener(Self::on_toggle_problems))
             .on_action(cx.listener(Self::on_show_help))
+            .on_action(cx.listener(Self::on_show_palette))
+            .on_action(cx.listener(Self::on_palette_next))
+            .on_action(cx.listener(Self::on_palette_prev))
+            .on_action(cx.listener(Self::on_palette_run))
             .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_new_hub))
             .on_action(cx.listener(Self::on_new_jump))
@@ -1537,6 +1688,9 @@ impl Render for Editor {
                 this.child(self.search_overlay(canvas_w, cx))
             })
             .when(self.help_open, |this| this.child(self.help_overlay(cx)))
+            .when(self.palette_open, |this| {
+                this.child(self.palette_overlay(cx))
+            })
     }
 }
 
@@ -3220,6 +3374,138 @@ impl Editor {
         )
     }
 
+    /// The command palette: every menu command, found by typing instead of by remembering
+    /// which menu it hangs off. Opened by Ctrl+K, Enter runs the highlighted row, Escape or
+    /// a click outside closes it.
+    ///
+    /// Modal, with the help sheet's pattern — an invisible backdrop that occludes the window
+    /// and closes the palette on a click, and a card that stops its own clicks reaching it —
+    /// where find is not, because find is meant to be walked through with the canvas live and
+    /// a palette is one command and out. No dimming: the document stays legible behind it.
+    fn palette_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const CARD_W: f32 = 480.0;
+        let query = self.palette_input.read(cx).content().to_string();
+        let entries = palette_entries(&query);
+        let selected = self.palette_sel.min(entries.len().saturating_sub(1));
+
+        deferred(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .occlude()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(MENU_H + 48.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.dismiss_overlays(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .key_context("Palette")
+                        .occlude()
+                        .w(px(CARD_W))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_2()
+                        .bg(theme::RAISED)
+                        .border_1()
+                        .border_color(theme::OUTLINE)
+                        .rounded_md()
+                        .shadow_lg()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(self.palette_input.clone())
+                        .child(
+                            div()
+                                .id("palette-list")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(320.0))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.palette_scroll)
+                                .when(entries.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .type_hint()
+                                            .child("No matching command."),
+                                    )
+                                })
+                                .children(entries.iter().enumerate().map(
+                                    |(row, &(menu, &(label, keys, action)))| {
+                                        div()
+                                            .id(("palette-row", row))
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            // One rung up from the card (see `theme`). There is
+                                            // no separate hover style: pointing at a row
+                                            // *selects* it, so the list has one highlight.
+                                            // A hover colour as well showed two rows lit
+                                            // whenever the pointer rested over the list
+                                            // while the arrow keys moved the selection.
+                                            .when(row == selected, |this| this.bg(theme::PRESSED))
+                                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                                if this.palette_sel != row {
+                                                    this.palette_sel = row;
+                                                    cx.notify();
+                                                }
+                                            }))
+                                            // The menu it lives in, in a column of its own
+                                            // so the labels line up and can be scanned.
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(40.0))
+                                                    .type_hint()
+                                                    .child(menu),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .one_line()
+                                                    .text_color(theme::TEXT)
+                                                    .child(label.trim_end_matches('…')),
+                                            )
+                                            .when(!keys.is_empty(), |this| {
+                                                this.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .px_1()
+                                                        .rounded_sm()
+                                                        .bg(theme::CANVAS)
+                                                        .type_hint()
+                                                        .text_color(theme::TEXT)
+                                                        .child(keys),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.run_command(action, window, cx)
+                                            }))
+                                    },
+                                )),
+                        ),
+                ),
+        )
+    }
+
     /// Every command and gesture, over a dimmed window. The shortcuts are read straight off
     /// `MENUS`, so the sheet is the menus' own table and cannot fall out of step with them;
     /// only the mouse gestures, which no menu holds, are written out here.
@@ -4378,6 +4664,12 @@ fn main() {
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
             KeyBinding::new("ctrl-shift-m", ToggleProblems, Some("Editor")),
             KeyBinding::new("f1", ShowHelp, Some("Editor")),
+            KeyBinding::new("ctrl-k", ShowPalette, Some("Editor")),
+            // `"Palette"` is set on the palette's card, an ancestor of its field, so these
+            // mean something only while it is open — and a text field binds none of them.
+            KeyBinding::new("down", PaletteNext, Some("Palette")),
+            KeyBinding::new("up", PalettePrev, Some("Palette")),
+            KeyBinding::new("enter", PaletteRun, Some("Palette")),
             // Ctrl+1 duplicates Tab so the number row is whole; the menu advertises Tab,
             // which is the older and better key for the kind you reach for most.
             KeyBinding::new("ctrl-1", Branch, Some("Editor")),
@@ -4445,4 +4737,50 @@ fn main() {
         cx.on_window_closed(|cx| cx.quit()).detach();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(query: &str) -> Vec<&'static str> {
+        palette_entries(query)
+            .into_iter()
+            .map(|(_, (label, _, _))| *label)
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_query_lists_every_command_but_the_palette_itself() {
+        let all: usize = MENUS.iter().map(|(_, items)| items.len()).sum();
+        assert_eq!(palette_entries("").len(), all - 1);
+        assert!(!labels("").contains(&PALETTE_LABEL));
+        // ...and so a query for it finds nothing, rather than a row that does nothing.
+        assert!(labels("palette").is_empty());
+    }
+
+    #[test]
+    fn words_match_in_any_order_and_any_case() {
+        assert!(labels("node hub").contains(&"Hub"));
+        assert!(labels("hub node").contains(&"Hub"));
+        assert!(labels("FIT").contains(&"Fit to view"));
+        assert!(labels("zoom nothing").is_empty());
+    }
+
+    #[test]
+    fn a_label_that_starts_with_the_query_outranks_one_that_merely_has_it() {
+        // "Zoom in" holds "in" mid-label; "Instruction" starts with it.
+        let found = labels("in");
+        let instruction = found.iter().position(|l| *l == "Instruction").unwrap();
+        let zoom_in = found.iter().position(|l| *l == "Zoom in").unwrap();
+        assert!(instruction < zoom_in);
+    }
+
+    #[test]
+    fn a_match_on_the_menu_name_alone_ranks_last() {
+        // `Stop` is in the Play menu but does not say "play".
+        let found = labels("play");
+        assert_eq!(found.last(), Some(&"Stop"));
+        assert!(found.len() > 1);
+    }
 }

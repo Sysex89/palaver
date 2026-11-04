@@ -61,6 +61,10 @@ SHOTS = [
     ("15-problems", ["menu View/Problems"]),
     ("16-help", ["menu View/Keyboard shortcuts"]),
     ("17-play-over-problems", ["select node 1", "menu Play/Play conversation", "menu View/Problems"]),
+    ("21-palette", ["menu View/Command palette"]),
+    # `zoom` matches two commands, so `palette next` leaves the second row highlighted.
+    ("22-palette-query", ["menu View/Command palette", "field palette zoom", "palette next"]),
+    ("23-palette-empty", ["menu View/Command palette", "field palette zzz"]),
     # From here on the shots edit the document, which `quit discard` throws away at the end.
     ("18-note", ["select none", "menu Node/Note", "field text Rewrite this branch once the pass is open."]),
     # Two nodes dropped with nothing selected, where the view's centre already holds a node:
@@ -92,26 +96,40 @@ def png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-def capture(editor, out):
-    out.unlink(missing_ok=True)
+# The size of the first capture that passed, which every later one has to match: the editor is
+# resized to a fixed logical size, so its capture is the same size every time.
+_expected = None
+
+
+def capture(editor, out, scratch):
+    """Captures the editor into `scratch` and moves it to `out` only once it is known to be
+    the editor. Spectacle shoots whatever window is *active*, and the person running this
+    may switch to another one mid-run — so a capture is never written into the repository
+    until it has passed, or a rejected one could be committed with `git add docs`."""
+    global _expected
+    shot = scratch / "capture.png"
+    shot.unlink(missing_ok=True)
     editor.send("activate")
     time.sleep(SETTLE)
-    subprocess.run(["spectacle", "-b", "-n", "-a", "-o", str(out)], check=True)
+    subprocess.run(["spectacle", "-b", "-n", "-a", "-o", str(shot)], check=True)
     for _ in range(50):
-        if out.exists() and out.stat().st_size > 0:
+        if shot.exists() and shot.stat().st_size > 0:
             break
         time.sleep(0.1)
     else:
         raise RuntimeError("spectacle wrote nothing")
     time.sleep(0.2)  # let the write finish
-    w, h = png_size(out)
+    w, h = png_size(shot)
     # Spectacle includes the frame and its shadow, so the capture is a little larger, and the
-    # desktop's scale factor multiplies all of it — a size check broke the day the scale
-    # changed. The shape survives both: 1200x800 plus a title bar and shadow is about 1.4:1,
-    # where a maximised or fullscreen window is much wider.
-    if w < WINDOW[0] or h < WINDOW[1] or not 1.25 <= w / h <= 1.55:
-        out.rename(out.with_suffix(".wrong-window.png"))
-        raise RuntimeError(f"captured {w}x{h} — another window was active")
+    # desktop's scale factor multiplies all of it — a plain size check broke the day the scale
+    # changed. The *shape* survives that: 1200x800 plus a title bar and shadow is about
+    # 1.39:1 at every scale seen, and a browser window, the thing that was once captured by
+    # mistake, is 1.53. Then it has to match the first capture exactly.
+    if not 1.36 <= w / h <= 1.42 or (_expected and (w, h) != _expected):
+        shot.unlink(missing_ok=True)
+        raise RuntimeError(f"captured {w}x{h} — another window was active, not kept")
+    _expected = _expected or (w, h)
+    shutil.move(str(shot), str(out))
 
 
 def main():
@@ -147,7 +165,7 @@ def main():
         # unless asked for by name, like any other shot.
         if not only or "00-open" in only:
             try:
-                capture(editor, out_dir / "00-open.png")
+                capture(editor, out_dir / "00-open.png", tmp)
                 print(f"  {'00-open':22} {editor.send('state')}")
                 taken += 1
             except RuntimeError as error:
@@ -161,7 +179,7 @@ def main():
                 for command in RESET + commands:
                     editor.send(command)
                 time.sleep(SETTLE)
-                capture(editor, out_dir / f"{name}.png")
+                capture(editor, out_dir / f"{name}.png", tmp)
                 print(f"  {name:22} {editor.send('state')}")
                 taken += 1
             except RuntimeError as error:
