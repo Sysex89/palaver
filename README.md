@@ -144,15 +144,15 @@ On Linux GPUI renders through Vulkan, so you'll need the Vulkan development pack
 the X11 or Wayland ones. If the build fails inside a `blade-*` crate or in `gpui` itself,
 it's almost always a missing system library rather than anything in here.
 
-It opens on a small sample conversation with one of every node kind, a second flow, some tags
-and two bookmarks, so there's something to click on straight away.
+There's no release binary yet, so building it is the only way to run it. It opens on a small
+sample conversation with one of every node kind, a second flow, some tags and two bookmarks,
+so there's something to click on straight away.
 
-## Not done yet
+## Design notes
 
-There's no release binary, so for now you have to build it yourself.
-
-[`CLAUDE.md`](CLAUDE.md) has the architecture notes and the list of things I decided not to
-build. [`docs/next.md`](docs/next.md) is what I'd do next.
+The architecture is written up in [CLAUDE.md](CLAUDE.md): how the canvas is drawn, the three
+coordinate spaces, the invariants each feature keeps, and a section at the end on what I chose
+not to build and why.
 
 ## License
 
