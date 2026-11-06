@@ -3,7 +3,7 @@
 //! Upstream code: keep edits minimal so it can be re-synced against a newer gpui.
 //! Local changes: made public, added `new`/`set_content`/`set_placeholder`/`bind_keys`, ctrl-based
 //! (rather than cmd-based) keybindings, dark styling from `crate::theme` with an accent border
-//! while focused, example harness removed. The text and the cursor are `theme::TEXT`, set here
+//! while focused, example harness removed. The text and the cursor are `theme::text()`, set here
 //! rather than inherited: upstream inherits the colour and paints the cursor `gpui::blue()`,
 //! which was invisible black-on-dark in any field whose ancestors set no text colour — every
 //! overlay, since they are deferred and sit under nothing that does.
@@ -466,9 +466,9 @@ struct PrepaintState {
 fn text_and_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextRun>) {
     let style = window.text_style();
     let (display_text, text_color) = if input.content.is_empty() {
-        (input.placeholder.clone(), theme::TEXT_FAINT.into())
+        (input.placeholder.clone(), theme::text_faint().into())
     } else {
-        (input.content.clone(), theme::TEXT.into())
+        (input.content.clone(), theme::text().into())
     };
 
     let run = TextRun {
@@ -518,7 +518,7 @@ fn text_and_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextR
             &run,
             input.selected_range.clone(),
             TextRun {
-                background_color: Some(theme::ACCENT_SELECTION.into()),
+                background_color: Some(theme::accent_selection().into()),
                 ..run.clone()
             },
         )
@@ -617,7 +617,7 @@ impl Element for TextElement {
                 .map(|pos| {
                     fill(
                         Bounds::new(bounds.origin + pos, size(px(2.), line_height)),
-                        theme::TEXT,
+                        theme::text(),
                     )
                 })
         } else {
@@ -714,12 +714,12 @@ impl Render for TextInput {
                     .min_h(px(20. + 4. * 2.))
                     .w_full()
                     .p(px(4.))
-                    .bg(theme::CANVAS)
+                    .bg(theme::canvas())
                     .border_1()
                     .border_color(if focused {
-                        theme::ACCENT
+                        theme::accent()
                     } else {
-                        theme::OUTLINE
+                        theme::outline()
                     })
                     .rounded_md()
                     .child(TextElement { input: cx.entity() }),

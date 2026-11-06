@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use gpui::{Context, Focusable, Window, px, size};
 
+use crate::ThemePref;
 use crate::doc::{Doc, NodeKind, clear_backup};
 use crate::{
     Editor, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection, SidePane, node_number,
@@ -161,6 +162,17 @@ fn run(
         }
 
         "select" => select(editor, rest, window, cx),
+
+        "theme" => {
+            let pref = match rest.to_ascii_lowercase().as_str() {
+                "system" => ThemePref::System,
+                "dark" => ThemePref::Dark,
+                "light" => ThemePref::Light,
+                _ => return Err(format!("no theme {rest:?}")),
+            };
+            editor.set_theme(pref, cx);
+            Ok(String::new())
+        }
 
         "pane" => {
             let pane = match rest.to_ascii_lowercase().as_str() {

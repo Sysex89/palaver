@@ -31,6 +31,8 @@ SETTLE = 0.4  # seconds for a frame to land after a command
 # Escape closes an overlay *instead of* stopping play when one is open, so it is sent twice:
 # the first closes whatever is up, the second stops a play-through the overlay was hiding.
 RESET = [
+    # Pinned, not left to follow the desktop: a shot must not depend on the machine's theme.
+    "theme dark",
     "menu Play/Stop",
     "menu Play/Stop",
     "select none",
@@ -71,6 +73,14 @@ SHOTS = [
     # `zoom` matches two commands, so `palette next` leaves the second row highlighted.
     ("22-palette-query", ["menu View/Command palette", "field palette zoom", "palette next"]),
     ("23-palette-empty", ["menu View/Command palette", "field palette zzz"]),
+    # The same states in the light palette. "Paper": warm greys, white cards.
+    ("L01-default", ["theme light"]),
+    ("L02-speech", ["theme light", "select node 1"]),
+    ("L07-condition", ["theme light", "select kind condition"]),
+    ("L10-search", ["theme light", "menu Edit/Find", "field search inn"]),
+    ("L11-cast", ["theme light", "pane cast"]),
+    ("L13-play-trail", ["theme light", "select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0", "choose 1"]),
+    ("L21-palette", ["theme light", "menu View/Command palette"]),
     # From here on the shots edit the document, which `quit discard` throws away at the end.
     ("18-note", ["select none", "menu Node/Note", "field text Rewrite this branch once the pass is open."]),
     # Two nodes dropped with nothing selected, where the view's centre already holds a node:

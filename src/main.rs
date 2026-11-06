@@ -14,8 +14,8 @@ use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder,
     PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle, ScrollWheelEvent,
-    SharedString, Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas, deferred,
-    div, point, prelude::*, px, rgb, size,
+    SharedString, Window, WindowAppearance, WindowBounds, WindowHandle, WindowOptions, actions,
+    canvas, deferred, div, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,6 +53,7 @@ actions!(
         ShowHelp,
         FitView,
         ShowPalette,
+        CycleTheme,
         PaletteNext,
         PalettePrev,
         PaletteRun
@@ -232,6 +233,9 @@ const MENUS: &[MenuSpec] = &[
             (PALETTE_LABEL, "Ctrl+K", |e, w, cx| {
                 e.on_show_palette(&ShowPalette, w, cx)
             }),
+            ("Cycle theme", "Ctrl+Shift+T", |e, w, cx| {
+                e.on_cycle_theme(&CycleTheme, w, cx)
+            }),
             ("Keyboard shortcuts", "F1", |e, w, cx| {
                 e.on_show_help(&ShowHelp, w, cx)
             }),
@@ -260,6 +264,29 @@ fn document_name(path: Option<&std::path::Path>) -> String {
             .to_string_lossy()
             .into(),
         None => format!("untitled.{FILE_EXT}"),
+    }
+}
+
+/// Which palette the author wants. `System` follows the window's appearance, so the editor
+/// matches the desktop and changes with it; the other two override it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemePref {
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemePref {
+    /// The palette to draw with, given what the window reports.
+    fn resolve(self, appearance: WindowAppearance) -> theme::Mode {
+        match self {
+            ThemePref::Dark => theme::Mode::Dark,
+            ThemePref::Light => theme::Mode::Light,
+            ThemePref::System => match appearance {
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => theme::Mode::Dark,
+                WindowAppearance::Light | WindowAppearance::VibrantLight => theme::Mode::Light,
+            },
+        }
     }
 }
 
@@ -322,6 +349,8 @@ struct Editor {
     /// The command palette is open. Its query lives in `palette_input`, which like
     /// `search_input` is not document content and stays out of the `sync_fields` loop.
     palette_open: bool,
+    /// Which palette is wanted; resolved against the window's appearance every frame.
+    theme_pref: ThemePref,
     palette_input: Entity<TextInput>,
     /// Which row Enter would run. Reset to the top whenever the query changes, so the best
     /// match is always the one under the cursor.
@@ -483,6 +512,12 @@ impl Editor {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
 
+        // The desktop switching light/dark repaints the window; `render` then resolves the
+        // palette against the new appearance. Detached: it lives as long as the window does.
+        window
+            .observe_window_appearance(|window, _| window.refresh())
+            .detach();
+
         let speaker_input = cx.new(|cx| TextInput::new("Speaker", cx));
         let text_input = cx.new(|cx| TextInput::new("Line of dialog", cx));
         let alias_input = cx.new(|cx| TextInput::new("Name for the game to call", cx));
@@ -549,6 +584,7 @@ impl Editor {
             problems_open: false,
             help_open: false,
             palette_open: false,
+            theme_pref: ThemePref::System,
             palette_input,
             palette_sel: 0,
             palette_seen: String::new(),
@@ -1055,17 +1091,17 @@ impl Editor {
                 let walked = path.windows(2).any(|w| w[0] == e.from && w[1] == e.to);
                 let spent = self.doc.spent(path, e.from, e.to);
                 let color = match (self.selection == Selection::Edge(index), e.branch) {
-                    (true, _) => theme::ACCENT,
-                    _ if spent => theme::SPENT,
+                    (true, _) => theme::accent(),
+                    _ if spent => theme::spent(),
                     _ if !self.doc.is_condition(e.from) => {
                         if walked {
-                            theme::TRAIL
+                            theme::trail()
                         } else {
-                            theme::EDGE
+                            theme::edge()
                         }
                     }
-                    (false, true) => theme::TRUE,
-                    (false, false) => theme::FALSE,
+                    (false, true) => theme::true_pin(),
+                    (false, false) => theme::false_pin(),
                 };
                 Some((
                     self.screen_pos(out_port(from)),
@@ -1377,6 +1413,18 @@ impl Editor {
     /// Ctrl+K. Toggles, and opens on a clean slate with the field focused. It closes every
     /// other overlay first: the palette is modal, and a find card left open underneath it
     /// would take the focus back the moment it was clicked.
+    /// System → Dark → Light → System. A command and not a toggle, because there are three
+    /// answers; the Preferences card sets one directly.
+    fn on_cycle_theme(&mut self, _: &CycleTheme, _: &mut Window, cx: &mut Context<Self>) {
+        let (next, name) = match self.theme_pref {
+            ThemePref::System => (ThemePref::Dark, "Theme: dark"),
+            ThemePref::Dark => (ThemePref::Light, "Theme: light"),
+            ThemePref::Light => (ThemePref::System, "Theme: follows the system"),
+        };
+        self.set_theme(next, cx);
+        self.set_status(name.to_string(), cx);
+    }
+
     fn on_show_palette(&mut self, _: &ShowPalette, window: &mut Window, cx: &mut Context<Self>) {
         let was_open = self.palette_open;
         self.dismiss_overlays(cx);
@@ -1747,22 +1795,26 @@ impl Editor {
                 .justify_center()
                 .gap_1()
                 .p_2()
-                .bg(theme::RAISED)
+                .bg(theme::raised())
                 .border_1()
-                .border_color(if on { theme::ACCENT } else { theme::OUTLINE })
+                .border_color(if on {
+                    theme::accent()
+                } else {
+                    theme::outline()
+                })
                 .rounded_md()
                 .shadow_md()
                 .cursor_pointer()
                 .child(
                     div()
                         .one_line()
-                        .text_color(theme::TEXT)
+                        .text_color(theme::text())
                         .child(if flow.is_empty() { "(main)" } else { flow }.to_string()),
                 )
                 .child(
                     div()
                         .one_line()
-                        .text_color(theme::TEXT_FAINT)
+                        .text_color(theme::text_faint())
                         .child(match nodes {
                             0 => "empty".to_string(),
                             _ => format!("{} · {}", plural(nodes, "node"), plural(lines, "line")),
@@ -1785,8 +1837,8 @@ impl Editor {
                 .child(
                     div()
                         .px_1()
-                        .bg(theme::CANVAS)
-                        .text_color(theme::KIND_JUMP)
+                        .bg(theme::canvas())
+                        .text_color(theme::kind_jump())
                         .child(count.to_string()),
                 )
                 .into_any_element()
@@ -1795,7 +1847,7 @@ impl Editor {
             .absolute()
             .left(px(12.0))
             .bottom(px(10.0))
-            .text_color(theme::TEXT_FAINT)
+            .text_color(theme::text_faint())
             .child(
                 "Flow map — arrows are jumps, numbered · click a flow to open it · Ctrl+M closes",
             )
@@ -1832,6 +1884,13 @@ impl Editor {
 
     /// Switches the left pane's tab. A rename aimed at the list you just left would rename
     /// the wrong thing, so switching tabs puts the shared field back to declaring.
+    /// Chooses the palette: light, dark, or whatever the desktop is. The one place the
+    /// preference changes, so the Preferences card and the automation reach it the same way.
+    fn set_theme(&mut self, pref: ThemePref, cx: &mut Context<Self>) {
+        self.theme_pref = pref;
+        cx.notify();
+    }
+
     fn switch_pane(&mut self, pane: SidePane, cx: &mut Context<Self>) {
         self.pane = pane;
         self.renaming = None;
@@ -1864,6 +1923,8 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // First, before anything below reads a token: the whole frame is drawn in one palette.
+        theme::set_mode(self.theme_pref.resolve(window.appearance()));
         let title = format!(
             "palaver — {}{}{}",
             self.file_name(),
@@ -1894,7 +1955,7 @@ impl Render for Editor {
                         (
                             point(px(a.0), px(a.1)),
                             point(px(b.0), px(b.1)),
-                            theme::KIND_JUMP,
+                            theme::kind_jump(),
                             EDGE_W,
                         )
                     })
@@ -1925,6 +1986,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_toggle_problems))
             .on_action(cx.listener(Self::on_show_help))
             .on_action(cx.listener(Self::on_show_palette))
+            .on_action(cx.listener(Self::on_cycle_theme))
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_run))
@@ -1987,10 +2049,10 @@ impl Editor {
             .h(px(MENU_H))
             .items_center()
             .px_1()
-            .bg(theme::PANE)
+            .bg(theme::pane())
             .border_b_1()
-            .border_color(theme::DIVIDER)
-            .text_color(theme::TEXT)
+            .border_color(theme::divider())
+            .text_color(theme::text())
             .children(MENUS.iter().map(|(name, items)| {
                 let open = self.open_menu == Some(*name);
                 div()
@@ -2001,8 +2063,8 @@ impl Editor {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .when(open, |this| this.bg(theme::PRESSED))
-                            .hover(|style| style.bg(theme::HOVER))
+                            .when(open, |this| this.bg(theme::pressed()))
+                            .hover(|style| style.bg(theme::hover()))
                             .child(*name)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_menu = (!open).then_some(*name);
@@ -2033,7 +2095,7 @@ impl Editor {
             .flex_1()
             .h_full()
             .overflow_hidden()
-            .bg(theme::CANVAS)
+            .bg(theme::canvas())
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_pan_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -2066,7 +2128,7 @@ impl Editor {
                             draw(from, to, color, width);
                         }
                         if let Some((from, to)) = pending {
-                            draw(from, to, theme::ACCENT, EDGE_W);
+                            draw(from, to, theme::accent(), EDGE_W);
                         }
                     },
                 )
@@ -2141,9 +2203,9 @@ impl Editor {
                     .top(origin.y)
                     .w(size.x)
                     .h(size.y)
-                    .bg(theme::ACCENT_WASH)
+                    .bg(theme::accent_wash())
                     .border_1()
-                    .border_color(theme::ACCENT)
+                    .border_color(theme::accent())
                     .into_any_element(),
             );
         }
@@ -2192,8 +2254,8 @@ impl Editor {
             .filter_map(|edge| {
                 let (text, color) = if self.doc.is_condition(edge.from) {
                     match edge.branch {
-                        true => ("true".to_string(), theme::TRUE),
-                        false => ("false".to_string(), theme::FALSE),
+                        true => ("true".to_string(), theme::true_pin()),
+                        false => ("false".to_string(), theme::false_pin()),
                     }
                 } else if self.doc.is_once(edge) {
                     // Shown on the canvas as well as in the inspector, the way a condition's
@@ -2204,10 +2266,10 @@ impl Editor {
                     // offers no toggle for it.
                     (
                         format!("(once) {}", edge.label).trim_end().to_string(),
-                        theme::TEXT_MUTED,
+                        theme::text_muted(),
                     )
                 } else {
-                    (edge.label.clone(), theme::TEXT_MUTED)
+                    (edge.label.clone(), theme::text_muted())
                 };
                 let (from_node, to_node) = (self.doc.node(edge.from)?, self.doc.node(edge.to)?);
                 // Skipped for the reason `edge_lines` skips it, and through the same test so
@@ -2249,9 +2311,9 @@ impl Editor {
                                 .px(px(self.view.scale(PAD_X)))
                                 .py(px(self.view.scale(2.0)))
                                 .rounded_md()
-                                .bg(theme::RAISED)
+                                .bg(theme::raised())
                                 .border_1()
-                                .border_color(theme::OUTLINE)
+                                .border_color(theme::outline())
                                 .text_color(color)
                                 .text_center()
                                 .text_ellipsis()
@@ -2303,9 +2365,9 @@ impl Editor {
                 .flex_col()
                 .gap_2()
                 .p_2()
-                .bg(theme::RAISED)
+                .bg(theme::raised())
                 .border_1()
-                .border_color(theme::OUTLINE)
+                .border_color(theme::outline())
                 .rounded_md()
                 .shadow_lg()
                 .on_mouse_down(
@@ -2341,11 +2403,11 @@ impl Editor {
                                             .py_1()
                                             .rounded_sm()
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(theme::HOVER))
+                                            .hover(|style| style.bg(theme::hover()))
                                             .child(
                                                 div()
                                                     .flex_none()
-                                                    .text_color(theme::TEXT)
+                                                    .text_color(theme::text())
                                                     .child(node.alias.trim().to_string()),
                                             )
                                             .child(
@@ -2353,7 +2415,7 @@ impl Editor {
                                                     .flex_1()
                                                     .min_w(px(0.0))
                                                     .one_line()
-                                                    .text_color(theme::TEXT_FAINT)
+                                                    .text_color(theme::text_faint())
                                                     .child(node_label(&self.doc, node)),
                                             )
                                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2393,14 +2455,14 @@ impl Editor {
                                     .py_1()
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(theme::HOVER))
+                                    .hover(|style| style.bg(theme::hover()))
                                     .child(div().flex_none().w_4().text_color(color).child(glyph))
                                     .child(
                                         div()
                                             .flex_1()
                                             .min_w(px(0.0))
                                             .one_line()
-                                            .text_color(theme::TEXT)
+                                            .text_color(theme::text())
                                             .child(ref_label(&self.doc, node)),
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -2507,10 +2569,10 @@ impl Editor {
             .flex_none()
             .h_full()
             .p_3()
-            .bg(theme::PANE)
+            .bg(theme::pane())
             .border_r_1()
-            .border_color(theme::DIVIDER)
-            .text_color(theme::TEXT)
+            .border_color(theme::divider())
+            .text_color(theme::text())
             // A segmented control in equal thirds. Chips that wrapped left "Flows" alone on a
             // second line, and "Variables (now)" while playing was wider than the pane; the
             // live state is a line of its own below instead of a longer label.
@@ -2522,7 +2584,7 @@ impl Editor {
                     .gap(px(2.0))
                     .p(px(2.0))
                     .rounded_md()
-                    .bg(theme::CANVAS)
+                    .bg(theme::canvas())
                     .children(
                         [
                             (SidePane::Variables, "Variables", "pane-variables"),
@@ -2549,9 +2611,9 @@ impl Editor {
                                 } else {
                                     FontWeight::NORMAL
                                 })
-                                .when(on, |this| this.bg(theme::PRESSED))
-                                .text_color(if on { theme::TEXT } else { theme::TEXT_FAINT })
-                                .hover(|style| style.text_color(theme::TEXT))
+                                .when(on, |this| this.bg(theme::pressed()))
+                                .text_color(if on { theme::text() } else { theme::text_faint() })
+                                .hover(|style| style.text_color(theme::text()))
                                 .child(label)
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.switch_pane(pane, cx)),
@@ -2563,7 +2625,7 @@ impl Editor {
                 this.child(
                     div()
                         .type_hint()
-                        .text_color(theme::PLAYING)
+                        .text_color(theme::playing())
                         .child("Live values — read-only"),
                 )
             })
@@ -2586,7 +2648,7 @@ impl Editor {
                         ),
                         SidePane::Tags if tag_groups.is_empty() => list.child(
                             div()
-                                .text_color(theme::TEXT_FAINT)
+                                .text_color(theme::text_faint())
                                 .child("No tags yet. Select nodes and tag them below."),
                         ),
                         SidePane::Tags => list.children(
@@ -2615,7 +2677,7 @@ impl Editor {
                                                         div()
                                                             .flex_1()
                                                             .min_w(px(0.0))
-                                                            .text_color(theme::TEXT_FAINT)
+                                                            .text_color(theme::text_faint())
                                                             .one_line()
                                                             .child(header.clone().unwrap_or_else(
                                                                 || "(ungrouped)".to_string(),
@@ -2714,8 +2776,8 @@ impl Editor {
                     div()
                         .pt_1()
                         .border_t_1()
-                        .border_color(theme::DIVIDER)
-                        .text_color(theme::TEXT_FAINT)
+                        .border_color(theme::divider())
+                        .text_color(theme::text_faint())
                         // Two lines, since a flow name and both counts overflow the pane.
                         .child(div().one_line().child(whose))
                         .child(div().one_line().child(format!(
@@ -2757,9 +2819,9 @@ impl Editor {
                             .px_2()
                             .rounded_sm()
                             .cursor_pointer()
-                            .bg(theme::RAISED)
-                            .text_color(theme::TEXT_MUTED)
-                            .hover(|style| style.text_color(theme::TEXT))
+                            .bg(theme::raised())
+                            .text_color(theme::text_muted())
+                            .hover(|style| style.text_color(theme::text()))
                             .child(if is_rename { "✓" } else { "+" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let typed = this.var_input.read(cx).content().to_string();
@@ -2918,8 +2980,8 @@ impl Editor {
                                 .px_1()
                                 .rounded_sm()
                                 .cursor_pointer()
-                                .text_color(theme::TEXT_FAINT)
-                                .hover(|style| style.text_color(theme::TEXT))
+                                .text_color(theme::text_faint())
+                                .hover(|style| style.text_color(theme::text()))
                                 .child("✗")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.renaming = None;
@@ -2983,8 +3045,8 @@ impl Editor {
             .px_1()
             .rounded_sm()
             .cursor_pointer()
-            .text_color(theme::ACCENT)
-            .hover(|style| style.bg(theme::HOVER))
+            .text_color(theme::accent())
+            .hover(|style| style.bg(theme::hover()))
             .child(n.to_string())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.edit_value(target.clone(), n, window, cx);
@@ -3009,8 +3071,8 @@ impl Editor {
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(theme::TEXT_MUTED)
-                    .hover(|style| style.text_color(theme::TEXT))
+                    .text_color(theme::text_muted())
+                    .hover(|style| style.text_color(theme::text()))
                     .child("✓")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // Checked again at the click and not only at render, since the
@@ -3050,8 +3112,8 @@ impl Editor {
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(theme::TEXT_FAINT)
-                    .hover(|style| style.text_color(theme::TEXT))
+                    .text_color(theme::text_faint())
+                    .hover(|style| style.text_color(theme::text()))
                     .child("✗")
                     // Not an edit, so no checkpoint: nothing was written yet.
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3097,9 +3159,17 @@ impl Editor {
                     .px_2()
                     .rounded_sm()
                     .cursor_pointer()
-                    .bg(if on { theme::PRESSED } else { theme::RAISED })
-                    .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
-                    .hover(|style| style.text_color(theme::TEXT))
+                    .bg(if on {
+                        theme::pressed()
+                    } else {
+                        theme::raised()
+                    })
+                    .text_color(if on {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .hover(|style| style.text_color(theme::text()))
                     .one_line()
                     .child(label)
                     // Only aims the field, so no checkpoint — same as a `\u{270e}`.
@@ -3119,8 +3189,8 @@ impl Editor {
             .px_1()
             .rounded_sm()
             .cursor_pointer()
-            .text_color(theme::TEXT_FAINT)
-            .hover(|style| style.text_color(theme::TEXT))
+            .text_color(theme::text_faint())
+            .hover(|style| style.text_color(theme::text()))
             .child("\u{270e}")
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.renaming = Some(Rename::Set(set.clone()));
@@ -3172,12 +3242,12 @@ impl Editor {
                     .gap_2()
                     .flex_1()
                     .min_w(px(0.0))
-                    .text_color(if on { theme::TRUE } else { theme::TEXT })
+                    .text_color(if on { theme::true_pin() } else { theme::text() })
                     .child(div().flex_none().child(if on { "☑" } else { "☐" }))
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .when(playing.is_none(), |this| {
                         this.cursor_pointer()
-                            .hover(|style| style.text_color(theme::TEXT))
+                            .hover(|style| style.text_color(theme::text()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.checkpoint();
                                 this.doc.set_default(&name, Value::Bool(!on));
@@ -3193,7 +3263,7 @@ impl Editor {
                     .flex_1()
                     .min_w(px(0.0))
                     .items_center()
-                    .text_color(theme::TEXT)
+                    .text_color(theme::text())
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .child(if editing {
                         self.value_editor(cx).into_any_element()
@@ -3201,7 +3271,7 @@ impl Editor {
                         // Read-only while playing, like everything else in the pane.
                         div()
                             .px_1()
-                            .text_color(theme::TEXT)
+                            .text_color(theme::text())
                             .child(n.to_string())
                             .into_any_element()
                     } else {
@@ -3221,11 +3291,11 @@ impl Editor {
                         .rounded_sm()
                         .cursor_pointer()
                         .text_color(if is_int {
-                            theme::ACCENT
+                            theme::accent()
                         } else {
-                            theme::TEXT_FAINT
+                            theme::text_faint()
                         })
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .hover(|style| style.text_color(theme::text()))
                         .child("#")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.checkpoint();
@@ -3251,8 +3321,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("✎")
                         // Not an edit yet, so no checkpoint — it only aims
                         // the field the declare button already uses.
@@ -3273,8 +3343,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::DANGER))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::danger()))
                         .child("×")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.checkpoint();
@@ -3327,8 +3397,12 @@ impl Editor {
                     .min_w(px(0.0))
                     .one_line()
                     .cursor_pointer()
-                    .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
-                    .hover(|style| style.text_color(theme::TEXT))
+                    .text_color(if on {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .hover(|style| style.text_color(theme::text()))
                     .child(if main { "(main)".to_string() } else { flow })
                     .on_click(cx.listener(move |this, _, _, cx| this.show_flow(&to_show, cx))),
             )
@@ -3342,8 +3416,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("→")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let ids = this.selection.nodes().to_vec();
@@ -3377,8 +3451,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("\u{270e}")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -3394,8 +3468,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::DANGER))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::danger()))
                         .child("\u{d7}")
                         // The nodes come back to the main flow rather than going with it:
                         // deleting a canvas must not delete what is drawn on it.
@@ -3447,8 +3521,8 @@ impl Editor {
                     .min_w(px(0.0))
                     .one_line()
                     .cursor_pointer()
-                    .text_color(theme::TEXT_MUTED)
-                    .hover(|style| style.text_color(theme::TEXT))
+                    .text_color(theme::text_muted())
+                    .hover(|style| style.text_color(theme::text()))
                     .child(shown)
                     // Only the search box changes, so no checkpoint.
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3466,8 +3540,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("+")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let ids = this.selection.nodes().to_vec();
@@ -3489,8 +3563,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("\u{270e}")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         // Split the way the declare field is joined, as a variable's rename
@@ -3525,7 +3599,7 @@ impl Editor {
             .when(tags.is_empty(), |this| {
                 this.child(
                     div()
-                        .text_color(theme::TEXT_FAINT)
+                        .text_color(theme::text_faint())
                         .child("none — add from the Tags tab"),
                 )
             })
@@ -3536,15 +3610,15 @@ impl Editor {
                     .gap_1()
                     .px_2()
                     .rounded_sm()
-                    .bg(theme::RAISED)
-                    .text_color(theme::TEXT_MUTED)
+                    .bg(theme::raised())
+                    .text_color(theme::text_muted())
                     .child(label)
                     .child(
                         div()
                             .id(("tag-off", i))
                             .cursor_pointer()
-                            .text_color(theme::TEXT_FAINT)
-                            .hover(|style| style.text_color(theme::DANGER))
+                            .text_color(theme::text_faint())
+                            .hover(|style| style.text_color(theme::danger()))
                             .child("\u{d7}")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.doc.node(id).is_some_and(|n| n.tags.contains(&tag)) {
@@ -3614,7 +3688,7 @@ impl Editor {
                     .flex_1()
                     .min_w(px(0.0))
                     .one_line()
-                    .text_color(theme::TEXT)
+                    .text_color(theme::text())
                     .child(name),
             )
             // How many lines they speak — the number casting asks first, and the flow row's
@@ -3628,8 +3702,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("✎")
                         // Not an edit yet, so no checkpoint — it only aims the shared field.
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -3645,8 +3719,8 @@ impl Editor {
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|style| style.text_color(theme::DANGER))
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::danger()))
                         .child("×")
                         // Undeclaring only: the nodes keep saying the name, and the problem
                         // list is what points out that nobody declared it.
@@ -3691,11 +3765,11 @@ impl Editor {
             .rounded_sm()
             .cursor_pointer()
             .text_color(if open {
-                theme::ACCENT
+                theme::accent()
             } else {
-                theme::TEXT_FAINT
+                theme::text_faint()
             })
-            .hover(|style| style.text_color(theme::TEXT))
+            .hover(|style| style.text_color(theme::text()))
             .child(count.to_string())
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.used_by = match this.used_by.take() {
@@ -3767,8 +3841,8 @@ impl Editor {
                         .rounded_sm()
                         .one_line()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_MUTED)
-                        .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                        .text_color(theme::text_muted())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
                         .child(label)
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.jump_to(id, window, cx)),
@@ -3785,9 +3859,9 @@ impl Editor {
             .mb_1()
             .pl_1()
             .border_l_1()
-            .border_color(theme::DIVIDER)
+            .border_color(theme::divider())
             .when(empty, |this| {
-                this.child(div().text_color(theme::TEXT_FAINT).child(match target {
+                this.child(div().text_color(theme::text_faint()).child(match target {
                     Ref::Node(_) => "Nothing leads here — a start.",
                     _ => "Used nowhere.",
                 }))
@@ -3796,7 +3870,7 @@ impl Editor {
             .when(more > 0, |this| {
                 this.child(
                     div()
-                        .text_color(theme::TEXT_FAINT)
+                        .text_color(theme::text_faint())
                         .child(format!("…and {more} more")),
                 )
             })
@@ -3845,8 +3919,8 @@ impl Editor {
                         .rounded_sm()
                         .one_line()
                         .cursor_pointer()
-                        .text_color(theme::TEXT_MUTED)
-                        .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                        .text_color(theme::text_muted())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
                         .child(label)
                         .on_click(cx.listener(move |this, _, window, cx| match at {
                             Mention::Node(id) => this.jump_to(id, window, cx),
@@ -3871,12 +3945,12 @@ impl Editor {
                         .mb_1()
                         .pl_1()
                         .border_l_1()
-                        .border_color(theme::DIVIDER)
+                        .border_color(theme::divider())
                         .children(rows)
                         .when(more > 0, |this| {
                             this.child(
                                 div()
-                                    .text_color(theme::TEXT_FAINT)
+                                    .text_color(theme::text_faint())
                                     .child(format!("…and {more} more")),
                             )
                         }),
@@ -3915,7 +3989,7 @@ impl Editor {
                 .px_1()
                 .rounded_sm()
                 .text_color(color)
-                .hover(|style| style.bg(theme::HOVER))
+                .hover(|style| style.bg(theme::hover()))
                 .child(label)
         };
 
@@ -3933,7 +4007,7 @@ impl Editor {
                     .justify_between()
                     .child(div().type_title().child("Playing"))
                     .child(
-                        row(("play-stop", 0), "Stop".into(), theme::TEXT_MUTED).on_click(
+                        row(("play-stop", 0), "Stop".into(), theme::text_muted()).on_click(
                             cx.listener(|this, _, window, cx| {
                                 this.on_stop_play(&StopPlay, window, cx)
                             }),
@@ -3946,7 +4020,7 @@ impl Editor {
                 let Some(node) = node else {
                     return this.child(
                         div()
-                            .text_color(theme::DANGER)
+                            .text_color(theme::danger())
                             .child("This node has been deleted."),
                     );
                 };
@@ -3956,7 +4030,7 @@ impl Editor {
                 if !self.doc.pauses_play(current) {
                     return this.child(
                         div()
-                            .text_color(theme::DANGER)
+                            .text_color(theme::danger())
                             .child("The flow stops here — nothing leads on."),
                     );
                 }
@@ -3989,7 +4063,7 @@ impl Editor {
                 self.effects_fired(path)
                     .into_iter()
                     .map(|(var, op, value)| {
-                        div().text_color(theme::KIND_INSTRUCTION).child(format!(
+                        div().text_color(theme::kind_instruction()).child(format!(
                             "{var} {} {}",
                             op.symbol(),
                             value
@@ -4015,11 +4089,11 @@ impl Editor {
                         if self.doc.spent(path, current, to) {
                             return div()
                                 .px_1()
-                                .text_color(theme::TEXT_DISABLED)
+                                .text_color(theme::text_disabled())
                                 .child(format!("→ {label} (already taken)"))
                                 .into_any_element();
                         }
-                        row(("play-choice", i), format!("→ {label}"), theme::TEXT)
+                        row(("play-choice", i), format!("→ {label}"), theme::text())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.play_advance(to, window, cx)
                             }))
@@ -4045,7 +4119,7 @@ impl Editor {
                     // the invisible run walked through to get here is not a step back.
                     .when(self.doc.step_back(&mut path.to_vec()), |this| {
                         this.child(
-                            row(("play-nav", 0), "← Back".into(), theme::TEXT_MUTED).on_click(
+                            row(("play-nav", 0), "← Back".into(), theme::text_muted()).on_click(
                                 cx.listener(|this, _, window, cx| {
                                     let Some(mut path) = this.play.take() else {
                                         return;
@@ -4059,7 +4133,7 @@ impl Editor {
                         )
                     })
                     .child(
-                        row(("play-nav", 1), "Restart".into(), theme::TEXT_MUTED).on_click(
+                        row(("play-nav", 1), "Restart".into(), theme::text_muted()).on_click(
                             cx.listener(|this, _, window, cx| {
                                 let Some(path) = this.play.as_ref() else {
                                     return;
@@ -4109,17 +4183,17 @@ impl Editor {
             .flex_none()
             .items_center()
             .h(px(STATUS_H))
-            .bg(theme::PANE)
+            .bg(theme::pane())
             .border_t_1()
-            .border_color(theme::DIVIDER)
+            .border_color(theme::divider())
             .child(
                 cell("problems-badge")
                     .cursor_pointer()
-                    .when(self.problems_open, |this| this.bg(theme::PRESSED))
-                    .hover(|style| style.bg(theme::HOVER))
+                    .when(self.problems_open, |this| this.bg(theme::pressed()))
+                    .hover(|style| style.bg(theme::hover()))
                     .map(|this| match (errors, warnings) {
                         (0, 0) => this
-                            .child(div().text_color(theme::SUCCESS).child("✓"))
+                            .child(div().text_color(theme::success()).child("✓"))
                             .child("No problems"),
                         (errors, warnings) => this
                             .when(errors > 0, |this| {
@@ -4127,7 +4201,7 @@ impl Editor {
                                     div()
                                         .flex()
                                         .gap_1()
-                                        .text_color(theme::DANGER)
+                                        .text_color(theme::danger())
                                         .child("✕")
                                         .child(errors.to_string()),
                                 )
@@ -4137,7 +4211,7 @@ impl Editor {
                                     div()
                                         .flex()
                                         .gap_1()
-                                        .text_color(theme::WARNING)
+                                        .text_color(theme::warning())
                                         .child("▲")
                                         .child(warnings.to_string()),
                                 )
@@ -4150,13 +4224,13 @@ impl Editor {
             .child(
                 cell("flow-cell")
                     .child("Flow")
-                    .child(div().text_color(theme::TEXT_MUTED).child(flow)),
+                    .child(div().text_color(theme::text_muted()).child(flow)),
             )
             // A click resets to 100%, which is the thing you want a zoom readout for.
             .child(
                 cell("zoom-cell")
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                    .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
                     .child(format!("{}%", (self.view.zoom * 100.0).round()))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_zoom_reset(&ZoomReset, window, cx)
@@ -4169,21 +4243,21 @@ impl Editor {
                     .px_2()
                     .one_line()
                     .text_size(px(theme::SMALL))
-                    .text_color(theme::TEXT_MUTED)
+                    .text_color(theme::text_muted())
                     .children(self.status.clone()),
             )
             .child(
                 cell("file-cell")
                     .child(self.file_name())
                     .when(self.doc.is_dirty(), |this| {
-                        this.child(div().text_color(theme::WARNING).child("●"))
+                        this.child(div().text_color(theme::warning()).child("●"))
                     }),
             )
             .child(
                 cell("help-button")
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
-                    .when(self.help_open, |this| this.bg(theme::PRESSED))
+                    .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                    .when(self.help_open, |this| this.bg(theme::pressed()))
                     .child("?")
                     .on_click(
                         cx.listener(|this, _, window, cx| this.on_show_help(&ShowHelp, window, cx)),
@@ -4212,9 +4286,9 @@ impl Editor {
                 .occlude()
                 .flex()
                 .flex_col()
-                .bg(theme::RAISED)
+                .bg(theme::raised())
                 .border_1()
-                .border_color(theme::OUTLINE)
+                .border_color(theme::outline())
                 .rounded_md()
                 .shadow_lg()
                 .on_mouse_down(
@@ -4230,7 +4304,7 @@ impl Editor {
                         .px_3()
                         .py_2()
                         .border_b_1()
-                        .border_color(theme::DIVIDER)
+                        .border_color(theme::divider())
                         .child(div().type_label().child("Problems"))
                         .child(div().type_hint().child(format!("{}", problems.len()))),
                 )
@@ -4250,7 +4324,7 @@ impl Editor {
                                     .flex()
                                     .gap_2()
                                     .type_hint()
-                                    .child(div().text_color(theme::SUCCESS).child("✓"))
+                                    .child(div().text_color(theme::success()).child("✓"))
                                     .child("Nothing to fix."),
                             )
                         })
@@ -4265,9 +4339,9 @@ impl Editor {
                                     // screen. An error's text stays a tier brighter, since it is
                                     // the one that means the document is broken.
                                     let (glyph, color, text) = match problem.severity() {
-                                        Severity::Error => ("✕", theme::DANGER, theme::TEXT),
+                                        Severity::Error => ("✕", theme::danger(), theme::text()),
                                         Severity::Warning => {
-                                            ("▲", theme::WARNING, theme::TEXT_MUTED)
+                                            ("▲", theme::warning(), theme::text_muted())
                                         }
                                     };
                                     let (node, edge) = (problem.node(), problem.edge());
@@ -4300,7 +4374,7 @@ impl Editor {
                                         )
                                         .when(node.is_some() || edge.is_some(), |this| {
                                             this.cursor_pointer()
-                                                .hover(|style| style.bg(theme::HOVER))
+                                                .hover(|style| style.bg(theme::hover()))
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
                                                         // An edge problem selects its edge, since a
@@ -4372,9 +4446,9 @@ impl Editor {
                         .flex_col()
                         .gap_2()
                         .p_2()
-                        .bg(theme::RAISED)
+                        .bg(theme::raised())
                         .border_1()
-                        .border_color(theme::OUTLINE)
+                        .border_color(theme::outline())
                         .rounded_md()
                         .shadow_lg()
                         .on_mouse_down(
@@ -4417,7 +4491,7 @@ impl Editor {
                                             // A hover colour as well showed two rows lit
                                             // whenever the pointer rested over the list
                                             // while the arrow keys moved the selection.
-                                            .when(row == selected, |this| this.bg(theme::PRESSED))
+                                            .when(row == selected, |this| this.bg(theme::pressed()))
                                             .on_mouse_move(cx.listener(move |this, _, _, cx| {
                                                 if this.palette_sel != row {
                                                     this.palette_sel = row;
@@ -4438,7 +4512,7 @@ impl Editor {
                                                     .flex_1()
                                                     .min_w(px(0.0))
                                                     .one_line()
-                                                    .text_color(theme::TEXT)
+                                                    .text_color(theme::text())
                                                     .child(label.trim_end_matches('…')),
                                             )
                                             .when(!keys.is_empty(), |this| {
@@ -4447,9 +4521,9 @@ impl Editor {
                                                         .flex_none()
                                                         .px_1()
                                                         .rounded_sm()
-                                                        .bg(theme::CANVAS)
+                                                        .bg(theme::canvas())
                                                         .type_hint()
-                                                        .text_color(theme::TEXT)
+                                                        .text_color(theme::text())
                                                         .child(keys),
                                                 )
                                             })
@@ -4495,7 +4569,7 @@ impl Editor {
                             div()
                                 .min_w(px(0.0))
                                 .one_line()
-                                .text_color(theme::TEXT_MUTED)
+                                .text_color(theme::text_muted())
                                 .child(what),
                         )
                         .child(
@@ -4503,9 +4577,9 @@ impl Editor {
                                 .flex_none()
                                 .px_1()
                                 .rounded_sm()
-                                .bg(theme::CANVAS)
+                                .bg(theme::canvas())
                                 .type_hint()
-                                .text_color(theme::TEXT)
+                                .text_color(theme::text())
                                 .child(keys),
                         )
                 }))
@@ -4521,7 +4595,7 @@ impl Editor {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme::SCRIM)
+                .bg(theme::scrim())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -4540,9 +4614,9 @@ impl Editor {
                         .max_h(px(640.0))
                         .overflow_y_scroll()
                         .p_5()
-                        .bg(theme::RAISED)
+                        .bg(theme::raised())
                         .border_1()
-                        .border_color(theme::OUTLINE)
+                        .border_color(theme::outline())
                         .rounded_lg()
                         .shadow_lg()
                         .on_mouse_down(
@@ -4621,9 +4695,17 @@ impl Editor {
                     .rounded_md()
                     .cursor_pointer()
                     .text_size(px(theme::SMALL))
-                    .bg(if on { theme::PRESSED } else { theme::RAISED })
-                    .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
-                    .hover(|style| style.text_color(theme::TEXT))
+                    .bg(if on {
+                        theme::pressed()
+                    } else {
+                        theme::raised()
+                    })
+                    .text_color(if on {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .hover(|style| style.text_color(theme::text()))
                     // The glyph keeps its kind's colour whether or not the chip is on, so the
                     // picker doubles as the key to what the canvas draws.
                     .child(div().text_color(color).child(glyph))
@@ -4695,10 +4777,10 @@ impl Editor {
                         // A flag is a checkbox; a number has no box to tick, so it shows the
                         // operator there instead and the value beside the name.
                         let (glyph, color) = match current {
-                            None => ("—", theme::TEXT_FAINT),
-                            Some((Value::Bool(true), _)) => ("☑", theme::TRUE),
-                            Some((Value::Bool(false), _)) => ("☐", theme::FALSE),
-                            Some((Value::Int(_), op)) => (op, theme::ACCENT),
+                            None => ("—", theme::text_faint()),
+                            Some((Value::Bool(true), _)) => ("☑", theme::true_pin()),
+                            Some((Value::Bool(false), _)) => ("☐", theme::false_pin()),
+                            Some((Value::Int(_), op)) => (op, theme::accent()),
                         };
                         let number = match current {
                             Some((Value::Int(n), _)) => Some(n),
@@ -4724,7 +4806,7 @@ impl Editor {
                                     .one_line()
                                     .cursor_pointer()
                                     .text_color(color)
-                                    .hover(|style| style.bg(theme::HOVER))
+                                    .hover(|style| style.bg(theme::hover()))
                                     .child(glyph)
                                     .child(variable.name.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -4807,8 +4889,12 @@ impl Editor {
             .flex()
             .gap_2()
             .cursor_pointer()
-            .text_color(if on { theme::TRUE } else { theme::FALSE })
-            .hover(|style| style.text_color(theme::TEXT))
+            .text_color(if on {
+                theme::true_pin()
+            } else {
+                theme::false_pin()
+            })
+            .hover(|style| style.text_color(theme::text()))
             .child(if on {
                 "☑ true branch"
             } else {
@@ -4834,8 +4920,12 @@ impl Editor {
             .flex()
             .gap_2()
             .cursor_pointer()
-            .text_color(if on { theme::TEXT } else { theme::TEXT_MUTED })
-            .hover(|style| style.text_color(theme::TEXT))
+            .text_color(if on {
+                theme::text()
+            } else {
+                theme::text_muted()
+            })
+            .hover(|style| style.text_color(theme::text()))
             .child(if on { "☑ once only" } else { "☐ once only" })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.doc.edges.get(index).is_none() {
@@ -4856,8 +4946,12 @@ impl Editor {
             .flex()
             .gap_2()
             .cursor_pointer()
-            .text_color(if on { theme::ENDING } else { theme::TEXT_MUTED })
-            .hover(|style| style.text_color(theme::TEXT))
+            .text_color(if on {
+                theme::ending()
+            } else {
+                theme::text_muted()
+            })
+            .hover(|style| style.text_color(theme::text()))
             .child(if on { "☑" } else { "☐" })
             .child("Ending")
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -4885,10 +4979,10 @@ impl Editor {
             .flex_none()
             .w(px(SIDEBAR_W))
             .h_full()
-            .bg(theme::PANE)
+            .bg(theme::pane())
             .border_l_1()
-            .border_color(theme::DIVIDER)
-            .text_color(theme::TEXT)
+            .border_color(theme::divider())
+            .text_color(theme::text())
             .child(
                 div()
                     .id("inspector")
@@ -5000,7 +5094,7 @@ impl Editor {
                         div()
                             .pt_4()
                             .border_t_1()
-                            .border_color(theme::DIVIDER)
+                            .border_color(theme::divider())
                             .child(list)
                     }))
                     .into_any_element()
@@ -5011,7 +5105,7 @@ impl Editor {
                 .gap_4()
                 .child(inspector_header(
                     "#",
-                    theme::ACCENT,
+                    theme::accent(),
                     "Selection",
                     format!("{} nodes", ids.len()),
                 ))
@@ -5041,7 +5135,7 @@ impl Editor {
                     .gap_4()
                     .child(inspector_header(
                         "→",
-                        theme::EDGE,
+                        theme::edge(),
                         if from_condition { "Branch" } else { "Choice" },
                         ends,
                     ))
@@ -5076,7 +5170,11 @@ impl Editor {
                         .flex()
                         .flex_row()
                         .justify_between()
-                        .child(div().text_color(theme::TEXT_MUTED).child(label.to_string()))
+                        .child(
+                            div()
+                                .text_color(theme::text_muted())
+                                .child(label.to_string()),
+                        )
                         .child(div().text_color(color).child(value))
                 };
                 let errors = problems
@@ -5084,9 +5182,9 @@ impl Editor {
                     .filter(|p| p.severity() == Severity::Error)
                     .count();
                 let (problem_text, problem_color) = match (problems.len(), errors) {
-                    (0, _) => ("None".to_string(), theme::SUCCESS),
-                    (n, 0) => (n.to_string(), theme::WARNING),
-                    (n, _) => (n.to_string(), theme::DANGER),
+                    (0, _) => ("None".to_string(), theme::success()),
+                    (n, 0) => (n.to_string(), theme::warning()),
+                    (n, _) => (n.to_string(), theme::danger()),
                 };
                 div()
                     .flex()
@@ -5094,7 +5192,7 @@ impl Editor {
                     .gap_4()
                     .child(inspector_header(
                         "≡",
-                        theme::TEXT_MUTED,
+                        theme::text_muted(),
                         "Document",
                         self.file_name(),
                     ))
@@ -5104,27 +5202,31 @@ impl Editor {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(stat("Nodes", self.doc.nodes.len().to_string(), theme::TEXT))
+                            .child(stat(
+                                "Nodes",
+                                self.doc.nodes.len().to_string(),
+                                theme::text(),
+                            ))
                             .child(stat(
                                 "Conversations",
                                 self.doc.roots().len().to_string(),
-                                theme::TEXT,
+                                theme::text(),
                             ))
                             .child(stat(
                                 "Variables",
                                 self.doc.variables.len().to_string(),
-                                theme::TEXT,
+                                theme::text(),
                             ))
                             .child(stat(
                                 "Cast",
                                 self.doc.characters.len().to_string(),
-                                theme::TEXT,
+                                theme::text(),
                             ))
                             // The main flow is always there and never listed.
                             .child(stat(
                                 "Flows",
                                 (self.doc.all_flows().len() + 1).to_string(),
-                                theme::TEXT,
+                                theme::text(),
                             ))
                             .child(stat("Problems", problem_text, problem_color)),
                     ))
@@ -5159,7 +5261,7 @@ fn section(title: &str, body: impl IntoElement) -> impl IntoElement {
         .gap_2()
         .pt_4()
         .border_t_1()
-        .border_color(theme::DIVIDER)
+        .border_color(theme::divider())
         .child(div().type_section().child(title.to_uppercase()))
         .child(body)
 }
@@ -5185,7 +5287,7 @@ fn inspector_header(
                 .justify_center()
                 .size_8()
                 .rounded_md()
-                .bg(theme::RAISED)
+                .bg(theme::raised())
                 .text_size(px(theme::TITLE))
                 .text_color(color)
                 .child(glyph),
@@ -5209,9 +5311,9 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
             .left(px(0.))
             .w(px(220.))
             .py_1()
-            .bg(theme::RAISED)
+            .bg(theme::raised())
             .border_1()
-            .border_color(theme::OUTLINE)
+            .border_color(theme::outline())
             .rounded_md()
             .shadow_md()
             // The panel overlaps the canvas, whose mouse-down handler would otherwise
@@ -5230,7 +5332,7 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
                     .gap_4()
                     .px_2()
                     .py_1()
-                    .hover(|style| style.bg(theme::PRESSED))
+                    .hover(|style| style.bg(theme::pressed()))
                     .child(*label)
                     .child(div().type_hint().child(*shortcut))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -5382,9 +5484,9 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
         .top(px(y - r))
         .size(px(r * 2.0))
         .rounded_full()
-        .bg(theme::PRESSED)
+        .bg(theme::pressed())
         .border_2()
-        .border_color(theme::EDGE)
+        .border_color(theme::edge())
 }
 
 /// The bar down a node's left edge in its kind's colour, so a graph reads by structure —
@@ -5422,9 +5524,9 @@ fn root_dot(node: &Node, view: View) -> impl IntoElement {
         .top(px(y - r))
         .size(px(r * 2.0))
         .rounded_full()
-        .bg(theme::CANVAS)
+        .bg(theme::canvas())
         .border_2()
-        .border_color(theme::EDGE)
+        .border_color(theme::edge())
 }
 
 /// The colour every line a character speaks is tinted, or `fallback` when nobody declared
@@ -5432,9 +5534,9 @@ fn root_dot(node: &Node, view: View) -> impl IntoElement {
 /// places a speaker is drawn share this, and nothing else is tinted: colour on a border or an
 /// edge would make the selection and play highlights ambiguous.
 fn speaker_color(doc: &Doc, speaker: &str, fallback: u32) -> Rgba {
-    rgb(doc
+    theme::ink(rgb(doc
         .character(speaker.trim())
-        .map_or(fallback, |character| character.color))
+        .map_or(fallback, |character| character.color)))
 }
 
 /// What hovering a jump shows of where it lands: who speaks there, the first line of what
@@ -5480,9 +5582,9 @@ impl Render for JumpPreview {
             .flex_col()
             .gap_1()
             .p_2()
-            .bg(theme::RAISED)
+            .bg(theme::raised())
             .border_1()
-            .border_color(theme::KIND_JUMP)
+            .border_color(theme::kind_jump())
             .rounded_md()
             .shadow_md()
             .text_sm()
@@ -5491,11 +5593,15 @@ impl Render for JumpPreview {
             })
             .child(
                 div()
-                    .text_color(theme::TEXT)
+                    .text_color(theme::text())
                     .line_clamp(3)
                     .child(self.line.clone()),
             )
-            .child(div().text_color(theme::TEXT_FAINT).child(self.flow.clone()))
+            .child(
+                div()
+                    .text_color(theme::text_faint())
+                    .child(self.flow.clone()),
+            )
     }
 }
 
@@ -5549,16 +5655,16 @@ fn node_box(
         // reads chrome-heavy at 0.25x and thin at 3x. Scale them too if that starts to grate.
         .gap_1()
         .p_2()
-        .bg(theme::RAISED)
+        .bg(theme::raised())
         .border_1()
         // Where the play-through is standing outranks where it has been, which outranks an
         // ending; the selection outranks all three.
         .border_color(match (selected, playing, passed, node.is_ending()) {
-            (true, ..) => theme::ACCENT,
-            (false, true, ..) => theme::PLAYING,
-            (false, false, true, _) => theme::TRAIL,
-            (false, false, false, true) => theme::ENDING,
-            (false, false, false, false) => theme::OUTLINE,
+            (true, ..) => theme::accent(),
+            (false, true, ..) => theme::playing(),
+            (false, false, true, _) => theme::trail(),
+            (false, false, false, true) => theme::ending(),
+            (false, false, false, false) => theme::outline(),
         })
         .rounded_md()
         .shadow_md()
@@ -5576,7 +5682,7 @@ fn node_box(
                 .child(
                     div()
                         .w_full()
-                        .text_color(theme::TEXT)
+                        .text_color(theme::text())
                         .text_ellipsis()
                         .line_clamp(3)
                         .child(node.text.clone()),
@@ -5585,7 +5691,7 @@ fn node_box(
             // line — an unnamed hub in a graph of hubs is not worth much.
             NodeKind::Hub => this.justify_center().items_center().child(
                 div()
-                    .text_color(theme::KIND_HUB)
+                    .text_color(theme::kind_hub())
                     .one_line()
                     .child(match node.text.trim() {
                         "" => "◇".to_string(),
@@ -5595,7 +5701,7 @@ fn node_box(
             NodeKind::Jump => this.justify_center().child(
                 div()
                     .w_full()
-                    .text_color(theme::KIND_JUMP)
+                    .text_color(theme::kind_jump())
                     .one_line()
                     .child(match jump_target {
                         Some(target) => format!("↪ {target}"),
@@ -5606,9 +5712,9 @@ fn node_box(
             // a node: `⚙ paid = true` is legible without opening anything.
             NodeKind::Instruction => this.justify_center().child(glyph_row(
                 kind_style(NodeKind::Instruction).0,
-                theme::KIND_INSTRUCTION,
+                theme::kind_instruction(),
                 div()
-                    .text_color(theme::TEXT)
+                    .text_color(theme::text())
                     .text_ellipsis()
                     .line_clamp(3)
                     .child(match node.effects.as_slice() {
@@ -5626,9 +5732,9 @@ fn node_box(
             // it; the inspector edits them with the same picker an instruction uses.
             NodeKind::Condition => this.justify_center().child(glyph_row(
                 kind_style(NodeKind::Condition).0,
-                theme::KIND_CONDITION,
+                theme::kind_condition(),
                 div()
-                    .text_color(theme::TEXT)
+                    .text_color(theme::text())
                     .text_ellipsis()
                     .line_clamp(3)
                     .child(match node.conditions.as_slice() {
@@ -5645,14 +5751,14 @@ fn node_box(
             // kind — hit-testing is arithmetic over `NODE_W`/`NODE_H`.
             NodeKind::Note => this.child(glyph_row(
                 kind_style(NodeKind::Note).0,
-                theme::KIND_NOTE,
+                theme::kind_note(),
                 div()
                     // Its own face, not just its own colour: the bundled UI font has no
                     // italic, so `.italic()` alone renders identically to a line of
                     // dialogue. A serif is the one thing on the canvas that is not.
                     .font_family(theme::NOTE_FONT)
                     .italic()
-                    .text_color(theme::TEXT_MUTED)
+                    .text_color(theme::text_muted())
                     .text_ellipsis()
                     .line_clamp(4)
                     .child(node.text.clone()),
@@ -5675,9 +5781,9 @@ fn node_box(
                     .top(px(2.0))
                     .px_1()
                     .rounded_sm()
-                    .bg(theme::RAISED)
+                    .bg(theme::raised())
                     .text_size(px(view.scale(theme::TINY)))
-                    .text_color(theme::TEXT_FAINT)
+                    .text_color(theme::text_faint())
                     .child(format!("#{first}{more}")),
             )
         })
@@ -5714,12 +5820,12 @@ fn glyph_row(glyph: &'static str, color: Rgba, content: impl IntoElement) -> imp
 /// mark was the obvious choice and was unreadable at chip size: it rendered as a speck.
 fn kind_style(kind: NodeKind) -> (&'static str, &'static str, Rgba) {
     match kind {
-        NodeKind::Speech => ("¶", "Speech", theme::KIND_SPEECH),
-        NodeKind::Hub => ("◇", "Hub", theme::KIND_HUB),
-        NodeKind::Jump => ("↪", "Jump", theme::KIND_JUMP),
-        NodeKind::Instruction => ("⚙", "Instruction", theme::KIND_INSTRUCTION),
-        NodeKind::Condition => ("?", "Condition", theme::KIND_CONDITION),
-        NodeKind::Note => ("▤", "Note", theme::KIND_NOTE),
+        NodeKind::Speech => ("¶", "Speech", theme::kind_speech()),
+        NodeKind::Hub => ("◇", "Hub", theme::kind_hub()),
+        NodeKind::Jump => ("↪", "Jump", theme::kind_jump()),
+        NodeKind::Instruction => ("⚙", "Instruction", theme::kind_instruction()),
+        NodeKind::Condition => ("?", "Condition", theme::kind_condition()),
+        NodeKind::Note => ("▤", "Note", theme::kind_note()),
     }
 }
 
@@ -5807,6 +5913,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-m", ToggleProblems, Some("Editor")),
             KeyBinding::new("f1", ShowHelp, Some("Editor")),
             KeyBinding::new("ctrl-k", ShowPalette, Some("Editor")),
+            KeyBinding::new("ctrl-shift-t", CycleTheme, Some("Editor")),
             // `"Palette"` is set on the palette's card, an ancestor of its field, so these
             // mean something only while it is open — and a text field binds none of them.
             KeyBinding::new("down", PaletteNext, Some("Palette")),
