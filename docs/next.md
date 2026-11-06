@@ -20,6 +20,7 @@ on screen, not by whether the tests pass.
 | Command palette | Ctrl+K over `MENUS`; modal; one highlight | `06-palette/` |
 | Play trail | Walked edges heavier, passed nodes outlined, spent choices dimmed | `07-trail/` |
 | Merge | The flow map, tags, filters, references and screenplay export from `origin/main`, in the tokenised layout; a sample that shows them | `08-merge/`, `09-sample/` |
+| Paper | Dark and light themes (live tokens, contrast-tested), Paper's shape language, elbow wires on one route function, two font settings with every face bundled, a Preferences card | `10-light/`, `11-paper/`, `12-wires/`, `13-fonts/` |
 
 ## Before any new feature
 
@@ -29,10 +30,8 @@ These matter more than a sixth feature, because they decide whether a stranger s
    pass. Write it as a story (the problem, what I changed, how I checked it), not a feature list.
    The screenshots script is itself part of the story: same states every run, so two runs
    either side of a change are an honest pair.
-2. **Bundle Inter.** `theme::UI_FONT` is named but not shipped, so anywhere it is missing gpui
-   falls back to a system face and the weights the hierarchy leans on disappear. Embed it with
-   `text_system().add_fonts` (see the `ponytail:` note by `UI_FONT`). `Noto Serif` for notes has
-   the same exposure.
+2. ~~**Bundle Inter.**~~ Done with the Paper pass: every face the Preferences card offers is embedded, and
+   `Noto Serif` for notes is now bundled Newsreader italic.
 3. **A short screen recording and a release binary.** Nobody builds a GPUI app from a link.
    A 20-second capture of authoring a branch and playing it is the hero asset.
 4. **Two known rough edges.**

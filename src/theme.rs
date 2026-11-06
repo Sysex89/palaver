@@ -34,6 +34,7 @@
 //! document never learns which theme drew it.
 
 use gpui::{FontWeight, Hsla, Rgba, Styled, px};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `rgb()` is not a `const fn` in gpui 0.2.2, and palettes want to be constants.
@@ -383,14 +384,35 @@ pub fn contrast(a: Rgba, b: Rgba) -> f32 {
 
 // ── Type ────────────────────────────────────────────────────────────────────────────────
 
-/// Set once at the root and inherited. Named rather than left to `.SystemUIFont`, which
+/// The faces in use, set by the Preferences card. Named, never left to `.SystemUIFont`, which
 /// on Linux asks for IBM Plex Sans and falls back to whatever fontconfig has — so a weight
-/// could render as a different face on every machine.
-// ponytail: not bundled. Where Inter is missing gpui falls back to the system face, which
-// is readable but loses the weights. Embed it with `text_system().add_fonts` if that bites.
-pub const UI_FONT: &str = "Inter";
-/// A note's face: the bundled UI font has no italic, and a note must not read as speech.
-pub const NOTE_FONT: &str = "Noto Serif";
+/// could render as a different face on every machine. All of them are bundled (see
+/// `assets/fonts`), so a choice looks the same on a machine that has none of them installed.
+static FONTS: Mutex<(&str, Option<&str>)> = Mutex::new(("Inter", None));
+
+/// Chooses the UI face and the text face (`None` for "same as the UI"). Cheap and idempotent,
+/// so the view may call it every frame, as it does `set_mode`.
+pub fn set_fonts(ui: &'static str, text: Option<&'static str>) {
+    if let Ok(mut fonts) = FONTS.lock() {
+        *fonts = (ui, text);
+    }
+}
+
+/// The face of the chrome: menus, labels, the inspector, identifiers. Set once at the root
+/// and inherited.
+pub fn ui_font() -> &'static str {
+    FONTS.lock().map_or("Inter", |f| f.0)
+}
+
+/// The face of what a character says: dialogue, speaker names, the choices a player picks.
+/// The UI face unless the author chose another, so identifiers never take it.
+pub fn text_font() -> &'static str {
+    FONTS.lock().map_or("Inter", |f| f.1.unwrap_or(f.0))
+}
+
+/// A note's face: bundled, and italic, because the UI font has no italic face and a note must
+/// not read as something a character says.
+pub const NOTE_FONT: &str = "Newsreader 16pt";
 
 /// Section labels, which are deliberately the smallest thing on screen: they name a group,
 /// they are not content, and weight plus capitals carry them at this size.

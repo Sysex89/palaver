@@ -1,6 +1,7 @@
 #[cfg(all(feature = "automation", unix))]
 mod automation;
 mod doc;
+mod settings;
 mod text_input;
 mod theme;
 
@@ -17,6 +18,7 @@ use gpui::{
     SharedString, Window, WindowAppearance, WindowBounds, WindowHandle, WindowOptions, actions,
     canvas, deferred, div, point, prelude::*, px, rgb, size,
 };
+use settings::{Settings, TextFont, ThemePref, UiFont};
 use std::path::PathBuf;
 use std::time::Duration;
 use text_input::TextInput;
@@ -54,6 +56,7 @@ actions!(
         FitView,
         ShowPalette,
         CycleTheme,
+        ShowPrefs,
         PaletteNext,
         PalettePrev,
         PaletteRun
@@ -236,6 +239,9 @@ const MENUS: &[MenuSpec] = &[
             (PALETTE_LABEL, "Ctrl+K", |e, w, cx| {
                 e.on_show_palette(&ShowPalette, w, cx)
             }),
+            ("Preferences…", "Ctrl+,", |e, w, cx| {
+                e.on_show_prefs(&ShowPrefs, w, cx)
+            }),
             ("Cycle theme", "Ctrl+Shift+T", |e, w, cx| {
                 e.on_cycle_theme(&CycleTheme, w, cx)
             }),
@@ -270,28 +276,49 @@ fn document_name(path: Option<&std::path::Path>) -> String {
     }
 }
 
-/// Which palette the author wants. `System` follows the window's appearance, so the editor
-/// matches the desktop and changes with it; the other two override it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThemePref {
-    System,
-    Dark,
-    Light,
+/// What one row of the Preferences card needs: its words, its options, which is chosen, how
+/// to show an option, and how to apply one. A struct so the three rows read as data.
+struct PrefRow<T: 'static> {
+    id: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    options: &'static [T],
+    current: T,
+    /// An option's label, and the typeface to draw it in, if it is one.
+    describe: fn(T) -> (&'static str, Option<&'static str>),
+    set: fn(&mut Editor, T, &mut Context<Editor>),
 }
 
-impl ThemePref {
-    /// The palette to draw with, given what the window reports.
-    fn resolve(self, appearance: WindowAppearance) -> theme::Mode {
-        match self {
-            ThemePref::Dark => theme::Mode::Dark,
-            ThemePref::Light => theme::Mode::Light,
-            ThemePref::System => match appearance {
-                WindowAppearance::Dark | WindowAppearance::VibrantDark => theme::Mode::Dark,
-                WindowAppearance::Light | WindowAppearance::VibrantLight => theme::Mode::Light,
-            },
-        }
+/// The palette to draw with: what the author asked for, or what the window reports.
+fn resolve_theme(pref: ThemePref, appearance: WindowAppearance) -> theme::Mode {
+    match pref {
+        ThemePref::Dark => theme::Mode::Dark,
+        ThemePref::Light => theme::Mode::Light,
+        ThemePref::System => match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => theme::Mode::Dark,
+            WindowAppearance::Light | WindowAppearance::VibrantLight => theme::Mode::Light,
+        },
     }
 }
+
+/// Every face the Preferences card can choose, embedded so a choice looks the same on a
+/// machine with none of them installed. Weights are the two the chrome uses, regular and
+/// semibold, plus the italic a note needs. Each family is OFL; the licences sit beside the
+/// files in `assets/fonts`.
+const FONT_FILES: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Geist-Regular.ttf"),
+    include_bytes!("../assets/fonts/Geist-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Newsreader16pt-Regular.ttf"),
+    include_bytes!("../assets/fonts/Newsreader16pt-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Newsreader16pt-Italic.ttf"),
+    include_bytes!("../assets/fonts/CourierPrime-Regular.ttf"),
+    include_bytes!("../assets/fonts/CourierPrime-Bold.ttf"),
+    include_bytes!("../assets/fonts/CourierPrime-Italic.ttf"),
+];
 
 struct Editor {
     doc: Doc,
@@ -352,8 +379,12 @@ struct Editor {
     /// The command palette is open. Its query lives in `palette_input`, which like
     /// `search_input` is not document content and stays out of the `sync_fields` loop.
     palette_open: bool,
-    /// Which palette is wanted; resolved against the window's appearance every frame.
-    theme_pref: ThemePref,
+    /// Theme and typefaces, as the Preferences card sets them and `settings.json` keeps them.
+    settings: Settings,
+    /// Whether a change is written to the settings file. Off under automation, so a script
+    /// can set any preference without touching the real one.
+    persist_settings: bool,
+    prefs_open: bool,
     palette_input: Entity<TextInput>,
     /// Which row Enter would run. Reset to the top whenever the query changes, so the best
     /// match is always the one under the cursor.
@@ -587,7 +618,9 @@ impl Editor {
             problems_open: false,
             help_open: false,
             palette_open: false,
-            theme_pref: ThemePref::System,
+            settings: Settings::load(),
+            persist_settings: true,
+            prefs_open: false,
             palette_input,
             palette_sel: 0,
             palette_seen: String::new(),
@@ -1410,6 +1443,7 @@ impl Editor {
     /// handle exists before the element does, the way `insert_node` focuses the speaker field.
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         self.close_palette(cx);
+        self.prefs_open = false;
         self.searching = true;
         window.focus(&self.search_input.read(cx).focus_handle(cx));
         cx.notify();
@@ -1417,12 +1451,14 @@ impl Editor {
 
     fn on_toggle_problems(&mut self, _: &ToggleProblems, _: &mut Window, cx: &mut Context<Self>) {
         self.close_palette(cx);
+        self.prefs_open = false;
         self.problems_open = !self.problems_open;
         cx.notify();
     }
 
     fn on_show_help(&mut self, _: &ShowHelp, _: &mut Window, cx: &mut Context<Self>) {
         self.close_palette(cx);
+        self.prefs_open = false;
         self.help_open = !self.help_open;
         cx.notify();
     }
@@ -1433,13 +1469,22 @@ impl Editor {
     /// System → Dark → Light → System. A command and not a toggle, because there are three
     /// answers; the Preferences card sets one directly.
     fn on_cycle_theme(&mut self, _: &CycleTheme, _: &mut Window, cx: &mut Context<Self>) {
-        let (next, name) = match self.theme_pref {
+        let (next, name) = match self.settings.theme {
             ThemePref::System => (ThemePref::Dark, "Theme: dark"),
             ThemePref::Dark => (ThemePref::Light, "Theme: light"),
             ThemePref::Light => (ThemePref::System, "Theme: follows the system"),
         };
         self.set_theme(next, cx);
         self.set_status(name.to_string(), cx);
+    }
+
+    /// Ctrl+,. Modal, like the palette: it closes whatever else is up, and the other overlay
+    /// handlers close it in turn, so two never stack.
+    fn on_show_prefs(&mut self, _: &ShowPrefs, _: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.prefs_open;
+        self.dismiss_overlays(cx);
+        self.prefs_open = !was_open;
+        cx.notify();
     }
 
     fn on_show_palette(&mut self, _: &ShowPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -1510,7 +1555,11 @@ impl Editor {
     /// something to close, which is how Escape knows it has already done its job. The query
     /// is cleared with the overlay, so find always opens on a clean slate.
     fn dismiss_overlays(&mut self, cx: &mut Context<Self>) -> bool {
-        let any = self.searching || self.problems_open || self.help_open || self.palette_open;
+        let any = self.searching
+            || self.problems_open
+            || self.help_open
+            || self.palette_open
+            || self.prefs_open;
         if self.searching {
             self.search_input
                 .update(cx, |input, cx| input.set_content("", cx));
@@ -1519,6 +1568,7 @@ impl Editor {
         self.searching = false;
         self.problems_open = false;
         self.help_open = false;
+        self.prefs_open = false;
         if any {
             cx.notify();
         }
@@ -1901,10 +1951,34 @@ impl Editor {
 
     /// Switches the left pane's tab. A rename aimed at the list you just left would rename
     /// the wrong thing, so switching tabs puts the shared field back to declaring.
+    /// Writes the preferences, unless this is an automated run. A failure is a status
+    /// message and not an error: the choice still applies for the session.
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.persist_settings {
+            return;
+        }
+        if let Err(why) = self.settings.save() {
+            self.set_status(format!("Could not save preferences: {why}"), cx);
+        }
+    }
+
+    fn set_ui_font(&mut self, font: UiFont, cx: &mut Context<Self>) {
+        self.settings.ui_font = font;
+        self.save_settings(cx);
+        cx.notify();
+    }
+
+    fn set_text_font(&mut self, font: TextFont, cx: &mut Context<Self>) {
+        self.settings.text_font = font;
+        self.save_settings(cx);
+        cx.notify();
+    }
+
     /// Chooses the palette: light, dark, or whatever the desktop is. The one place the
     /// preference changes, so the Preferences card and the automation reach it the same way.
     fn set_theme(&mut self, pref: ThemePref, cx: &mut Context<Self>) {
-        self.theme_pref = pref;
+        self.settings.theme = pref;
+        self.save_settings(cx);
         cx.notify();
     }
 
@@ -1941,7 +2015,11 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // First, before anything below reads a token: the whole frame is drawn in one palette.
-        theme::set_mode(self.theme_pref.resolve(window.appearance()));
+        theme::set_mode(resolve_theme(self.settings.theme, window.appearance()));
+        theme::set_fonts(
+            self.settings.ui_font.family(),
+            self.settings.text_font.family(),
+        );
         let title = format!(
             "palaver — {}{}{}",
             self.file_name(),
@@ -2003,6 +2081,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_show_help))
             .on_action(cx.listener(Self::on_show_palette))
             .on_action(cx.listener(Self::on_cycle_theme))
+            .on_action(cx.listener(Self::on_show_prefs))
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_run))
@@ -2030,7 +2109,7 @@ impl Render for Editor {
             .flex()
             .flex_col()
             .size_full()
-            .font_family(theme::UI_FONT)
+            .font_family(theme::ui_font())
             .text_size(px(theme::BODY))
             .child(self.menu_bar(cx))
             .child(
@@ -2050,6 +2129,7 @@ impl Render for Editor {
                 this.child(self.search_overlay(canvas_w, cx))
             })
             .when(self.help_open, |this| this.child(self.help_overlay(cx)))
+            .when(self.prefs_open, |this| this.child(self.prefs_overlay(cx)))
             .when(self.palette_open, |this| {
                 this.child(self.palette_overlay(cx))
             })
@@ -2274,7 +2354,8 @@ impl Editor {
                         || self.doc.is_once(edge))
             })
             .filter_map(|edge| {
-                let (text, color) = if self.doc.is_condition(edge.from) {
+                let is_pin = self.doc.is_condition(edge.from);
+                let (text, color) = if is_pin {
                     match edge.branch {
                         true => ("true".to_string(), theme::true_pin()),
                         false => ("false".to_string(), theme::false_pin()),
@@ -2337,6 +2418,13 @@ impl Editor {
                                 .border_1()
                                 .border_color(theme::outline())
                                 .text_color(color)
+                                // A choice is what the player reads; `true`/`false` on a
+                                // condition is the editor's own word, so it stays in the UI face.
+                                .font_family(if is_pin {
+                                    theme::ui_font()
+                                } else {
+                                    theme::text_font()
+                                })
                                 .text_center()
                                 .text_ellipsis()
                                 .line_clamp(2)
@@ -4065,6 +4153,7 @@ impl Editor {
                 this.when(!speaker.is_empty(), |this| {
                     this.child(
                         div()
+                            .font_family(theme::text_font())
                             .text_color(speaker_color(&self.doc, speaker, theme::SPEAKER_DEFAULT))
                             .child(speaker.to_string()),
                     )
@@ -4075,7 +4164,9 @@ impl Editor {
                     this.child(if text.is_empty() {
                         div().type_hint().child("(no line written yet)")
                     } else {
-                        div().child(text.to_string())
+                        div()
+                            .font_family(theme::text_font())
+                            .child(text.to_string())
                     })
                 })
             })
@@ -4111,11 +4202,13 @@ impl Editor {
                         if self.doc.spent(path, current, to) {
                             return div()
                                 .px_1()
+                                .font_family(theme::text_font())
                                 .text_color(theme::text_disabled())
                                 .child(format!("→ {label} (already taken)"))
                                 .into_any_element();
                         }
                         row(("play-choice", i), format!("→ {label}"), theme::text())
+                            .font_family(theme::text_font())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.play_advance(to, window, cx)
                             }))
@@ -4685,6 +4778,176 @@ impl Editor {
         )
     }
 
+    /// One row of the Preferences card: a title and a pill per option, the chosen one tinted
+    /// in the accent. An option that is a typeface is drawn in it, so a choice is seen before
+    /// it is made. Generic over the option type so the three rows are one piece of code.
+    fn pref_row<T: Copy + PartialEq + 'static>(
+        row: PrefRow<T>,
+        cx: &mut Context<Self>,
+        // Owns everything it draws and borrows nothing back, so three rows can be built from
+        // one `cx` before any of them is mounted.
+    ) -> impl IntoElement + use<T> {
+        let PrefRow {
+            id,
+            title,
+            hint,
+            options,
+            current,
+            describe,
+            set,
+        } = row;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().type_section().child(title.to_uppercase()))
+            .child(div().flex().flex_row().flex_wrap().gap_2().children(
+                options.iter().enumerate().map(|(i, &option)| {
+                    let on = option == current;
+                    let (label, family) = describe(option);
+                    div()
+                        .id((id, i))
+                        .px_3()
+                        .py_1()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if on {
+                            theme::accent()
+                        } else {
+                            theme::outline()
+                        })
+                        .bg(if on {
+                            theme::accent_wash()
+                        } else {
+                            theme::canvas()
+                        })
+                        .text_color(theme::text())
+                        .cursor_pointer()
+                        .when_some(family, |this, family| this.font_family(family))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| set(this, option, cx)))
+                }),
+            ))
+            .child(div().type_hint().child(hint))
+    }
+
+    /// Ctrl+,: the theme and the two typefaces, as a modal card on the help sheet's pattern —
+    /// an occluding backdrop that closes it, and a card that stops its own clicks.
+    fn prefs_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme_row = Self::pref_row(
+            PrefRow {
+                id: "pref-theme",
+                title: "Theme",
+                hint: "System follows the desktop's light or dark.",
+                options: &ThemePref::ALL,
+                current: self.settings.theme,
+                describe: |t| (t.label(), None),
+                set: Editor::set_theme,
+            },
+            cx,
+        );
+        let ui_row = Self::pref_row(
+            PrefRow {
+                id: "pref-ui-font",
+                title: "UI font",
+                hint: "Menus, labels, the inspector, and names like variables and tags.",
+                options: &UiFont::ALL,
+                current: self.settings.ui_font,
+                describe: |f| (f.label(), Some(f.family())),
+                set: Editor::set_ui_font,
+            },
+            cx,
+        );
+        let text_row = Self::pref_row(
+            PrefRow {
+                id: "pref-text-font",
+                title: "Text font",
+                hint: "What a character says: dialogue, speaker names and the choices a player picks.",
+                options: &TextFont::ALL,
+                current: self.settings.text_font,
+                describe: |f| (f.label(), f.family()),
+                set: Editor::set_text_font,
+            },
+            cx,
+        );
+        // A line of dialogue as the canvas will draw it, so the Text font choice is judged on
+        // the thing it is for.
+        let preview = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::outline())
+            .bg(theme::canvas())
+            .font_family(theme::text_font())
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::ink(rgb(theme::SPEAKER_DEFAULT)))
+                    .child("Innkeeper"),
+            )
+            .child(
+                div()
+                    .text_color(theme::text())
+                    .child("Snowed shut since Tuesday. Nobody's crossing."),
+            );
+
+        deferred(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::scrim())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.prefs_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("prefs-card")
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .w(px(480.0))
+                        .p_5()
+                        .bg(theme::raised())
+                        .border_1()
+                        .border_color(theme::outline())
+                        .rounded_lg()
+                        .shadow_lg()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .child(div().type_title().child("Preferences"))
+                                .child(div().type_hint().child("Esc to close")),
+                        )
+                        .child(theme_row)
+                        .child(ui_row)
+                        .child(text_row)
+                        .child(preview),
+                ),
+        )
+    }
+
     /// What the node is. What a conversion keeps and drops is `Doc::set_kind`'s to decide,
     /// where it can be tested; this only checkpoints first, so an undo brings back every
     /// edge and effect the change cut.
@@ -5037,6 +5300,18 @@ impl Editor {
                 .child(input.clone())
         };
 
+        // What a character says is set in the text face; everything else in the field list
+        // (an alias, a variable's value) is the UI's. The font goes on the input's wrapper, not
+        // the label above it, so the label stays in the chrome's face.
+        let dialogue_field = |label: &str, input: &Entity<TextInput>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().type_label().child(label.to_string()))
+                .child(div().font_family(theme::text_font()).child(input.clone()))
+        };
+
         if let Some(path) = self.play.clone() {
             return self.play_panel(&path, cx).into_any_element();
         }
@@ -5070,12 +5345,18 @@ impl Editor {
                                 .flex()
                                 .flex_col()
                                 .gap_3()
-                                .child(field("Speaker", &self.speaker_input))
-                                .child(field("Text", &self.text_input)),
+                                .child(dialogue_field("Speaker", &self.speaker_input))
+                                .child(dialogue_field("Text", &self.text_input)),
                         ))
                     })
                     .when(matches!(kind, NodeKind::Hub | NodeKind::Note), |this| {
-                        this.child(section("Content", field(text_label, &self.text_input)))
+                        // A hub's label is read by the player; a note is the author's own.
+                        let input = if kind == NodeKind::Hub {
+                            dialogue_field(text_label, &self.text_input)
+                        } else {
+                            field(text_label, &self.text_input)
+                        };
+                        this.child(section("Content", input))
                     })
                     .when(kind == NodeKind::Instruction, |this| {
                         this.child(section("Logic", self.var_rows(id, VarRow::Sets, cx)))
@@ -5176,7 +5457,11 @@ impl Editor {
                                 .flex()
                                 .flex_col()
                                 .gap_3()
-                                .child(self.label_input.clone())
+                                .child(
+                                    div()
+                                        .font_family(theme::text_font())
+                                        .child(self.label_input.clone()),
+                                )
                                 // Only where the player is the one choosing. Out of an
                                 // instruction or a jump the walk has to take the edge it
                                 // finds, so a once-only flag there would be a promise
@@ -5712,6 +5997,7 @@ fn node_box(
                     div()
                         .flex_none()
                         .w_full()
+                        .font_family(theme::text_font())
                         .text_color(speaker)
                         .one_line()
                         .child(node.speaker.clone()),
@@ -5719,6 +6005,7 @@ fn node_box(
                 .child(
                     div()
                         .w_full()
+                        .font_family(theme::text_font())
                         .text_color(theme::text())
                         .text_ellipsis()
                         .line_clamp(3)
@@ -5932,6 +6219,15 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>, zoom: f32) -> Option<Path
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        // Before the window opens, so the first frame already has its faces.
+        if let Err(why) = cx.text_system().add_fonts(
+            FONT_FILES
+                .iter()
+                .map(|f| std::borrow::Cow::Borrowed(*f))
+                .collect(),
+        ) {
+            eprintln!("could not load the bundled fonts: {why}");
+        }
         cx.bind_keys([
             // `"Canvas"`, not `"Editor"`: these three mean something else in a text field,
             // and the canvas is the only place focus can be without being in one.
@@ -5951,6 +6247,7 @@ fn main() {
             KeyBinding::new("f1", ShowHelp, Some("Editor")),
             KeyBinding::new("ctrl-k", ShowPalette, Some("Editor")),
             KeyBinding::new("ctrl-shift-t", CycleTheme, Some("Editor")),
+            KeyBinding::new("ctrl-,", ShowPrefs, Some("Editor")),
             // `"Palette"` is set on the palette's card, an ancestor of its field, so these
             // mean something only while it is open — and a text field binds none of them.
             KeyBinding::new("down", PaletteNext, Some("Palette")),

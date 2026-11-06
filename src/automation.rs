@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use gpui::{Context, Focusable, Window, px, size};
 
-use crate::ThemePref;
 use crate::doc::{Doc, NodeKind, clear_backup};
+use crate::settings::{TextFont, ThemePref, UiFont};
 use crate::{
     Editor, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection, SidePane, node_number,
 };
@@ -50,6 +50,8 @@ fn socket_path() -> PathBuf {
 /// exactly as it would without the feature.
 pub fn start(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     editor.autosave_off = true;
+    // The same rule for preferences: a script sets any it likes and the real file is untouched.
+    editor.persist_settings = false;
 
     let path = socket_path();
     // A socket file left by a run that was killed would make the bind fail.
@@ -171,6 +173,26 @@ fn run(
                 _ => return Err(format!("no theme {rest:?}")),
             };
             editor.set_theme(pref, cx);
+            Ok(String::new())
+        }
+
+        "prefs" => {
+            editor.on_show_prefs(&crate::ShowPrefs, window, cx);
+            Ok(String::new())
+        }
+
+        "font" => {
+            // `font ui inter|geist|plex`, `font text same|newsreader|courier`
+            let (which, name) = rest.split_once(' ').ok_or("font <ui|text> <name>")?;
+            match (which, name.trim().to_ascii_lowercase().as_str()) {
+                ("ui", "inter") => editor.set_ui_font(UiFont::Inter, cx),
+                ("ui", "geist") => editor.set_ui_font(UiFont::Geist, cx),
+                ("ui", "plex") => editor.set_ui_font(UiFont::Plex, cx),
+                ("text", "same") => editor.set_text_font(TextFont::SameAsUi, cx),
+                ("text", "newsreader") => editor.set_text_font(TextFont::Newsreader, cx),
+                ("text", "courier") => editor.set_text_font(TextFont::CourierPrime, cx),
+                _ => return Err(format!("no font {rest:?}")),
+            }
             Ok(String::new())
         }
 
@@ -411,6 +433,7 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         ("help", editor.help_open),
         ("palette", editor.palette_open),
         ("map", editor.flow_map),
+        ("prefs", editor.prefs_open),
     ]
     .into_iter()
     .filter_map(|(name, open)| open.then_some(name))
@@ -421,7 +444,7 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         overlays.join(",")
     };
     format!(
-        "flow={} zoom={} pan={:.0},{:.0} selection={selection} playing={playing} dirty={} problems={} nodes={} field={focused} overlays={overlays} path={}",
+        "flow={} zoom={} pan={:.0},{:.0} settings={:?}/{:?}/{:?} selection={selection} playing={playing} dirty={} problems={} nodes={} field={focused} overlays={overlays} path={}",
         if editor.flow.is_empty() {
             "main"
         } else {
@@ -430,6 +453,9 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         (editor.view.zoom * 100.0).round(),
         editor.view.pan.0,
         editor.view.pan.1,
+        editor.settings.theme,
+        editor.settings.ui_font,
+        editor.settings.text_font,
         doc.is_dirty(),
         doc.problems().len(),
         doc.nodes.len(),

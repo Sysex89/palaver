@@ -3,7 +3,7 @@
 A node-graph editor for branching game dialogue, in the spirit of articy:draft, written in Rust
 with GPUI, the UI framework Zed is built on.
 
-![palaver mid-play: the walked path is drawn on the canvas, the inspector shows the current line](docs/shots/09-sample/24-play-trail.png)
+![palaver mid-play in the light theme: elbow wires, the walked path drawn heavier, the inspector showing the current line](docs/shots/12-wires/L13-play-trail.png)
 
 ## What it is
 
@@ -73,8 +73,20 @@ flow shows where it is used. The flow map, on Ctrl+M, draws one box per canvas w
 for each pair a jump connects.
 
 <table><tr>
-<td><img src="docs/shots/09-sample/28-search-bookmarks.png" alt="Search with nothing typed, listing bookmarks"></td>
-<td><img src="docs/shots/09-sample/26-flow-map.png" alt="The flow map: main jumps to road"></td>
+<td><img src="docs/shots/12-wires/28-search-bookmarks.png" alt="Search with nothing typed, listing bookmarks"></td>
+<td><img src="docs/shots/12-wires/26-flow-map.png" alt="The flow map: main jumps to road"></td>
+</tr></table>
+
+**Paper, and your own type.** The last pass turned the look into a choice. There are two themes,
+Dark and a light one called Paper, and by default they follow the desktop. Wires are elbows
+now, so a hub's choices leave on one trunk and each label sits on a run of its own. Ctrl+, opens
+Preferences, where the UI font and the text font are separate settings: the text font is what a
+character says, so it can be Newsreader or the Courier of a screenplay without touching the
+names of your variables. Every font is bundled, so it looks the same on any machine.
+
+<table><tr>
+<td><img src="docs/shots/13-fonts/L31-prefs.png" alt="The Preferences card in the light theme"></td>
+<td><img src="docs/shots/13-fonts/32-text-courier.png" alt="Dark theme with the text font set to Courier Prime"></td>
 </tr></table>
 
 ## How I checked it
@@ -83,7 +95,9 @@ for each pair a jump connects.
 socket, and screenshots each one. The states are the same every run, so two runs on either side
 of a change make an honest before and after pair, and that is where every image above comes from.
 
-This mattered more than the tests did. Two real bugs passed every test: text typed into any
+The pointer-heavy parts (clicking an elbow wire, dragging a new one out of a port, Ctrl+, and a
+click on a font chip) were checked with real keyboard and mouse events, not just the scripted
+socket. This mattered more than the tests did. Two real bugs passed every test: text typed into any
 overlay field was black on near-black, and the palette could highlight two rows at once (one
 under the mouse, one from the arrow keys). Both were found only by looking at the screenshots.
 
@@ -102,8 +116,6 @@ The editor opens on a small sample conversation with one of every node kind, a s
 ## Not built yet
 
 - There is no release binary and no screen recording yet, so for now you have to build it.
-- The UI font (Inter) is named in the theme but not bundled. Where it is not installed, GPUI
-  falls back to a system font and some of the type hierarchy is lost.
 
 [`CLAUDE.md`](CLAUDE.md) explains the architecture and lists what was deliberately left out of
 scope. [`docs/next.md`](docs/next.md) is what I would do next.

@@ -33,6 +33,8 @@ SETTLE = 0.4  # seconds for a frame to land after a command
 RESET = [
     # Pinned, not left to follow the desktop: a shot must not depend on the machine's theme.
     "theme dark",
+    "font ui inter",
+    "font text same",
     "menu Play/Stop",
     "menu Play/Stop",
     "select none",
@@ -81,6 +83,14 @@ SHOTS = [
     ("L11-cast", ["theme light", "pane cast"]),
     ("L13-play-trail", ["theme light", "select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0", "choose 1"]),
     ("L21-palette", ["theme light", "menu View/Command palette"]),
+    # Preferences, and each typeface on the thing it is for.
+    ("31-prefs", ["prefs"]),
+    ("L31-prefs", ["theme light", "prefs"]),
+    ("32-text-courier", ["font text courier", "select node 1"]),
+    ("33-text-newsreader-light", ["theme light", "font text newsreader", "select node 1"]),
+    ("34-ui-geist-light", ["theme light", "font ui geist", "select node 1"]),
+    ("35-ui-plex", ["font ui plex", "select node 1"]),
+    ("36-play-courier", ["font text courier", "select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0"]),
     # From here on the shots edit the document, which `quit discard` throws away at the end.
     ("18-note", ["select none", "menu Node/Note", "field text Rewrite this branch once the pass is open."]),
     # Two nodes dropped with nothing selected, where the view's centre already holds a node:
@@ -164,7 +174,8 @@ def main():
 
     tmp = Path(tempfile.mkdtemp(prefix="palaver-shots-"))
     sock = tmp / "palaver-automation.sock"
-    env = dict(os.environ, TMPDIR=str(tmp))
+    # Both private: TMPDIR moves the socket and the crash copy, XDG_CONFIG_HOME moves settings.json.
+    env = dict(os.environ, TMPDIR=str(tmp), XDG_CONFIG_HOME=str(tmp / "config"))
     app = subprocess.Popen([str(BINARY)], env=env, stderr=subprocess.DEVNULL)
     failed = []
     taken = 0
