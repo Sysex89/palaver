@@ -4687,16 +4687,20 @@ impl Editor {
                                 .text_color(theme::text_muted())
                                 .child(what),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .px_1()
-                                .rounded_sm()
-                                .bg(theme::canvas())
-                                .type_hint()
-                                .text_color(theme::text())
-                                .child(keys),
-                        )
+                        // A command with no shortcut draws no keycap, as the palette does: an
+                        // empty one reads as a glitch.
+                        .when(!keys.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(theme::canvas())
+                                    .type_hint()
+                                    .text_color(theme::text())
+                                    .child(keys),
+                            )
+                        })
                 }))
         };
 

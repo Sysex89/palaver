@@ -83,6 +83,9 @@ SHOTS = [
     ("L11-cast", ["theme light", "pane cast"]),
     ("L13-play-trail", ["theme light", "select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0", "choose 1"]),
     ("L21-palette", ["theme light", "menu View/Command palette"]),
+    ("L15-problems", ["theme light", "menu View/Problems"]),
+    ("L16-help", ["theme light", "menu View/Keyboard shortcuts"]),
+    ("L12-flows", ["theme light", "pane flows"]),
     # Preferences, and each typeface on the thing it is for.
     ("31-prefs", ["prefs"]),
     ("L31-prefs", ["theme light", "prefs"]),
@@ -101,6 +104,7 @@ SHOTS = [
     ("20-fit-all", ["menu View/Fit to view"]),
     # Last: the map is a mode, not an overlay, so it stays up for every shot after it.
     ("26-flow-map", ["menu View/Flow map"]),
+    ("L26-flow-map", ["theme light", "menu View/Flow map"]),
 ]
 
 
