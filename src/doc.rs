@@ -2820,6 +2820,17 @@ impl Doc {
     /// than an edge dragged back across the canvas, asking about the pass runs an
     /// *instruction* that remembers you did, and the goodbye runs a *condition* on it.
     pub fn sample() -> Doc {
+        Doc::build_sample(true)
+    }
+
+    /// [`Doc::sample`] without the showcase pieces: just the tavern conversation, which is
+    /// what the tests that count nodes, problems and screenplay blocks are written against.
+    #[cfg(test)]
+    fn tavern() -> Doc {
+        Doc::build_sample(false)
+    }
+
+    fn build_sample(showcase: bool) -> Doc {
         let mut doc = Doc::default();
         let node = |doc: &mut Doc, x, y, speaker: &str, text: &str| {
             let id = doc.add_node(x, y);
@@ -2931,6 +2942,44 @@ impl Doc {
         // the rule the editor relies on when an author drags the happy path first.
         doc.add_edge(check, warned);
         doc.add_edge(check, farewell);
+
+        if !showcase {
+            return doc;
+        }
+
+        // Everything below is appended, so the ids above keep their order: a note, the
+        // names a game would look nodes up by, tags, and a second canvas. They are here so
+        // the sample opens on every part of the editor instead of only the graph.
+        let aside = doc.add_node(60.0, 60.0);
+        let n = doc.node_mut(aside).unwrap();
+        n.kind = NodeKind::Note;
+        n.text = "Keep the opening short: the player has not decided to stay yet.".into();
+
+        doc.node_mut(greet).unwrap().alias = "intro".into();
+        doc.node_mut(pass).unwrap().alias = "pass_status".into();
+        doc.add_tag(&[greet, ask, rude, answer, sulk], "act1.tavern");
+        doc.add_tag(&[pass, warned, farewell], "act1.road");
+        doc.add_tag(&[sulk, farewell], "todo");
+
+        // The way out is its own canvas, reached by a jump — the one edge that may cross.
+        doc.add_flow("road");
+        let leave = doc.add_node(2220.0, 300.0);
+        doc.node_mut(leave).unwrap().kind = NodeKind::Jump;
+        let climb = node(
+            &mut doc,
+            60.0,
+            200.0,
+            "Player",
+            "The drifts are waist-high by the second mile.",
+        );
+        let summit = node(&mut doc, 420.0, 200.0, "Player", "Then I turn back.");
+        for id in [climb, summit] {
+            doc.node_mut(id).unwrap().flow = "road".into();
+        }
+        doc.node_mut(summit).unwrap().end = true;
+        edge(&mut doc, warned, leave, "Head out");
+        edge(&mut doc, leave, climb, "");
+        edge(&mut doc, climb, summit, "");
         doc
     }
 }
@@ -3029,9 +3078,12 @@ mod tests {
         let [hub] = of_kind(NodeKind::Hub)[..] else {
             panic!("the sample lost its hub");
         };
-        let [jump] = of_kind(NodeKind::Jump)[..] else {
-            panic!("the sample lost its jump");
-        };
+        // The sample has two jumps: this one returns to the hub, the other leaves for the
+        // `road` flow, which `sample_reaches_a_second_canvas` covers.
+        let jump = of_kind(NodeKind::Jump)
+            .into_iter()
+            .find(|j| doc.start_walk(j.id).last() == Some(&hub.id))
+            .expect("the sample lost the jump back to its hub");
 
         assert!(doc.choices(hub.id).len() > 1, "a hub is a branch point");
         assert!(hub.speaker.is_empty(), "nobody speaks at a hub");
@@ -3293,6 +3345,26 @@ mod tests {
 
         doc.node_mut(note).unwrap().text = "rewrite this branch".into();
         assert!(doc.problems().is_empty());
+    }
+
+    /// The sample is the first thing a stranger sees, so it carries one of each thing the
+    /// editor can show: bookmarks, tags, a note and a second canvas joined by a jump.
+    #[test]
+    fn sample_reaches_a_second_canvas() {
+        let doc = Doc::sample();
+
+        assert_eq!(doc.all_flows(), vec!["road"]);
+        assert_eq!(
+            doc.flow_links(),
+            vec![("".to_string(), "road".to_string(), 1)]
+        );
+        assert_eq!(doc.bookmarks().len(), 2, "two aliased nodes");
+        assert!(doc.all_tags().contains(&"act1.tavern"));
+        assert!(doc.nodes.iter().any(|n| n.kind == NodeKind::Note));
+        assert!(
+            !doc.problems().iter().any(|p| p.edge().is_some()),
+            "a jump may cross canvases; nothing else does"
+        );
     }
 
     #[test]
@@ -5703,7 +5775,7 @@ mod tests {
     /// target gets a number of its own, rising down the page.
     #[test]
     fn screenplay_runs_lines_on_and_numbers_branches() {
-        let script = Doc::sample().to_screenplay();
+        let script = Doc::tavern().to_screenplay();
         assert!(script.starts_with("## Main\n\n### §1\n\n**INNKEEPER**  \nYou look lost"));
         assert!(script.contains("- Ask → §2\n- Refuse → §3\n"));
         assert!(
@@ -5717,7 +5789,7 @@ mod tests {
     /// never becomes a block that says nothing but where to turn.
     #[test]
     fn screenplay_points_through_jumps() {
-        let script = Doc::sample().to_screenplay();
+        let script = Doc::tavern().to_screenplay();
         assert!(script.contains("- Ask something else → §4\n"));
         assert!(script.contains("*[asked_about_pass = true]*\n\n→ §4\n"));
         assert!(!script.contains("### §11"));
@@ -6096,7 +6168,7 @@ mod tests {
 
     #[test]
     fn query_filters_by_speaker_kind_and_flag() {
-        let mut doc = Doc::sample();
+        let mut doc = Doc::tavern();
         let player = doc.query("speaker:player");
         assert_eq!(player.len(), 2);
         // Filters AND with each other and with the text.
@@ -6114,7 +6186,7 @@ mod tests {
 
     #[test]
     fn query_filters_by_flow() {
-        let mut doc = Doc::sample();
+        let mut doc = Doc::tavern();
         let moved = doc.query("where am");
         doc.move_to_flow(&moved, "Cellar");
         assert_eq!(doc.query("flow:cellar"), moved);
@@ -6140,7 +6212,7 @@ mod tests {
 
     #[test]
     fn query_finds_nodes_with_problems() {
-        let doc = Doc::sample();
+        let doc = Doc::tavern();
         // The sample's three dead ends, and nothing else.
         assert_eq!(doc.query("has:problem").len(), 3);
         assert_eq!(doc.query("has:problem speaker:player").len(), 0);

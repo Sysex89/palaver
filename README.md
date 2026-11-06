@@ -3,7 +3,7 @@
 A node-graph editor for branching game dialogue, in the spirit of articy:draft, written in Rust
 with GPUI, the UI framework Zed is built on.
 
-![palaver mid-play: the walked path is drawn on the canvas, the inspector shows the current line](docs/shots/07-trail/24-play-trail.png)
+![palaver mid-play: the walked path is drawn on the canvas, the inspector shows the current line](docs/shots/09-sample/24-play-trail.png)
 
 ## What it is
 
@@ -14,9 +14,9 @@ notes for the author. Press F5 and the editor plays the conversation right there
 graph the way a game would.
 
 Around that sit the things a real project needs: document-wide variables, a cast of characters,
-several canvases (flows) in one file, full undo, and a problems list for dead ends and broken
-links. Documents are plain JSON (`.dln`), and the lines a player reads export to Fluent (`.ftl`)
-for translation.
+several canvases (flows) in one file, tags, full undo, and a problems list for dead ends and
+broken links. Documents are plain JSON (`.dln`), and the lines a player reads export to Fluent
+(`.ftl`) for translation, or to a numbered Markdown screenplay.
 
 ## Making it legible
 
@@ -66,6 +66,17 @@ the menus and the F1 sheet, so the three can never disagree about a name or a sh
 took are drawn heavier, the nodes you passed are outlined, and once-only choices you have used
 up are dimmed. The screenshot at the top is one of these.
 
+**Finding your way.** A graph gets big, so there are a few ways to get around it. Search takes
+filters (`kind:cond`, `speaker:player`, `tag:act1`, `sets:gold`), and when the box is empty it
+lists your bookmarks, which are just the nodes you gave an alias. Every variable, character and
+flow shows where it is used. The flow map, on Ctrl+M, draws one box per canvas with an arrow
+for each pair a jump connects.
+
+<table><tr>
+<td><img src="docs/shots/09-sample/28-search-bookmarks.png" alt="Search with nothing typed, listing bookmarks"></td>
+<td><img src="docs/shots/09-sample/26-flow-map.png" alt="The flow map: main jumps to road"></td>
+</tr></table>
+
 ## How I checked it
 
 `tools/shots.py` builds the editor, drives it into a fixed list of states over a small automation
@@ -86,7 +97,7 @@ On Linux GPUI renders through Vulkan, so you need the Vulkan and X11 or Wayland 
 packages installed. If the build fails inside a `blade-*` crate or `gpui` itself, it is almost
 always a missing system library rather than a problem in this code.
 
-The editor opens on a small sample conversation with one of every node kind.
+The editor opens on a small sample conversation with one of every node kind, a second flow, tags and two bookmarks, so there is something to click on.
 
 ## Not built yet
 

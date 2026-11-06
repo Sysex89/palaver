@@ -18,6 +18,8 @@ on screen, not by whether the tests pass.
 | Fit to view | Opens fitted (50% floor), `F` fits everything, flow tabs refit | `04-fit/` |
 | Kind strip | Node kind as a coloured edge bar; hollow ring on a conversation's start | `05-before/` → `05-kinds/` |
 | Command palette | Ctrl+K over `MENUS`; modal; one highlight | `06-palette/` |
+| Play trail | Walked edges heavier, passed nodes outlined, spent choices dimmed | `07-trail/` |
+| Merge | The flow map, tags, filters, references and screenplay export from `origin/main`, in the tokenised layout; a sample that shows them | `08-merge/`, `09-sample/` |
 
 ## Before any new feature
 

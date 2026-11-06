@@ -5658,9 +5658,11 @@ fn node_box(
                     .child(node.text.clone()),
             )),
         })
-        // The first tag in a corner, over whatever text runs under it, so `#todo` can be
-        // seen without selecting anything — and the box stays `NODE_W`×`NODE_H`, since
-        // kinds and tags change what a node draws, never how big it is.
+        // The first tag in the top corner, so `#todo` can be seen without selecting anything.
+        // Top, not bottom: a speech node has only a short speaker name there, while the bottom
+        // sat on the third line of a wrapped line of dialogue and hid its last word. The box
+        // stays `NODE_W`×`NODE_H` — kinds and tags change what a node draws, never how big it
+        // is.
         .when_some(node.tags.first(), |this, first| {
             let more = match node.tags.len() {
                 1 => String::new(),
@@ -5670,7 +5672,7 @@ fn node_box(
                 div()
                     .absolute()
                     .right(px(4.0))
-                    .bottom(px(2.0))
+                    .top(px(2.0))
                     .px_1()
                     .rounded_sm()
                     .bg(theme::RAISED)

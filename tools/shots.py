@@ -64,6 +64,9 @@ SHOTS = [
     ("17-play-over-problems", ["select node 1", "menu Play/Play conversation", "menu View/Problems"]),
     ("25-tags", ["pane tags"]),
     ("27-search-filter", ["menu Edit/Find", "field search kind:cond"]),
+    ("28-search-bookmarks", ["menu Edit/Find"]),
+    ("29-search-tag", ["menu Edit/Find", "field search tag:act1.tavern"]),
+    ("30-road-flow", ["flow road"]),
     ("21-palette", ["menu View/Command palette"]),
     # `zoom` matches two commands, so `palette next` leaves the second row highlighted.
     ("22-palette-query", ["menu View/Command palette", "field palette zoom", "palette next"]),
