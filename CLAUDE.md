@@ -10,7 +10,7 @@ Every section above **Out of scope** describes code that exists. There is no roa
 
 ## Stack
 
-- GUI: **GPUI** (`gpui` 0.2.2), the framework Zed is built on. Its API still moves between releases — the version is pinned, and when an API doesn't match the docs, read the source in `~/.cargo/registry/src/*/gpui-*/` rather than guessing.
+- GUI: **GPUI** (`gpui` 0.2.2). Its API still moves between releases — the version is pinned, and when an API doesn't match the docs, read the source in `~/.cargo/registry/src/*/gpui-*/` rather than guessing.
 - On Linux GPUI renders through Vulkan/Blade and needs X11/Wayland + Vulkan dev packages present; a build failure in `blade-*` or `gpui` almost always means a missing system lib, not a code bug.
 
 ## Commands
