@@ -2,7 +2,9 @@
 
 A node-graph editor for branching game dialogue, a bit like articy:draft. Written in Rust with GPUI.
 
-![palaver mid-play in the light theme: elbow wires, the walked path drawn heavier, the inspector showing the current line](docs/shots/12-wires/L13-play-trail.png)
+![A 40-second run: playing a conversation, searching, the flow map, the command palette, then Preferences and the dark theme](docs/palaver.gif)
+
+The same clip as [an mp4](docs/palaver.mp4).
 
 ## What it is
 
@@ -60,7 +62,9 @@ F1 sheet, so a name or shortcut can't differ between them.
 
 **Play trail.** While a conversation plays, the canvas shows where you've been. Edges you took are
 drawn heavier, nodes you passed are outlined, and once-only choices you've used up are dimmed.
-The screenshot at the top shows it.
+The clip at the top shows it, and so does the screenshot below.
+
+![Mid-play in the light theme: the walked path drawn heavier, the inspector showing the current line](docs/shots/12-wires/L13-play-trail.png)
 
 **Getting around.** Big graphs need it. Search takes filters (`kind:cond`, `speaker:player`,
 `tag:act1`, `sets:gold`), and with an empty box it lists your bookmarks, which are just nodes
@@ -111,7 +115,7 @@ bookmarks, so there's something to click on.
 
 ## Not done yet
 
-- No release binary or screen recording, so for now you have to build it.
+- No release binary, so for now you have to build it.
 
 [`CLAUDE.md`](CLAUDE.md) covers the architecture and what I decided not to build.
 [`docs/next.md`](docs/next.md) is what I'd do next.

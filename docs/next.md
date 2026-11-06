@@ -32,8 +32,8 @@ These matter more than a sixth feature, because they decide whether a stranger s
    either side of a change are an honest pair.
 2. ~~**Bundle Inter.**~~ Done with the Paper pass: every face the Preferences card offers is embedded, and
    `Noto Serif` for notes is now bundled Newsreader italic.
-3. **A short screen recording and a release binary.** Nobody builds a GPUI app from a link.
-   A 20-second capture of authoring a branch and playing it is the hero asset.
+3. **A release binary.** Nobody builds a GPUI app from a link. The screen recording is done
+   (`tools/record.py`, `docs/palaver.gif`); a binary to run without building is not.
 4. **Two known rough edges.**
    - A *selected* speech node's outline (`ACCENT`) and its strip (`KIND_SPEECH`) are nearly the
      same blue. The clean fix is a different `KIND_SPEECH`, but it is also `SPEAKER_DEFAULT`, so
