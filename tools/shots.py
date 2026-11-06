@@ -60,6 +60,7 @@ SHOTS = [
     ("14-play-hub", ["select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0"]),
     ("15-problems", ["menu View/Problems"]),
     ("16-help", ["menu View/Keyboard shortcuts"]),
+    ("24-play-trail", ["select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0", "choose 1"]),
     ("17-play-over-problems", ["select node 1", "menu Play/Play conversation", "menu View/Problems"]),
     ("21-palette", ["menu View/Command palette"]),
     # `zoom` matches two commands, so `palette next` leaves the second row highlighted.

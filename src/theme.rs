@@ -95,6 +95,11 @@ pub const DANGER: Rgba = hex(0xff7a7a);
 
 /// Where a play-through is standing.
 pub const PLAYING: Rgba = SUCCESS;
+/// A node or edge the play-through has already passed. Fainter than [`PLAYING`], so the
+/// current node is still the one bright thing.
+pub const TRAIL: Rgba = hexa(0x8ce99a99);
+/// A once-only choice the play-through has used up.
+pub const SPENT: Rgba = OUTLINE;
 /// A condition's true pin, and a flag set or checked true.
 pub const TRUE: Rgba = SUCCESS;
 /// A condition's false pin, and a flag set or checked false.

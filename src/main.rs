@@ -67,6 +67,10 @@ const STATUS_H: f32 = 26.0;
 /// Radius of the ring marking a node nothing links to. Smaller than `PORT_R`, so the handle
 /// you drag from stays the larger and the only interactive-looking one.
 const ROOT_R: f32 = 5.0;
+/// Edge stroke widths. A walked edge is heavier, not just greener: a condition's pins already
+/// use the trail's hue for `true`, so weight is the one cue that is not colour.
+const EDGE_W: f32 = 1.5;
+const TRAIL_W: f32 = 3.0;
 /// How long a status message stays up before it clears itself.
 const STATUS_FOR: Duration = Duration::from_secs(6);
 /// Width of the inspector on the right.
@@ -972,7 +976,8 @@ impl Editor {
     /// the colour to draw it in — the selection outranks a condition's branch, which
     /// outranks the ordinary edge colour. An edge leaving a jump is not drawn at all: the
     /// node itself names its target, which is the whole point of the kind.
-    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, Rgba)> {
+    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, Rgba, f32)> {
+        let path = self.play.as_deref().unwrap_or(&[]);
         self.doc
             .edges
             .iter()
@@ -987,9 +992,21 @@ impl Editor {
                 if from.flow != self.flow || to.flow != self.flow {
                     return None;
                 }
+                // The trail is read off the play path, the way `Doc::spent` is: nothing is
+                // stored beside it. It is the weight of the line that says "walked", so a
+                // condition's pin keeps its own colour — the trail hue is the true pin's.
+                let walked = path.windows(2).any(|w| w[0] == e.from && w[1] == e.to);
+                let spent = self.doc.spent(path, e.from, e.to);
                 let color = match (self.selection == Selection::Edge(index), e.branch) {
                     (true, _) => theme::ACCENT,
-                    _ if !self.doc.is_condition(e.from) => theme::EDGE,
+                    _ if spent => theme::SPENT,
+                    _ if !self.doc.is_condition(e.from) => {
+                        if walked {
+                            theme::TRAIL
+                        } else {
+                            theme::EDGE
+                        }
+                    }
                     (false, true) => theme::TRUE,
                     (false, false) => theme::FALSE,
                 };
@@ -997,6 +1014,7 @@ impl Editor {
                     self.screen_pos(out_port(from)),
                     self.screen_pos(in_port(to)),
                     color,
+                    if walked { TRAIL_W } else { EDGE_W },
                 ))
             })
             .collect()
@@ -1734,7 +1752,7 @@ impl Editor {
     /// text field are bound — Delete, Backspace and Tab — so they never fire from one.
     fn canvas_pane(
         &self,
-        lines: Vec<(Point<Pixels>, Point<Pixels>, Rgba)>,
+        lines: Vec<(Point<Pixels>, Point<Pixels>, Rgba, f32)>,
         pending: Option<(Point<Pixels>, Point<Pixels>)>,
         view: View,
         cx: &mut Context<Self>,
@@ -1760,25 +1778,26 @@ impl Editor {
                     |_, _, _| {},
                     move |bounds, _, window, _| {
                         // Paint coordinates are window-absolute, canvas bounds are not at the origin.
-                        let mut draw = |from: Point<Pixels>, to: Point<Pixels>, color: Rgba| {
-                            let (from, to) = (from + bounds.origin, to + bounds.origin);
-                            let mut line = PathBuilder::stroke(px(1.5));
-                            line.move_to(from);
-                            line.line_to(to);
-                            if let Ok(line) = line.build() {
-                                window.paint_path(line, color);
-                            }
-                            // The stroke stays a hairline at every zoom; only the head scales.
-                            if let Some(head) = arrow_head(to, from, view.zoom) {
-                                window.paint_path(head, color);
-                            }
-                        };
+                        let mut draw =
+                            |from: Point<Pixels>, to: Point<Pixels>, color: Rgba, width: f32| {
+                                let (from, to) = (from + bounds.origin, to + bounds.origin);
+                                let mut line = PathBuilder::stroke(px(width));
+                                line.move_to(from);
+                                line.line_to(to);
+                                if let Ok(line) = line.build() {
+                                    window.paint_path(line, color);
+                                }
+                                // The stroke stays a hairline at every zoom; only the head scales.
+                                if let Some(head) = arrow_head(to, from, view.zoom) {
+                                    window.paint_path(head, color);
+                                }
+                            };
 
-                        for (from, to, color) in lines {
-                            draw(from, to, color);
+                        for (from, to, color, width) in lines {
+                            draw(from, to, color, width);
                         }
                         if let Some((from, to)) = pending {
-                            draw(from, to, theme::ACCENT);
+                            draw(from, to, theme::ACCENT, EDGE_W);
                         }
                     },
                 )
@@ -1789,6 +1808,10 @@ impl Editor {
             )
             .children(self.doc.nodes_in(&self.flow).map(|node| {
                 let playing = self.play.as_ref().and_then(|path| path.last().copied());
+                let passed = self
+                    .play
+                    .as_ref()
+                    .is_some_and(|path| path.contains(&node.id));
                 let jump_target = (node.kind == NodeKind::Jump)
                     .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
                     .flatten()
@@ -1799,6 +1822,7 @@ impl Editor {
                     view,
                     self.selection.nodes().contains(&node.id),
                     playing == Some(node.id),
+                    passed,
                     jump_target,
                     speaker_color(&self.doc, &node.speaker, theme::SPEAKER_DEFAULT),
                 )
@@ -4414,6 +4438,7 @@ fn node_box(
     view: View,
     selected: bool,
     playing: bool,
+    passed: bool,
     jump_target: Option<String>,
     speaker: Rgba,
 ) -> impl IntoElement {
@@ -4434,12 +4459,14 @@ fn node_box(
         .p_2()
         .bg(theme::RAISED)
         .border_1()
-        // Where the play-through is standing outranks an ending; the selection outranks both.
-        .border_color(match (selected, playing, node.is_ending()) {
-            (true, _, _) => theme::ACCENT,
-            (false, true, _) => theme::PLAYING,
-            (false, false, true) => theme::ENDING,
-            (false, false, false) => theme::OUTLINE,
+        // Where the play-through is standing outranks where it has been, which outranks an
+        // ending; the selection outranks all three.
+        .border_color(match (selected, playing, passed, node.is_ending()) {
+            (true, ..) => theme::ACCENT,
+            (false, true, ..) => theme::PLAYING,
+            (false, false, true, _) => theme::TRAIL,
+            (false, false, false, true) => theme::ENDING,
+            (false, false, false, false) => theme::OUTLINE,
         })
         .rounded_md()
         .shadow_md()
