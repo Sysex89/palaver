@@ -119,3 +119,9 @@ The editor opens on a small sample conversation with one of every node kind, a s
 
 [`CLAUDE.md`](CLAUDE.md) explains the architecture and lists what was deliberately left out of
 scope. [`docs/next.md`](docs/next.md) is what I would do next.
+
+## License
+
+palaver is free software under the [GNU General Public License v3.0](LICENSE) or, at your
+option, any later version. The bundled fonts in `assets/fonts` keep their own SIL Open Font
+License terms; the licence files sit beside them.
