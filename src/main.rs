@@ -7,8 +7,8 @@ mod theme;
 use doc::{
     Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId,
     NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use, Value,
-    VarState, View, box_exit, clean_tag, clear_backup, in_port, join_set, map_cell, map_hit,
-    node_center, out_port, read_backup, snippet, split_set, with_default_extension,
+    VarState, View, WIRE_STUB, box_exit, clean_tag, clear_backup, in_port, join_set, map_cell,
+    map_hit, node_center, out_port, read_backup, route, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -71,6 +71,9 @@ const STATUS_H: f32 = 26.0;
 /// Radius of the ring marking a node nothing links to. Smaller than `PORT_R`, so the handle
 /// you drag from stays the larger and the only interactive-looking one.
 const ROOT_R: f32 = 5.0;
+/// One wire as the paint closure takes it: the corners in pane pixels, its colour, its width.
+type Wire = (Vec<Point<Pixels>>, Rgba, f32);
+
 /// Edge stroke widths. A walked edge is heavier, not just greener: a condition's pins already
 /// use the trail's hue for `true`, so weight is the one cue that is not colour.
 const EDGE_W: f32 = 1.5;
@@ -1069,7 +1072,7 @@ impl Editor {
     /// the colour to draw it in — the selection outranks a condition's branch, which
     /// outranks the ordinary edge colour. An edge leaving a jump is not drawn at all: the
     /// node itself names its target, which is the whole point of the kind.
-    fn edge_lines(&self) -> Vec<(Point<Pixels>, Point<Pixels>, Rgba, f32)> {
+    fn edge_lines(&self) -> Vec<Wire> {
         let path = self.play.as_deref().unwrap_or(&[]);
         self.doc
             .edges
@@ -1103,9 +1106,14 @@ impl Editor {
                     (false, true) => theme::true_pin(),
                     (false, false) => theme::false_pin(),
                 };
+                // The one route, shared with `Doc::edge_at` and the label, so the wire that is
+                // drawn is the wire that is clicked and the wire that is labelled.
+                let wire = route(out_port(from), in_port(to));
                 Some((
-                    self.screen_pos(out_port(from)),
-                    self.screen_pos(in_port(to)),
+                    wire.points
+                        .into_iter()
+                        .map(|p| self.screen_pos(p))
+                        .collect(),
                     color,
                     if walked { TRAIL_W } else { EDGE_W },
                 ))
@@ -1114,12 +1122,21 @@ impl Editor {
     }
 
     /// The rubber band drawn while dragging a new edge out of a port.
-    fn pending_edge(&self) -> Option<(Point<Pixels>, Point<Pixels>)> {
+    fn pending_edge(&self) -> Option<Vec<Point<Pixels>>> {
         let Some(Drag::Edge { from, cursor }) = self.drag else {
             return None;
         };
         let node = self.doc.node(from)?;
-        Some((self.screen_pos(out_port(node)), self.screen_pos(cursor)))
+        let start = out_port(node);
+        // An elbow once the cursor is clear of the stub, so it previews the wire that will
+        // be made; behind the node a straight line follows the cursor, because the looped
+        // route an edge back to a node takes would flicker across rows as the cursor moves.
+        let points = if cursor.0 - start.0 >= WIRE_STUB * 2.5 {
+            route(start, cursor).points
+        } else {
+            vec![start, cursor]
+        };
+        Some(points.into_iter().map(|p| self.screen_pos(p)).collect())
     }
 
     fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -1953,8 +1970,7 @@ impl Render for Editor {
                     .into_iter()
                     .map(|(a, b, _, _)| {
                         (
-                            point(px(a.0), px(a.1)),
-                            point(px(b.0), px(b.1)),
+                            vec![point(px(a.0), px(a.1)), point(px(b.0), px(b.1))],
                             theme::kind_jump(),
                             EDGE_W,
                         )
@@ -2080,8 +2096,8 @@ impl Editor {
     /// text field are bound — Delete, Backspace and Tab — so they never fire from one.
     fn canvas_pane(
         &self,
-        lines: Vec<(Point<Pixels>, Point<Pixels>, Rgba, f32)>,
-        pending: Option<(Point<Pixels>, Point<Pixels>)>,
+        lines: Vec<Wire>,
+        pending: Option<Vec<Point<Pixels>>>,
         view: View,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2109,26 +2125,34 @@ impl Editor {
                     |_, _, _| {},
                     move |bounds, _, window, _| {
                         // Paint coordinates are window-absolute, canvas bounds are not at the origin.
-                        let mut draw =
-                            |from: Point<Pixels>, to: Point<Pixels>, color: Rgba, width: f32| {
-                                let (from, to) = (from + bounds.origin, to + bounds.origin);
-                                let mut line = PathBuilder::stroke(px(width));
-                                line.move_to(from);
-                                line.line_to(to);
-                                if let Ok(line) = line.build() {
-                                    window.paint_path(line, color);
-                                }
-                                // The stroke stays a hairline at every zoom; only the head scales.
-                                if let Some(head) = arrow_head(to, from, head_zoom) {
-                                    window.paint_path(head, color);
-                                }
-                            };
+                        let mut draw = |points: &[Point<Pixels>], color: Rgba, width: f32| {
+                            let n = points.len();
+                            if n < 2 {
+                                return;
+                            }
+                            let points: Vec<Point<Pixels>> =
+                                points.iter().map(|p| *p + bounds.origin).collect();
+                            let mut line = PathBuilder::stroke(px(width));
+                            line.move_to(points[0]);
+                            for p in &points[1..] {
+                                line.line_to(*p);
+                            }
+                            if let Ok(line) = line.build() {
+                                window.paint_path(line, color);
+                            }
+                            // The stroke stays a hairline at every zoom; only the head scales.
+                            // It points along the last run, which is level into the port.
+                            if let Some(head) = arrow_head(points[n - 1], points[n - 2], head_zoom)
+                            {
+                                window.paint_path(head, color);
+                            }
+                        };
 
-                        for (from, to, color, width) in lines {
-                            draw(from, to, color, width);
+                        for (points, color, width) in &lines {
+                            draw(points, *color, *width);
                         }
-                        if let Some((from, to)) = pending {
-                            draw(from, to, theme::accent(), EDGE_W);
+                        if let Some(points) = &pending {
+                            draw(points, theme::accent(), EDGE_W);
                         }
                     },
                 )
@@ -2214,10 +2238,10 @@ impl Editor {
 
     /// Choice text on each labelled edge, as a pill centred on the line's midpoint.
     ///
-    /// The width is the *gap* the line crosses. An edge runs from a node's right edge to the
-    /// next one's left edge, so its midpoint is the middle of that gap, and a label wider than
-    /// the gap ran underneath a node box and was cut off mid-word. Bounded to the gap it
-    /// covers no text, whatever the order things paint in. What does not fit wraps to a
+    /// The width is the *run* the wire has: the label sits on the straight stretch into the
+    /// target's port, centred on it (`Route::label`), and a label wider than that stretch ran
+    /// underneath a node box and was cut off mid-word. Bounded to the run it covers no text,
+    /// whatever the order things paint in. What does not fit wraps to a
     /// second line and then ends in `…` — see `Typography::one_line` for why the ellipsis
     /// needs the clamp rather than `truncate()`.
     fn edge_labels(&self) -> Vec<impl IntoElement> {
@@ -2225,9 +2249,7 @@ impl Editor {
         /// dot is `2 * PORT_R` across and centred on the gap's edge, so this clears it with a
         /// few units to spare.
         const MARGIN: f32 = 2.0 * PORT_R + 10.0;
-        /// What a label may be where there is no gap to fit it in: an edge running back
-        /// across the graph, where every width is equally arbitrary.
-        const BACK_W: f32 = 120.0;
+        /// The narrowest a label is given, however short the run its wire leaves it.
         const MIN_W: f32 = 48.0;
         const MAX_W: f32 = 200.0;
         /// What a character of the label font may take at 1:1, deliberately over the real
@@ -2277,11 +2299,11 @@ impl Editor {
                 if from_node.flow != self.flow || to_node.flow != self.flow {
                     return None;
                 }
-                let from = out_port(from_node);
-                let to = in_port(to_node);
-                let gap = to.0 - from.0;
-                let fit = if gap > 0.0 { gap - MARGIN } else { BACK_W };
-                let mid = self.screen_pos(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0));
+                // On the run the wire has, at the width that run has: the same route the
+                // canvas draws, so the label can never be centred on a wire that is not there.
+                let wire = route(out_port(from_node), in_port(to_node));
+                let fit = wire.room - MARGIN;
+                let mid = self.screen_pos(wire.label);
                 // A *definite* width for the pill, estimated from the text and capped at the
                 // gap. Left to size itself against a `max_w`, gpui measured it at its full
                 // width first and then wrapped one line wider than the box, clipping it on

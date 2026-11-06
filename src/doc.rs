@@ -82,6 +82,80 @@ pub fn in_port(node: &Node) -> (f32, f32) {
     (node.x, node.y + NODE_H / 2.0)
 }
 
+/// How far a wire runs straight out of an out-port before its first bend. Every wire
+/// leaving one node shares this stub and the trunk after it, so a hub's choices read as one
+/// bus branching off, each ending in a run of its own.
+pub const WIRE_STUB: f32 = 20.0;
+/// The least straight run into an in-port a forward wire is drawn with: room for the
+/// arrowhead and for a label to sit on it.
+const WIRE_RUN: f32 = 36.0;
+
+/// The path of an elbow wire, in document space, and where its label sits. **This is the one
+/// place a wire's shape is decided**: the canvas draws `points`, `Doc::edge_at` hits them and
+/// the label is centred on `label`, so the three can never disagree about where the wire is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Route {
+    /// From the out-port to the in-port, axis-aligned, and always ending in a horizontal
+    /// run into the in-port so the arrowhead points the way a node reads.
+    pub points: Vec<(f32, f32)>,
+    /// The middle of the run a label sits on.
+    pub label: (f32, f32),
+    /// How long that run is: the width a label can have before it covers a bend.
+    pub room: f32,
+}
+
+/// The elbow wire from an out-port to an in-port. Level ports get a straight line. A target
+/// to the right gets a short stub, a vertical trunk and a straight run in. A target at or
+/// behind the source — a cycle drawn as an ordinary edge — loops round: out, across between
+/// the two rows (or under both when they are on the same row) and back in, so it never
+/// cuts through the nodes it joins.
+pub fn route(from: (f32, f32), to: (f32, f32)) -> Route {
+    let forward = to.0 - from.0 >= WIRE_STUB + WIRE_RUN;
+    if forward && from.1 == to.1 {
+        return Route {
+            points: vec![from, to],
+            label: ((from.0 + to.0) / 2.0, from.1),
+            room: to.0 - from.0,
+        };
+    }
+    if forward {
+        let bend = from.0 + WIRE_STUB;
+        return Route {
+            points: vec![from, (bend, from.1), (bend, to.1), to],
+            label: ((bend + to.0) / 2.0, to.1),
+            room: to.0 - bend,
+        };
+    }
+    let (out, back) = (from.0 + WIRE_STUB, to.0 - WIRE_STUB);
+    // Rows far enough apart leave a clear lane between them; the same row needs a lane
+    // under both, so the wire does not run along the node boxes it is joining.
+    let lane = if (to.1 - from.1).abs() >= NODE_H + 20.0 {
+        (from.1 + to.1) / 2.0
+    } else {
+        from.1.max(to.1) + NODE_H / 2.0 + WIRE_STUB
+    };
+    Route {
+        points: vec![
+            from,
+            (out, from.1),
+            (out, lane),
+            (back, lane),
+            (back, to.1),
+            to,
+        ],
+        label: ((out + back) / 2.0, lane),
+        room: (out - back).abs(),
+    }
+}
+
+/// Distance from a point to the nearest part of a polyline.
+fn distance_to_polyline(p: (f32, f32), points: &[(f32, f32)]) -> f32 {
+    points
+        .windows(2)
+        .map(|seg| distance_to_segment(p, seg[0], seg[1]))
+        .fold(f32::INFINITY, f32::min)
+}
+
 /// Middle of a node, which is what the canvas centres on when jumping to one.
 pub fn node_center(node: &Node) -> (f32, f32) {
     (node.x + NODE_W / 2.0, node.y + NODE_H / 2.0)
@@ -89,8 +163,10 @@ pub fn node_center(node: &Node) -> (f32, f32) {
 
 /// Horizontal gap between a node and one branched off it. The choice label sits in this gap,
 /// so it is what a label can be: at 100 a label of any real length was cut to a few words,
-/// and 160 holds a short question ("Is the pass open?") on one line.
-pub const GAP_X: f32 = 160.0;
+/// and at 160 a short question ("Is the pass open?") fitted on one line only while wires
+/// were straight. An elbow wire spends [`WIRE_STUB`] of the gap on its first bend, so 200 is
+/// what leaves the same room for the run a label sits on.
+pub const GAP_X: f32 = 200.0;
 /// Vertical gap between siblings sharing a parent.
 pub const GAP_Y: f32 = 30.0;
 
@@ -1685,7 +1761,8 @@ impl Doc {
         }
     }
 
-    /// Index of the first edge of one flow whose line passes near the point. An edge is in
+    /// Index of the first edge of one flow whose wire passes near the point — the route
+    /// [`route`] draws, not a straight line between the ports. An edge is in
     /// a flow only when *both* its ends are — the same test the canvas draws it by, so the
     /// author can never click a line that is not there. The index is still into the whole
     /// `edges` vec, which is what keeps `Selection::Edge` a bare index.
@@ -1697,7 +1774,7 @@ impl Doc {
             if from.flow != flow || to.flow != flow {
                 return false;
             }
-            distance_to_segment((x, y), out_port(from), in_port(to)) <= EDGE_HIT_TOL
+            distance_to_polyline((x, y), &route(out_port(from), in_port(to)).points) <= EDGE_HIT_TOL
         })
     }
 
@@ -2861,34 +2938,34 @@ impl Doc {
             "Innkeeper",
             "You look lost, traveler.",
         );
-        let ask = node(&mut doc, 420.0, 140.0, "Player", "Where am I?");
-        let rude = node(&mut doc, 420.0, 380.0, "Player", "None of your business.");
+        let ask = node(&mut doc, 460.0, 140.0, "Player", "Where am I?");
+        let rude = node(&mut doc, 460.0, 380.0, "Player", "None of your business.");
         let answer = node(
             &mut doc,
-            780.0,
+            860.0,
             140.0,
             "Innkeeper",
             "Sern's Rest. Last inn before the pass.",
         );
-        let sulk = node(&mut doc, 780.0, 380.0, "Innkeeper", "Suit yourself.");
+        let sulk = node(&mut doc, 860.0, 380.0, "Innkeeper", "Suit yourself.");
 
         // The hub is the point the conversation keeps coming back to. Nobody speaks at
         // one, so it has a label and no speaker.
-        let more = doc.add_node(1140.0, 140.0);
+        let more = doc.add_node(1260.0, 140.0);
         let n = doc.node_mut(more).unwrap();
         n.kind = NodeKind::Hub;
         n.text = "Anything else?".into();
 
         let rooms = node(
             &mut doc,
-            1500.0,
+            1660.0,
             20.0,
             "Innkeeper",
             "Two coppers a night, and the fire stays lit.",
         );
         let pass = node(
             &mut doc,
-            1500.0,
+            1660.0,
             160.0,
             "Innkeeper",
             "Snowed shut since Tuesday. Nobody's crossing.",
@@ -2899,7 +2976,7 @@ impl Doc {
 
         // Logic is graph structure: the instruction that records the question and the
         // condition that reads it back are both nodes you can see on the canvas.
-        let noted = doc.add_node(1860.0, 160.0);
+        let noted = doc.add_node(2060.0, 160.0);
         doc.node_mut(noted).unwrap().kind = NodeKind::Instruction;
         doc.set_effect(
             noted,
@@ -2908,22 +2985,22 @@ impl Doc {
             SetOp::Set,
         );
 
-        let check = doc.add_node(1500.0, 300.0);
+        let check = doc.add_node(1660.0, 300.0);
         doc.node_mut(check).unwrap().kind = NodeKind::Condition;
         doc.set_condition(check, "asked_about_pass", Some(Value::Bool(true)), Cmp::Eq);
 
         let warned = node(
             &mut doc,
-            1860.0,
+            2060.0,
             300.0,
             "Innkeeper",
             "Mind the drifts on the road out.",
         );
-        let farewell = node(&mut doc, 1860.0, 440.0, "Innkeeper", "Safe travels, then.");
+        let farewell = node(&mut doc, 2060.0, 440.0, "Innkeeper", "Safe travels, then.");
 
         // One jump serves every branch that returns to the hub, so the canvas carries no
         // long edge doubling back across it.
-        let back = doc.add_node(2220.0, 60.0);
+        let back = doc.add_node(2460.0, 60.0);
         doc.node_mut(back).unwrap().kind = NodeKind::Jump;
 
         edge(&mut doc, greet, ask, "Ask");
@@ -2963,7 +3040,7 @@ impl Doc {
 
         // The way out is its own canvas, reached by a jump — the one edge that may cross.
         doc.add_flow("road");
-        let leave = doc.add_node(2220.0, 300.0);
+        let leave = doc.add_node(2460.0, 300.0);
         doc.node_mut(leave).unwrap().kind = NodeKind::Jump;
         let climb = node(
             &mut doc,
@@ -2972,7 +3049,7 @@ impl Doc {
             "Player",
             "The drifts are waist-high by the second mile.",
         );
-        let summit = node(&mut doc, 420.0, 200.0, "Player", "Then I turn back.");
+        let summit = node(&mut doc, 460.0, 200.0, "Player", "Then I turn back.");
         for id in [climb, summit] {
             doc.node_mut(id).unwrap().flow = "road".into();
         }
@@ -3305,6 +3382,117 @@ mod tests {
             None,
             "before the start"
         );
+    }
+
+    #[test]
+    fn a_level_wire_is_a_straight_line() {
+        let r = route((200.0, 45.0), (400.0, 45.0));
+        assert_eq!(r.points, vec![(200.0, 45.0), (400.0, 45.0)]);
+        assert_eq!(r.label, (300.0, 45.0));
+    }
+
+    /// Every forward wire ends in a horizontal run into the in-port, whatever the offset,
+    /// so an arrowhead always points right, and every segment is axis-aligned.
+    #[test]
+    fn a_forward_wire_is_axis_aligned_and_runs_level_into_its_port() {
+        for dy in [-300.0, -90.0, -1.0, 1.0, 40.0, 250.0] {
+            let (from, to) = ((200.0, 100.0), (400.0, 100.0 + dy));
+            let r = route(from, to);
+            assert_eq!(r.points.first(), Some(&from));
+            assert_eq!(r.points.last(), Some(&to));
+            for seg in r.points.windows(2) {
+                assert!(
+                    seg[0].0 == seg[1].0 || seg[0].1 == seg[1].1,
+                    "{seg:?} is diagonal"
+                );
+            }
+            let last = r.points[r.points.len() - 2..].to_vec();
+            assert_eq!(last[0].1, last[1].1, "the run into the port is level");
+            assert!(last[0].0 < last[1].0, "and runs rightward");
+        }
+    }
+
+    /// Wires leaving one node share a stub and a trunk, and each ends in a run of its own,
+    /// which is where its label sits — so labels on a hub's choices never collide.
+    #[test]
+    fn a_hubs_wires_share_a_trunk_and_keep_separate_runs() {
+        let hub = (200.0, 100.0);
+        let up = route(hub, (400.0, 0.0));
+        let down = route(hub, (400.0, 200.0));
+        assert_eq!(up.points[1], down.points[1], "the same first bend");
+        assert_ne!(up.label.1, down.label.1, "labels on different rows");
+        assert_eq!(up.label.0, down.label.0);
+        assert!(up.room > 100.0, "room for a label on the run: {}", up.room);
+    }
+
+    /// A target behind the source loops round instead of cutting through either node.
+    #[test]
+    fn a_wire_to_something_behind_loops_round() {
+        let (from, to) = ((500.0, 45.0), (0.0, 45.0));
+        let r = route(from, to);
+        assert_eq!(r.points.first(), Some(&from));
+        assert_eq!(r.points.last(), Some(&to));
+        let lane = r.label.1;
+        assert!(
+            lane > 45.0 + NODE_H / 2.0,
+            "same row: under both nodes, got {lane}"
+        );
+        let apart = route((500.0, 45.0), (0.0, 445.0));
+        assert!(
+            (apart.label.1 - 245.0).abs() < 0.01,
+            "rows apart: between them"
+        );
+    }
+
+    /// The old straight line's midpoint is empty space now; the trunk is the hit.
+    #[test]
+    fn edge_at_follows_the_elbow_not_the_diagonal() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.add_node(400.0, 200.0);
+        doc.add_edge(a, b);
+        let (from, to) = (
+            out_port(doc.node(a).unwrap()),
+            in_port(doc.node(b).unwrap()),
+        );
+
+        let diagonal_mid = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+        assert_eq!(doc.edge_at("", diagonal_mid.0, diagonal_mid.1), None);
+        let trunk = (from.0 + WIRE_STUB, (from.1 + to.1) / 2.0);
+        assert_eq!(doc.edge_at("", trunk.0, trunk.1), Some(0));
+        let run = ((from.0 + WIRE_STUB + to.0) / 2.0, to.1);
+        assert_eq!(doc.edge_at("", run.0, run.1), Some(0));
+    }
+
+    /// The route and the hit test are one function, so every point of a wire is a hit and
+    /// a point well off it is not — over wires of every shape the editor can draw.
+    #[test]
+    fn every_point_on_a_wire_hits_it() {
+        for (ax, ay, bx, by) in [
+            (0.0, 0.0, 400.0, 0.0),
+            (0.0, 0.0, 400.0, 180.0),
+            (0.0, 0.0, 400.0, -180.0),
+            (400.0, 0.0, 0.0, 0.0),
+            (400.0, 0.0, 0.0, 400.0),
+        ] {
+            let mut doc = Doc::default();
+            let a = doc.add_node(ax, ay);
+            let b = doc.add_node(bx, by);
+            doc.add_edge(a, b);
+            let r = route(
+                out_port(doc.node(a).unwrap()),
+                in_port(doc.node(b).unwrap()),
+            );
+            for seg in r.points.windows(2) {
+                for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let p = (
+                        seg[0].0 + (seg[1].0 - seg[0].0) * t,
+                        seg[0].1 + (seg[1].1 - seg[0].1) * t,
+                    );
+                    assert_eq!(doc.edge_at("", p.0, p.1), Some(0), "{p:?} on {r:?}");
+                }
+            }
+        }
     }
 
     /// A node with text, so it is not flagged empty by accident.

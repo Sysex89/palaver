@@ -421,13 +421,15 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         overlays.join(",")
     };
     format!(
-        "flow={} zoom={} selection={selection} playing={playing} dirty={} problems={} nodes={} field={focused} overlays={overlays} path={}",
+        "flow={} zoom={} pan={:.0},{:.0} selection={selection} playing={playing} dirty={} problems={} nodes={} field={focused} overlays={overlays} path={}",
         if editor.flow.is_empty() {
             "main"
         } else {
             &editor.flow
         },
         (editor.view.zoom * 100.0).round(),
+        editor.view.pan.0,
+        editor.view.pan.1,
         doc.is_dirty(),
         doc.problems().len(),
         doc.nodes.len(),
