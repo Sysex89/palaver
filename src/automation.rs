@@ -167,6 +167,7 @@ fn run(
                 "variables" => SidePane::Variables,
                 "cast" => SidePane::Cast,
                 "flows" => SidePane::Flows,
+                "tags" => SidePane::Tags,
                 _ => return Err(format!("no pane {rest:?}")),
             };
             editor.switch_pane(pane, cx);
@@ -397,6 +398,7 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
         ("problems", editor.problems_open),
         ("help", editor.help_open),
         ("palette", editor.palette_open),
+        ("map", editor.flow_map),
     ]
     .into_iter()
     .filter_map(|(name, open)| open.then_some(name))

@@ -5,9 +5,10 @@ mod text_input;
 mod theme;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, NODE_H, NODE_W, Node, NodeId, NodeKind,
-    OPEN_FIT_MIN_ZOOM, PORT_R, Problem, SetOp, Severity, Value, VarState, View, clear_backup,
-    in_port, join_set, node_center, out_port, read_backup, split_set, with_default_extension,
+    Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId,
+    NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use, Value,
+    VarState, View, box_exit, clean_tag, clear_backup, in_port, join_set, map_cell, map_hit,
+    node_center, out_port, read_backup, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -31,6 +32,7 @@ actions!(
         ZoomOut,
         ZoomReset,
         Find,
+        ToggleFlowMap,
         Branch,
         NewHub,
         NewJump,
@@ -42,6 +44,7 @@ actions!(
         Save,
         SaveAs,
         ExportFluent,
+        ExportScreenplay,
         Open,
         Play,
         PlayFromHere,
@@ -77,7 +80,7 @@ const STATUS_FOR: Duration = Duration::from_secs(6);
 const SIDEBAR_W: f32 = 280.0;
 /// Width of the global-variables pane on the left. With [`SIDEBAR_W`] and [`MENU_H`], this
 /// is what bounds the canvas — and what `window_pos` has to subtract off every mouse event.
-const VARS_W: f32 = 220.0;
+const VARS_W: f32 = 252.0;
 
 /// How much one pixel of scroll changes the zoom. Multiplicative, so a scroll up and an
 /// equal scroll down cancel out exactly.
@@ -92,6 +95,7 @@ fn declare_hint(pane: SidePane) -> &'static str {
         SidePane::Variables => "New flag",
         SidePane::Cast => "New character",
         SidePane::Flows => "New flow",
+        SidePane::Tags => "Tag the selection",
     }
 }
 
@@ -107,6 +111,10 @@ const CAST_COLORS: [u32; 8] = [
 
 /// How often a dirty document gets a crash copy. Also the most work a crash can cost.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
+
+/// One arrow on the flow map, in pane pixels: where it leaves, where it lands, where its
+/// count sits, and the count — how many jumps it stands for.
+type MapArrow = ((f32, f32), (f32, f32), (f32, f32), usize);
 
 type MenuAction = fn(&mut Editor, &mut Window, &mut Context<Editor>);
 /// Label, shortcut hint, what it runs.
@@ -169,6 +177,9 @@ const MENUS: &[MenuSpec] = &[
             ("Export Fluent…", "Ctrl+E", |e, w, cx| {
                 e.on_export_fluent(&ExportFluent, w, cx)
             }),
+            ("Export Screenplay…", "", |e, w, cx| {
+                e.on_export_screenplay(&ExportScreenplay, w, cx)
+            }),
         ],
     ),
     (
@@ -211,6 +222,9 @@ const MENUS: &[MenuSpec] = &[
             }),
             ("Fit to view", "F", |e, w, cx| {
                 e.on_fit_view(&FitView, w, cx)
+            }),
+            ("Flow map", "Ctrl+M", |e, w, cx| {
+                e.on_toggle_flow_map(&ToggleFlowMap, w, cx)
             }),
             ("Problems", "Ctrl+Shift+M", |e, w, cx| {
                 e.on_toggle_problems(&ToggleProblems, w, cx)
@@ -341,6 +355,15 @@ struct Editor {
     /// Which canvas is on screen. A flow is a *view* onto the one flat node list, so this
     /// is editor state and never serialized — the whole feature is this filter plus a tab.
     flow: String,
+    /// Whose "Used by" list is open under its row in the left pane, if any. View state, and
+    /// filtered at render like `renaming`: a name the document no longer has matches no
+    /// row, so the list simply is not drawn.
+    used_by: Option<Ref>,
+    /// Whether the canvas pane is showing the flow map — one box per flow, an arrow per
+    /// pair of flows a jump crosses between — instead of a canvas. A mode of the pane
+    /// rather than a pane of its own, since `window_pos` is where a new pane breaks every
+    /// hit test; `Editor::show` is what closes it, so anything that goes to a node leaves.
+    flow_map: bool,
 }
 
 /// What the shared `var_input` is renaming. `Editor::pane` already says which *list* an
@@ -360,6 +383,9 @@ enum SidePane {
     Variables,
     Cast,
     Flows,
+    /// Never declared: the list is whatever the nodes carry, so the field's `+` tags the
+    /// selection rather than adding to a list.
+    Tags,
 }
 
 /// Node ids are stable within a history step, so a node selection can be a set.
@@ -468,7 +494,7 @@ impl Editor {
 
         // Neither of these is document content, so they stay out of the loop above and only
         // ask for a re-render — without this, typing would not refresh what they drive.
-        let search_input = cx.new(|cx| TextInput::new("Find a node", cx));
+        let search_input = cx.new(|cx| TextInput::new("Find — or #tag speaker: is:end", cx));
         let var_input = cx.new(|cx| TextInput::new(declare_hint(SidePane::default()), cx));
         let value_input = cx.new(|cx| TextInput::new("0", cx));
         for input in [&search_input, &var_input, &value_input] {
@@ -533,6 +559,8 @@ impl Editor {
             autosave_off: false,
             play: None,
             pane: SidePane::default(),
+            used_by: None,
+            flow_map: false,
             flow: String::new(),
             fit_pending: true,
         }
@@ -586,7 +614,7 @@ impl Editor {
                         // Recovered work is still unsaved work, and `checkpoint` is the only
                         // thing that says so. The price is a first undo that restores the
                         // state it was already in.
-                        this.doc.checkpoint();
+                        this.checkpoint();
                     })
                     .ok();
                 }
@@ -709,13 +737,33 @@ impl Editor {
         .detach();
     }
 
-    /// Writes the translatable strings out for a game build. Deliberately not a save: it
-    /// leaves `self.path`, the dirty flag and the crash copy alone, so exporting never
-    /// re-points the editor at the `.ftl`.
+    /// Writes the translatable strings out for a game build.
     fn on_export_fluent(&mut self, _: &ExportFluent, _: &mut Window, cx: &mut Context<Self>) {
+        self.export(FTL_EXT, Doc::export_ftl, cx);
+    }
+
+    /// Writes the dialogue out as a script for a table read or a recording session.
+    fn on_export_screenplay(
+        &mut self,
+        _: &ExportScreenplay,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.export(SCRIPT_EXT, Doc::export_screenplay, cx);
+    }
+
+    /// Asks where, then runs `write` there. Deliberately not a save: it leaves `self.path`,
+    /// the dirty flag and the crash copy alone, so exporting never re-points the editor at
+    /// the file it wrote — and `write` takes `&Doc`, so it could not if it tried.
+    fn export(
+        &mut self,
+        ext: &'static str,
+        write: fn(&Doc, &std::path::Path) -> Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let suggested = PathBuf::from(self.file_name())
-            .with_extension(FTL_EXT)
+            .with_extension(ext)
             .to_string_lossy()
             .into_owned();
         let response = cx.prompt_for_new_path(&directory, Some(&suggested));
@@ -724,8 +772,8 @@ impl Editor {
             match response.await {
                 Ok(Ok(Some(path))) => {
                     this.update(cx, |this, cx| {
-                        let path = with_default_extension(path, FTL_EXT);
-                        let status = match this.doc.export_ftl(&path) {
+                        let path = with_default_extension(path, ext);
+                        let status = match write(&this.doc, &path) {
                             Ok(()) => format!("Exported {}", document_name(Some(&path))),
                             Err(error) => format!("Export failed: {error}"),
                         };
@@ -913,7 +961,16 @@ impl Editor {
         cx.notify();
     }
 
-    // ponytail: one undo checkpoint per editing session, not per keystroke.
+    /// Every discrete edit checkpoints through here rather than on `doc` directly: it also
+    /// ends the typing session, so text typed *after* the edit gets an undo step of its own
+    /// instead of riding on the edit's and vanishing with it on the first Ctrl+Z.
+    fn checkpoint(&mut self) {
+        self.doc.checkpoint();
+        self.text_dirty = false;
+    }
+
+    // ponytail: one undo checkpoint per editing session, not per keystroke. On `doc`
+    // directly, since this *is* the typing session the wrapper above ends.
     fn checkpoint_once(&mut self) {
         if !self.text_dirty {
             self.doc.checkpoint();
@@ -1048,6 +1105,10 @@ impl Editor {
 
     /// Starts a pan. Bound to the middle button, and to Alt+left for pointers without one.
     fn on_pan_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The map ignores pan and zoom, so a pan under it would move a canvas nobody sees.
+        if self.flow_map {
+            return;
+        }
         window.focus(&self.focus_handle);
         self.open_menu = None;
         self.drag = Some(Drag::Pan {
@@ -1058,6 +1119,11 @@ impl Editor {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The map's own rung, above everything: while it is up nothing on the canvas is
+        // drawn, so nothing on it may be hit, dragged or created.
+        if self.flow_map {
+            return self.on_map_down(ev, window, cx);
+        }
         if ev.modifiers.alt {
             return self.on_pan_down(ev, window, cx);
         }
@@ -1080,6 +1146,7 @@ impl Editor {
             }
             let node = self.doc.node(id).expect("hit_test returned a live node");
             let grab = (x - node.x, y - node.y);
+            let kind = node.kind;
             // Grabbing a node that is already selected keeps the set, which is what
             // makes a group drag possible; grabbing any other node replaces it.
             if !self.selection.nodes().contains(&id) {
@@ -1090,15 +1157,20 @@ impl Editor {
                 grab,
                 moved: false,
             });
-            if ev.click_count == 2 {
+            // Only where the inspector draws the Text field: focus on a field that is not
+            // rendered lands nowhere, and every shortcut is dead until the canvas is
+            // clicked again.
+            if ev.click_count == 2 && has_text_field(kind) {
                 window.focus(&self.text_input.read(cx).focus_handle(cx));
             }
         } else if let Some(index) = self.doc.edge_at(&self.flow, x, y) {
             self.select(Selection::Edge(index), cx);
             self.drag = None;
         } else if ev.click_count == 2 {
-            self.doc.checkpoint();
-            let id = self.doc.add_node(x, y);
+            self.checkpoint();
+            // Onto the canvas being looked at: `add_node` alone lands on the main flow,
+            // where a node made on any other canvas would be selected but invisible.
+            let id = self.doc.add_node_on(&self.flow, x, y);
             self.select(Selection::Nodes(vec![id]), cx);
             self.drag = None;
             window.focus(&self.speaker_input.read(cx).focus_handle(cx));
@@ -1121,12 +1193,15 @@ impl Editor {
         match self.drag.take() {
             Some(Drag::Edge { from, .. }) => {
                 let (x, y) = self.doc_pos(ev.position);
+                // Asked before the checkpoint: a drop the model refuses — onto a note,
+                // back onto the node itself, over an edge that exists — must leave no
+                // empty undo step and select nothing, least of all whichever edge is last
+                // in the file. A jump that already has a target is pointed at the new one.
                 if let Some(to) = self.doc.hit_test(&self.flow, x, y)
-                    && from != to
-                    && !self.doc.has_edge(from, to)
+                    && self.doc.can_link(from, to)
                 {
-                    self.doc.checkpoint();
-                    self.doc.add_edge(from, to);
+                    self.checkpoint();
+                    self.doc.link(from, to);
                     self.select(Selection::Edge(self.doc.edges.len() - 1), cx);
                 }
             }
@@ -1153,7 +1228,7 @@ impl Editor {
             Drag::Node { id, grab, moved } => {
                 // Checkpoint on the first movement, so a plain click leaves no empty undo entry.
                 if !moved {
-                    self.doc.checkpoint();
+                    self.checkpoint();
                     self.drag = Some(Drag::Node {
                         id,
                         grab,
@@ -1198,11 +1273,11 @@ impl Editor {
     }
 
     fn on_delete(&mut self, _: &DeleteNode, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selection == Selection::None {
+        if self.selection == Selection::None || self.flow_map {
             return;
         }
         // One checkpoint for the whole set, so a group deletion is a single undo step.
-        self.doc.checkpoint();
+        self.checkpoint();
         match self.selection.clone() {
             Selection::Nodes(ids) => ids.iter().for_each(|id| self.doc.remove_node(*id)),
             Selection::Edge(index) => self.doc.remove_edge(index),
@@ -1246,6 +1321,9 @@ impl Editor {
 
     /// Wheel zooms about the cursor, so whatever you are pointing at stays put.
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.flow_map {
+            return;
+        }
         let dy = f32::from(ev.delta.pixel_delta(window.line_height()).y);
         if dy == 0.0 {
             return;
@@ -1417,18 +1495,22 @@ impl Editor {
     }
 
     fn insert_node(&mut self, kind: NodeKind, window: &mut Window, cx: &mut Context<Self>) {
+        // A node made where nobody can see it is a node made by accident, so making one
+        // leaves the map for the canvas it lands on.
+        self.flow_map = false;
         // Guard before the checkpoint: one whose mutation then fails is an empty undo
         // step and a false dirty flag.
-        // A note takes no edges, so it can never branch off the selection: it always lands
-        // in the middle of the view. Without this the branch would be created and the edge
-        // silently refused, leaving the note parked where a child would have gone.
+        // A note takes no edges, so it can never branch off the selection, nor can
+        // anything branch off a note — nor off a jump that has its one target. Without
+        // the guard the node would be made and its edge silently refused, an orphan parked
+        // where a child would have gone. All three land in the middle of the view instead.
         let parent = self
             .selection
             .only_node()
             .filter(|_| kind != NodeKind::Note)
-            .filter(|id| self.doc.node(*id).is_some());
+            .filter(|id| self.doc.can_branch(*id));
 
-        self.doc.checkpoint();
+        self.checkpoint();
         let id = match parent {
             Some(from) => match self.doc.branch_from(from) {
                 Some(id) => id,
@@ -1436,22 +1518,16 @@ impl Editor {
             },
             None => {
                 // Centred on the view rather than parked at its origin, so the node lands
-                // where you are already looking.
+                // where you are already looking, and onto the canvas being looked at. The
+                // branch arm needs no equivalent: `branch_from` inherits the parent's, and
+                // switching canvas drops the selection, so a parent is always on this one.
                 let (x, y) = self.view.to_doc(Self::pane_center(window));
                 // Slid down past anything already standing there: dropped dead on top of
                 // another node, the new one hid it, and a second Ctrl+6 hid the first.
                 let (x, y) = self
                     .doc
                     .free_spot(&self.flow, x - NODE_W / 2.0, y - NODE_H / 2.0);
-                let id = self.doc.add_node(x, y);
-                // Onto the canvas being looked at. The branch arm needs no equivalent:
-                // `branch_from` inherits the parent's, and switching canvas drops the
-                // selection, so a parent is always on this one.
-                let flow = self.flow.clone();
-                if let Some(node) = self.doc.node_mut(id) {
-                    node.flow = flow;
-                }
-                id
+                self.doc.add_node_on(&self.flow, x, y)
             }
         };
         if let Some(node) = self.doc.node_mut(id) {
@@ -1512,7 +1588,7 @@ impl Editor {
     /// is what lets `Doc::vars_along` recompute the variables from the path alone.
     fn start_play(&mut self, at: NodeId, window: &Window, cx: &mut Context<Self>) {
         let path = self.doc.start_walk(at);
-        self.follow(&path, window);
+        self.follow(&path, window, cx);
         self.play = Some(path);
         cx.notify();
     }
@@ -1523,29 +1599,39 @@ impl Editor {
             return;
         };
         self.doc.advance(&mut path, to);
-        self.follow(&path, window);
+        self.follow(&path, window, cx);
         self.play = Some(path);
         cx.notify();
     }
 
     /// Brings the node a play-through has arrived at into view.
-    fn follow(&mut self, path: &[NodeId], window: &Window) {
+    fn follow(&mut self, path: &[NodeId], window: &Window, cx: &mut Context<Self>) {
         if let Some(&at) = path.last() {
-            self.show(at, window);
+            self.show(at, window, cx);
         }
     }
 
-    /// Brings a node into view without touching the selection — which is what separates
-    /// following a play-through from [`Editor::jump_to`].
+    /// Brings a node into view without touching the selection on the canvas it is on —
+    /// which is what separates following a play-through from [`Editor::jump_to`].
     /// Switching the canvas lives here rather than in each caller: `jump_to` and `follow`
     /// both come through, so a search hit, a problem row and a play-through that walks into
-    /// another flow all cross canvases without an arm of their own.
-    fn show(&mut self, id: NodeId, window: &Window) {
-        if let Some(node) = self.doc.node(id) {
-            self.flow.clone_from(&node.flow);
-            self.view
-                .center_on(node_center(node), Self::pane_center(window));
+    /// another flow all cross canvases without an arm of their own. Crossing drops the
+    /// selection, as a click on the Flows tab does: what was selected on the canvas left
+    /// behind is neither drawn nor hit-testable, and Delete or Tab would work it unseen.
+    fn show(&mut self, id: NodeId, window: &Window, cx: &mut Context<Self>) {
+        let Some((flow, center)) = self
+            .doc
+            .node(id)
+            .map(|node| (node.flow.clone(), node_center(node)))
+        else {
+            return;
+        };
+        self.flow_map = false;
+        if self.flow != flow {
+            self.flow = flow;
+            self.select(Selection::None, cx);
         }
+        self.view.center_on(center, Self::pane_center(window));
     }
 
     /// Selects a node and brings it into view without changing zoom.
@@ -1553,9 +1639,168 @@ impl Editor {
         if self.doc.node(id).is_none() {
             return;
         }
-        self.show(id, window);
+        self.show(id, window, cx);
         self.select(Selection::Nodes(vec![id]), cx);
         cx.notify();
+    }
+
+    fn on_toggle_flow_map(&mut self, _: &ToggleFlowMap, _: &mut Window, cx: &mut Context<Self>) {
+        self.flow_map = !self.flow_map;
+        self.drag = None;
+        // Nodes are not drawn on the map, so none of them stays selected under it —
+        // otherwise Delete would remove something off screen.
+        if self.flow_map {
+            self.select(Selection::None, cx);
+        }
+        cx.notify();
+    }
+
+    /// A click on the flow map: a box opens that flow's canvas — centred on its first node
+    /// through [`Editor::show`], or, for an empty canvas, simply switched to. Anywhere else
+    /// does nothing, so a stray click cannot close the map.
+    fn on_map_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        self.open_menu = None;
+        let (x, y) = Self::window_pos(ev.position);
+        let flows = self.doc.map_flows();
+        let Some(flow) = map_hit(flows.len(), x, y).map(|i| flows[i].to_string()) else {
+            return;
+        };
+        let first = self.doc.nodes_in(&flow).next().map(|node| node.id);
+        match first {
+            Some(first) => self.show(first, window, cx),
+            None => {
+                self.flow = flow;
+                self.flow_map = false;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The map's arrows in pane pixels, one per [`Doc::flow_links`] entry, each from the
+    /// border of one box to the border of the other with its count. A pair of flows that
+    /// jump both ways gets two lines, each nudged to its own side so they do not overlap.
+    fn map_arrows(&self) -> Vec<MapArrow> {
+        /// How far apart the two lines of a two-way pair sit.
+        const SPLIT: f32 = 7.0;
+        /// How far a two-way pair's counts sit off their lines, each on its own side, so
+        /// the pair's two numbers never land on top of each other.
+        const LABEL_OUT: f32 = 16.0;
+
+        let flows = self.doc.map_flows();
+        let n = flows.len();
+        let middle = |flow: &str| {
+            let i = flows.iter().position(|f| *f == flow)?;
+            let (x, y) = map_cell(i, n);
+            Some((x + MAP_W / 2.0, y + MAP_H / 2.0))
+        };
+        let links = self.doc.flow_links();
+        links
+            .iter()
+            .filter_map(|(from, to, count)| {
+                let (a, b) = (middle(from)?, middle(to)?);
+                let both_ways = links.iter().any(|(f, t, _)| f == to && t == from);
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                // Perpendicular to the direction, so the reverse arrow lands on the other side.
+                let (nx, ny) = (-dy / len, dx / len);
+                let (split, out) = match both_ways {
+                    true => (SPLIT, LABEL_OUT),
+                    false => (0.0, 0.0),
+                };
+                let (a, b) = (
+                    (a.0 + nx * split, a.1 + ny * split),
+                    (b.0 + nx * split, b.1 + ny * split),
+                );
+                let (from, to) = (box_exit(a, MAP_W, MAP_H, b), box_exit(b, MAP_W, MAP_H, a));
+                let label = (
+                    (from.0 + to.0) / 2.0 + nx * out,
+                    (from.1 + to.1) / 2.0 + ny * out,
+                );
+                Some((from, to, label, *count))
+            })
+            .collect()
+    }
+
+    /// The flow map's boxes, arrow counts and hint — what the canvas pane holds instead of
+    /// nodes while the map is up.
+    fn map_children(&self) -> Vec<AnyElement> {
+        let flows = self.doc.map_flows();
+        let n = flows.len();
+        let boxes = flows.iter().enumerate().map(|(i, &flow)| {
+            let (x, y) = map_cell(i, n);
+            let nodes = self.doc.nodes_in(flow).count();
+            let lines = self.doc.stats(|node| node.flow == flow).lines;
+            let plural = |n: usize, one: &str| match n {
+                1 => format!("1 {one}"),
+                _ => format!("{n} {one}s"),
+            };
+            let on = flow == self.flow;
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(MAP_W))
+                .h(px(MAP_H))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap_1()
+                .p_2()
+                .bg(theme::RAISED)
+                .border_1()
+                .border_color(if on { theme::ACCENT } else { theme::OUTLINE })
+                .rounded_md()
+                .shadow_md()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .one_line()
+                        .text_color(theme::TEXT)
+                        .child(if flow.is_empty() { "(main)" } else { flow }.to_string()),
+                )
+                .child(
+                    div()
+                        .one_line()
+                        .text_color(theme::TEXT_FAINT)
+                        .child(match nodes {
+                            0 => "empty".to_string(),
+                            _ => format!("{} · {}", plural(nodes, "node"), plural(lines, "line")),
+                        }),
+                )
+                .into_any_element()
+        });
+        // Fixed width and centred content, like an edge label, so it centres unmeasured.
+        // Just the number: every arrow is jumps, and the hint says so once rather than each
+        // label saying it again in a gap too narrow for two of them.
+        let counts = self.map_arrows().into_iter().map(|(_, _, mid, count)| {
+            const W: f32 = 40.0;
+            div()
+                .absolute()
+                .left(px(mid.0 - W / 2.0))
+                .top(px(mid.1 - 10.0))
+                .w(px(W))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px_1()
+                        .bg(theme::CANVAS)
+                        .text_color(theme::KIND_JUMP)
+                        .child(count.to_string()),
+                )
+                .into_any_element()
+        });
+        let hint = div()
+            .absolute()
+            .left(px(12.0))
+            .bottom(px(10.0))
+            .text_color(theme::TEXT_FAINT)
+            .child(
+                "Flow map — arrows are jumps, numbered · click a flow to open it · Ctrl+M closes",
+            )
+            .into_any_element();
+        boxes.chain(counts).chain(std::iter::once(hint)).collect()
     }
 
     /// Selects an edge by index and shows whichever end of it still exists — the source
@@ -1569,7 +1814,7 @@ impl Editor {
             .into_iter()
             .find(|id| self.doc.node(*id).is_some());
         if let Some(id) = end {
-            self.show(id, window);
+            self.show(id, window, cx);
         }
         self.select(Selection::Edge(index), cx);
         window.focus(&self.focus_handle);
@@ -1640,8 +1885,24 @@ impl Render for Editor {
             self.fit_pending = false;
             self.fit_view(OPEN_FIT_MIN_ZOOM, window);
         }
-        let lines = self.edge_lines();
-        let pending = self.pending_edge();
+        // The map draws its arrows through the same paint closure as the canvas's edges.
+        let (lines, pending) = match self.flow_map {
+            true => (
+                self.map_arrows()
+                    .into_iter()
+                    .map(|(a, b, _, _)| {
+                        (
+                            point(px(a.0), px(a.1)),
+                            point(px(b.0), px(b.1)),
+                            theme::KIND_JUMP,
+                            EDGE_W,
+                        )
+                    })
+                    .collect(),
+                None,
+            ),
+            false => (self.edge_lines(), self.pending_edge()),
+        };
         let view = self.view;
         // Once per frame, for the status bar's badge, the drawer and the inspector's summary.
         let problems = self.doc.problems();
@@ -1667,21 +1928,26 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_run))
+            .on_action(cx.listener(Self::on_toggle_flow_map))
             .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_new_hub))
             .on_action(cx.listener(Self::on_new_jump))
             .on_action(cx.listener(Self::on_new_instruction))
             .on_action(cx.listener(Self::on_new_condition))
             .on_action(cx.listener(Self::on_new_note))
-            .on_action(cx.listener(Self::on_focus_canvas))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
             .on_action(cx.listener(Self::on_export_fluent))
+            .on_action(cx.listener(Self::on_export_screenplay))
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_play))
             .on_action(cx.listener(Self::on_play_from_here))
             .on_action(cx.listener(Self::on_stop_play))
+            // Here, on the root, and not on the canvas pane: an action reaches only the
+            // listeners between the root and the focused element, and Escape asks for the
+            // canvas back from a text field, which lives in a side pane beside the canvas.
+            .on_action(cx.listener(Self::on_focus_canvas))
             .relative()
             .flex()
             .flex_col()
@@ -1757,6 +2023,9 @@ impl Editor {
         view: View,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // The map ignores the canvas's zoom, so its arrowheads do too.
+        let head_zoom = if self.flow_map { 1.0 } else { view.zoom };
+        let map = self.flow_map;
         div()
             .key_context("Canvas")
             .track_focus(&self.focus_handle)
@@ -1788,7 +2057,7 @@ impl Editor {
                                     window.paint_path(line, color);
                                 }
                                 // The stroke stays a hairline at every zoom; only the head scales.
-                                if let Some(head) = arrow_head(to, from, view.zoom) {
+                                if let Some(head) = arrow_head(to, from, head_zoom) {
                                     window.paint_path(head, color);
                                 }
                             };
@@ -1806,59 +2075,79 @@ impl Editor {
                 .left(px(0.))
                 .size_full(),
             )
-            .children(self.doc.nodes_in(&self.flow).map(|node| {
-                let playing = self.play.as_ref().and_then(|path| path.last().copied());
+            .when(map, |this| this.children(self.map_children()))
+            .when(!map, |this| this.children(self.canvas_children(view)))
+    }
+
+    /// Everything the canvas pane draws over the edge lines when it is showing a canvas:
+    /// node boxes, labels, ports, the roots' rings and the marquee.
+    fn canvas_children(&self, view: View) -> Vec<AnyElement> {
+        let playing = self.play.as_ref().and_then(|path| path.last().copied());
+        let mut children: Vec<AnyElement> = self
+            .doc
+            .nodes_in(&self.flow)
+            .map(|node| {
                 let passed = self
                     .play
                     .as_ref()
                     .is_some_and(|path| path.contains(&node.id));
-                let jump_target = (node.kind == NodeKind::Jump)
+                let target = (node.kind == NodeKind::Jump)
                     .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
                     .flatten()
-                    .and_then(|to| self.doc.node(to))
-                    .map(|target| node_label(&self.doc, target));
+                    .and_then(|to| self.doc.node(to));
                 node_box(
                     node,
                     view,
-                    self.selection.nodes().contains(&node.id),
-                    playing == Some(node.id),
-                    passed,
-                    jump_target,
+                    NodeState {
+                        selected: self.selection.nodes().contains(&node.id),
+                        playing: playing == Some(node.id),
+                        passed,
+                    },
+                    target.map(|target| node_label(&self.doc, target)),
+                    target.map(|target| JumpPreview::of(&self.doc, target)),
                     speaker_color(&self.doc, &node.speaker, theme::SPEAKER_DEFAULT),
                 )
-            }))
-            // Over the nodes, not under them: a label that a node box painted over was cut off
-            // mid-word. Each is bounded to the gap it sits in, so it covers no text anyway.
-            .children(self.edge_labels())
-            .children(
-                self.doc
-                    .nodes_in(&self.flow)
-                    // A note takes no edges, so it gets no handle to drag one from —
-                    // `Doc::port_hit_test` skips it for the same reason.
-                    .filter(|node| node.kind != NodeKind::Note)
-                    .map(|node| port_dot(node, view)),
-            )
-            .children(
-                self.doc
-                    .roots()
-                    .into_iter()
-                    .filter_map(|id| self.doc.node(id))
-                    .filter(|node| node.flow == self.flow)
-                    .map(|node| root_dot(node, view)),
-            )
-            .when_some(self.marquee_rect(), |this, (origin, size)| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left(origin.x)
-                        .top(origin.y)
-                        .w(size.x)
-                        .h(size.y)
-                        .bg(theme::ACCENT_WASH)
-                        .border_1()
-                        .border_color(theme::ACCENT),
-                )
+                .into_any_element()
             })
+            .collect();
+        // Over the nodes, not under them: a label that a node box painted over was cut off
+        // mid-word. Each is bounded to the gap it sits in, so it covers no text anyway.
+        children.extend(
+            self.edge_labels()
+                .into_iter()
+                .map(IntoElement::into_any_element),
+        );
+        children.extend(
+            self.doc
+                .nodes_in(&self.flow)
+                // A note takes no edges, so it gets no handle to drag one from —
+                // `Doc::port_hit_test` skips it for the same reason.
+                .filter(|node| node.kind != NodeKind::Note)
+                .map(|node| port_dot(node, view).into_any_element()),
+        );
+        children.extend(
+            self.doc
+                .roots()
+                .into_iter()
+                .filter_map(|id| self.doc.node(id))
+                .filter(|node| node.flow == self.flow)
+                .map(|node| root_dot(node, view).into_any_element()),
+        );
+        if let Some((origin, size)) = self.marquee_rect() {
+            children.push(
+                div()
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .w(size.x)
+                    .h(size.y)
+                    .bg(theme::ACCENT_WASH)
+                    .border_1()
+                    .border_color(theme::ACCENT)
+                    .into_any_element(),
+            );
+        }
+        children
     }
 
     /// Choice text on each labelled edge, as a pill centred on the line's midpoint.
@@ -1990,9 +2279,18 @@ impl Editor {
         // ponytail: rescans every node each frame, but only while the overlay is open and a
         // query is typed — which is never while dragging. Cache it if searching a huge graph
         // ever stutters.
-        let hits = self.doc.find(&query);
+        let hits = self.doc.query(&query);
         let typed = !query.trim().is_empty();
         let more = hits.len().saturating_sub(MAX_ROWS);
+
+        // An idle search box lists the bookmarks too: every aliased node, the author's own
+        // landmarks. Under the field rather than in a panel of their own, since "take me
+        // somewhere" is the question both answer.
+        let bookmarks = match typed {
+            true => Vec::new(),
+            false => self.doc.bookmarks(),
+        };
+        let more_marks = bookmarks.len().saturating_sub(MAX_ROWS);
 
         deferred(
             div()
@@ -2023,15 +2321,63 @@ impl Editor {
                         .max_h(px(280.0))
                         .overflow_y_scroll()
                         .when(!typed, |this| {
-                            this.child(
-                                div()
-                                    .px_1()
-                                    .type_hint()
-                                    .child("Search speakers, lines and aliases."),
-                            )
+                            this.child(div().px_1().type_hint().child(
+                                "Search speakers, lines and aliases, or filter: speaker: kind: \
+                                 flow: sets: checks: is: has:",
+                            ))
                         })
-                        .when(typed && hits.is_empty(), |this| {
-                            this.child(div().px_1().type_hint().child("No matches."))
+                        .when(!bookmarks.is_empty(), |this| {
+                            this.child(div().px_1().pt_2().type_section().child("Bookmarks"))
+                                .children(bookmarks.iter().take(MAX_ROWS).filter_map(|&id| {
+                                    let node = self.doc.node(id)?;
+                                    Some(
+                                        div()
+                                            .id(("bookmark", id))
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(theme::HOVER))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_color(theme::TEXT)
+                                                    .child(node.alias.trim().to_string()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .one_line()
+                                                    .text_color(theme::TEXT_FAINT)
+                                                    .child(node_label(&self.doc, node)),
+                                            )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.jump_to(id, window, cx)
+                                            })),
+                                    )
+                                }))
+                                .when(more_marks > 0, |this| {
+                                    this.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .type_hint()
+                                            .child(format!("…and {more_marks} more")),
+                                    )
+                                })
+                        })
+                        // A filter can catch a lot more than a word does, so say how much.
+                        .when(typed, |this| {
+                            this.child(div().px_1().type_hint().child(match hits.len() {
+                                0 => "No matches.".to_string(),
+                                1 => "1 match".to_string(),
+                                n => format!("{n} matches"),
+                            }))
                         })
                         .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
                             let node = self.doc.node(id)?;
@@ -2055,7 +2401,7 @@ impl Editor {
                                             .min_w(px(0.0))
                                             .one_line()
                                             .text_color(theme::TEXT)
-                                            .child(node_label(&self.doc, node)),
+                                            .child(ref_label(&self.doc, node)),
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.jump_to(id, window, cx)
@@ -2090,7 +2436,11 @@ impl Editor {
             .renaming
             .clone()
             .filter(|rename| match (rename, self.pane) {
+                (Rename::Set(set), SidePane::Tags) => self.doc.tag_sets().contains(&set.as_str()),
                 (Rename::Set(set), _) => self.doc.all_sets().contains(&set.as_str()),
+                (Rename::Item(name), SidePane::Tags) => {
+                    self.doc.all_tags().contains(&name.as_str())
+                }
                 (Rename::Item(name), SidePane::Variables) => self.doc.variable(name).is_some(),
                 (Rename::Item(name), SidePane::Cast) => self.doc.character(name).is_some(),
                 (Rename::Item(name), SidePane::Flows) => {
@@ -2100,18 +2450,34 @@ impl Editor {
         let is_rename = renaming.is_some();
         let renaming_set = matches!(renaming, Some(Rename::Set(_)));
         let pane = self.pane;
+        // Owned for the same reason the flow names are: the picker chips borrow `cx`. The
+        // Tags tab groups by the same dotted convention, so it gets the same picker.
+        let sets: Vec<String> = match pane {
+            SidePane::Tags => self.doc.tag_sets(),
+            _ => self.doc.all_sets(),
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         // Aimed at a set the document no longer has is aimed at nothing, exactly as above.
-        let set = match self.doc.all_sets().contains(&self.set.as_str()) {
+        let set = match sets.contains(&self.set) {
             true => self.set.clone(),
             false => String::new(),
         };
-        // Owned for the same reason the flow names are: the picker chips borrow `cx`.
-        let sets: Vec<String> = self
-            .doc
-            .all_sets()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let selected: Vec<NodeId> = self.selection.nodes().to_vec();
+        // Tags grouped the way variables are below, by the set in the name.
+        let mut tag_groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for tag in self.doc.all_tags() {
+            let set = split_set(tag).0.map(str::to_string);
+            match tag_groups.iter_mut().find(|(s, _)| *s == set) {
+                Some((_, rows)) => rows.push(tag.to_string()),
+                None => tag_groups.push((set, vec![tag.to_string()])),
+            }
+        }
+        // Ungrouped tags lead, then each set in order — `all_tags` is sorted, but a set's
+        // first tag can sort after a loose one.
+        tag_groups.sort_by_key(|(set, _)| set.as_ref().map(|s| s.to_lowercase()));
+        let any_tag_sets = tag_groups.iter().any(|(set, _)| set.is_some());
         // Owned, so the rows can borrow `cx` mutably. The main flow leads, then every other
         // canvas the document has — declared or merely stood on, so no node is unreachable.
         let flows: Vec<String> = std::iter::once(String::new())
@@ -2162,14 +2528,18 @@ impl Editor {
                             (SidePane::Variables, "Variables", "pane-variables"),
                             (SidePane::Cast, "Cast", "pane-cast"),
                             (SidePane::Flows, "Flows", "pane-flows"),
+                            (SidePane::Tags, "Tags", "pane-tags"),
                         ]
                         .map(|(pane, label, element_id)| {
                             let on = pane == self.pane;
                             div()
                                 .id(element_id)
-                                .flex_1()
+                                // Sized by content, then shared out: four equal quarters of
+                                // this pane are narrower than "Variables" is.
+                                .flex_auto()
                                 .flex()
                                 .justify_center()
+                                .px_1()
                                 .py_1()
                                 .rounded_sm()
                                 .cursor_pointer()
@@ -2213,6 +2583,64 @@ impl Editor {
                         SidePane::Cast => list.children(
                             (0..self.doc.characters.len())
                                 .map(|i| self.cast_row(i, playing.is_some(), cx)),
+                        ),
+                        SidePane::Tags if tag_groups.is_empty() => list.child(
+                            div()
+                                .text_color(theme::TEXT_FAINT)
+                                .child("No tags yet. Select nodes and tag them below."),
+                        ),
+                        SidePane::Tags => list.children(
+                            tag_groups
+                                .into_iter()
+                                .enumerate()
+                                .map(|(g, (header, rows))| {
+                                    let rows: Vec<_> = rows
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, tag)| {
+                                            self.tag_row(g * 1000 + i, tag, playing.is_some(), cx)
+                                        })
+                                        .collect();
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .when(any_tag_sets, |this| {
+                                            this.child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
+                                                            .text_color(theme::TEXT_FAINT)
+                                                            .one_line()
+                                                            .child(header.clone().unwrap_or_else(
+                                                                || "(ungrouped)".to_string(),
+                                                            )),
+                                                    )
+                                                    .when_some(
+                                                        header.filter(|_| playing.is_none()),
+                                                        |this, name| {
+                                                            this.child(
+                                                                self.set_rename_button(&name, cx),
+                                                            )
+                                                        },
+                                                    ),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .when(any_tag_sets, |this| this.pl_2())
+                                                .children(rows),
+                                        )
+                                })
+                                .collect::<Vec<_>>(),
                         ),
                         SidePane::Flows => list.children(
                             flows
@@ -2266,6 +2694,37 @@ impl Editor {
                         })),
                     }),
             )
+            // The foot: the whole cast's dialogue on the Cast tab, the open canvas's on the
+            // Flows tab — the one a click on a flow row has just switched to.
+            .map(|this| {
+                let (whose, count) = match pane {
+                    SidePane::Variables | SidePane::Tags => return this,
+                    SidePane::Cast => ("Whole cast".to_string(), self.doc.stats(|_| true)),
+                    SidePane::Flows => {
+                        let flow = self.flow.as_str();
+                        let whose = if flow.is_empty() { "(main)" } else { flow };
+                        (format!("On {whose}"), self.doc.stats(|node| node.flow == flow))
+                    }
+                };
+                let plural = |n: usize, one: &str| match n {
+                    1 => format!("1 {one}"),
+                    _ => format!("{n} {one}s"),
+                };
+                this.child(
+                    div()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(theme::DIVIDER)
+                        .text_color(theme::TEXT_FAINT)
+                        // Two lines, since a flow name and both counts overflow the pane.
+                        .child(div().one_line().child(whose))
+                        .child(div().one_line().child(format!(
+                            "{} · {}",
+                            plural(count.lines, "line"),
+                            plural(count.words, "word")
+                        ))),
+                )
+            })
             .when(playing.is_none(), |this| {
                 this.when_some(renaming.clone(), |this, old| {
                     let what = match old {
@@ -2275,10 +2734,13 @@ impl Editor {
                     this.child(div().type_label().one_line().child(what))
                 })
                 // Only above the variables, and not while the field holds a set name.
-                .when(pane == SidePane::Variables && !renaming_set, |this| {
-                    this.child(div().type_section().pt_2().child("DECLARE IN SET"))
-                        .child(self.set_picker(&set, &sets, cx))
-                })
+                .when(
+                    matches!(pane, SidePane::Variables | SidePane::Tags) && !renaming_set,
+                    |this| {
+                        this.child(div().type_section().pt_2().child("DECLARE IN SET"))
+                            .child(self.set_picker(&set, &sets, cx))
+                    },
+                )
                 .child(
                 div()
                     .flex()
@@ -2305,10 +2767,23 @@ impl Editor {
                                 // name; the picker holds the set. Not when it is renaming a
                                 // set, where the field *is* the set name.
                                 let name = match (pane, renaming_set) {
-                                    (SidePane::Variables, false) => join_set(&set, typed.trim()),
+                                    (SidePane::Variables | SidePane::Tags, false) => {
+                                        join_set(&set, typed.trim())
+                                    }
                                     _ => typed,
                                 };
-                                let free = match (pane, renaming_set) {
+                                let free = match (pane, &renaming) {
+                                    // A tag rename merges rather than refuses, so the only
+                                    // question is whether it would change anything; a new
+                                    // tag goes onto the selection, and only if some of it
+                                    // lacks it.
+                                    (SidePane::Tags, Some(Rename::Item(old) | Rename::Set(old))) => {
+                                        this.doc.tag_rename_ok(old, &name)
+                                    }
+                                    (SidePane::Tags, None) => this.doc.can_tag(&selected, &name),
+                                    _ => true,
+                                } && match (pane, renaming_set) {
+                                    (SidePane::Tags, _) => true,
                                     (_, true) => this.doc.set_name_free(&name),
                                     (SidePane::Cast, _) => this.doc.character_name_free(&name),
                                     (SidePane::Variables, _) => {
@@ -2319,8 +2794,33 @@ impl Editor {
                                 if !free {
                                     return;
                                 }
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 match (&renaming, pane) {
+                                    // A tag, or a whole group of them: every node carrying
+                                    // one follows, and the search that found them too.
+                                    (Some(Rename::Item(old) | Rename::Set(old)), SidePane::Tags) => {
+                                        let moved = this.doc.rename_tag(old, &name);
+                                        let s = if moved == 1 { "" } else { "s" };
+                                        let name = clean_tag(&name).unwrap_or_default();
+                                        if this.set == *old {
+                                            this.set = name.clone();
+                                        }
+                                        this.set_status(
+                                            format!(
+                                                "Renamed #{old} to #{name} — {moved} node{s}."
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                    (None, SidePane::Tags) => {
+                                        let tagged = this.doc.add_tag(&selected, &name);
+                                        let s = if tagged == 1 { "" } else { "s" };
+                                        let name = clean_tag(&name).unwrap_or_default();
+                                        this.set_status(
+                                            format!("Tagged {tagged} node{s} #{name}."),
+                                            cx,
+                                        );
+                                    }
                                     // Every dotted name in the set follows, and so does
                                     // every effect and check naming one.
                                     (Some(Rename::Set(old)), _) => {
@@ -2342,9 +2842,20 @@ impl Editor {
                                         let moved = this.doc.rename_character(old, &name);
                                         let s = if moved == 1 { "" } else { "s" };
                                         let name = name.trim();
+                                        // The rename rewrites who speaks, never what is said,
+                                        // so say how much prose still has the old name in it.
+                                        let left = this
+                                            .doc
+                                            .mentions(&Ref::Character(old.clone()))
+                                            .len();
+                                        let still = match left {
+                                            0 => String::new(),
+                                            1 => format!(" 1 line still says \"{old}\"."),
+                                            n => format!(" {n} lines still say \"{old}\"."),
+                                        };
                                         this.set_status(
                                             format!(
-                                                "Renamed \"{old}\" to \"{name}\" — {moved} line{s}."
+                                                "Renamed \"{old}\" to \"{name}\" — {moved} line{s}.{still}"
                                             ),
                                             cx,
                                         );
@@ -2428,17 +2939,34 @@ impl Editor {
     /// not a target any more, which is the filtering `renaming` gets and for the same reason:
     /// one place, rather than every site that could invalidate it.
     fn editing_target(&self) -> Option<&ValueTarget> {
+        // And still a number: retyped to a flag, the variable's row draws a checkbox with
+        // no editor in it, and an editor left aimed at it would write a number onto a flag.
+        let is_int = |name: &str| {
+            self.doc
+                .variable(name)
+                .is_some_and(|variable| matches!(variable.default, Value::Int(_)))
+        };
         self.editing.as_ref().filter(|target| match target {
-            ValueTarget::Default(name) => self.doc.variable(name).is_some(),
-            ValueTarget::Effect(id, _) | ValueTarget::Check(id, _) => self.doc.node(*id).is_some(),
+            ValueTarget::Default(name) => is_int(name),
+            ValueTarget::Effect(id, name) | ValueTarget::Check(id, name) => {
+                self.doc.node(*id).is_some() && is_int(name)
+            }
         })
     }
 
-    /// Aims the number editor at `target`, starting from the number that is there now.
-    fn edit_value(&mut self, target: ValueTarget, from: i64, cx: &mut Context<Self>) {
+    /// Aims the number editor at `target`, starting from the number that is there now, and
+    /// puts the cursor in it.
+    fn edit_value(
+        &mut self,
+        target: ValueTarget,
+        from: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editing = Some(target);
         self.value_input
             .update(cx, |input, cx| input.set_content(&from.to_string(), cx));
+        window.focus(&self.value_input.read(cx).focus_handle(cx));
         cx.notify();
     }
 
@@ -2458,15 +2986,16 @@ impl Editor {
             .text_color(theme::ACCENT)
             .hover(|style| style.bg(theme::HOVER))
             .child(n.to_string())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.edit_value(target.clone(), n, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.edit_value(target.clone(), n, window, cx);
             }))
     }
 
-    /// The number field and its commit button, drawn in place of whatever value the author
-    /// clicked. One field for the whole crate, so there is never a second half-typed number
-    /// lying around. A number that will not parse is simply refused, and the field keeping
-    /// its content is what says so — the same idiom as a duplicate variable name.
+    /// The number field, its commit button and its cancel button, drawn in place of
+    /// whatever value the author clicked. One field for the whole crate, so there is never
+    /// a second half-typed number lying around. A number that will not parse is simply
+    /// refused, and the field keeping its content is what says so — the same idiom as a
+    /// duplicate variable name; `✗` puts the number that was there back.
     fn value_editor(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let target = self.editing.clone();
         div()
@@ -2484,7 +3013,12 @@ impl Editor {
                     .hover(|style| style.text_color(theme::TEXT))
                     .child("✓")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(target) = target.clone() else {
+                        // Checked again at the click and not only at render, since the
+                        // document can move on between the two.
+                        let Some(target) = target
+                            .clone()
+                            .filter(|target| this.editing_target() == Some(target))
+                        else {
                             return;
                         };
                         let Ok(n) = this.value_input.read(cx).content().trim().parse::<i64>()
@@ -2492,7 +3026,7 @@ impl Editor {
                             return;
                         };
                         let value = Value::Int(n);
-                        this.doc.checkpoint();
+                        this.checkpoint();
                         match &target {
                             ValueTarget::Default(name) => this.doc.set_default(name, value),
                             // The operator is not what is being edited here, so it is read
@@ -2506,6 +3040,21 @@ impl Editor {
                                 this.doc.set_condition(*id, name, Some(value), op);
                             }
                         }
+                        this.editing = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("value-cancel")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme::TEXT_FAINT)
+                    .hover(|style| style.text_color(theme::TEXT))
+                    .child("✗")
+                    // Not an edit, so no checkpoint: nothing was written yet.
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.editing = None;
                         cx.notify();
                     })),
@@ -2607,8 +3156,11 @@ impl Editor {
         let editing = self
             .editing_target()
             .is_some_and(|target| *target == ValueTarget::Default(name.clone()));
+        let target = Ref::Variable(variable.name.clone());
+        let used_by = self.used_by_toggle(("var-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
 
-        div()
+        let row = div()
             .flex()
             .gap_2()
             .items_center()
@@ -2627,7 +3179,7 @@ impl Editor {
                         this.cursor_pointer()
                             .hover(|style| style.text_color(theme::TEXT))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 this.doc.set_default(&name, Value::Bool(!on));
                                 cx.notify();
                             }))
@@ -2658,6 +3210,7 @@ impl Editor {
                     })
                     .into_any_element(),
             })
+            .when(!editing, |this| this.child(used_by))
             .when(playing.is_none() && !editing, |this| {
                 this.child(
                     // The one place a variable's type changes. Lit when it holds a number,
@@ -2675,7 +3228,7 @@ impl Editor {
                         .hover(|style| style.text_color(theme::TEXT))
                         .child("#")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             let to = if is_int {
                                 Value::Bool(false)
                             } else {
@@ -2724,7 +3277,7 @@ impl Editor {
                         .hover(|style| style.text_color(theme::DANGER))
                         .child("×")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             // Effects naming it go with it, so say how many.
                             let dropped = this.doc.remove_variable(&to_remove);
                             if dropped > 0 {
@@ -2737,7 +3290,8 @@ impl Editor {
                             cx.notify();
                         })),
                 )
-            })
+            });
+        div().flex().flex_col().child(row).children(open)
     }
 
     /// A row of the Flows list: the canvas name, how many nodes stand on it, and the
@@ -2754,13 +3308,15 @@ impl Editor {
         // Owns everything it draws and borrows nothing back, like its two sibling rows.
     ) -> impl IntoElement + use<> {
         let on = self.flow == flow;
-        let count = self.doc.nodes_in(&flow).count();
         let main = flow.is_empty();
+        let target = Ref::Flow(flow.clone());
+        let used_by = self.used_by_toggle(("flow-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
         let selected = self.selection.nodes().len();
         let (to_show, to_rename, to_remove, to_move) =
             (flow.clone(), flow.clone(), flow.clone(), flow.clone());
 
-        div()
+        let row = div()
             .flex()
             .gap_2()
             .items_center()
@@ -2776,12 +3332,9 @@ impl Editor {
                     .child(if main { "(main)".to_string() } else { flow })
                     .on_click(cx.listener(move |this, _, _, cx| this.show_flow(&to_show, cx))),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme::TEXT_FAINT)
-                    .child(count.to_string()),
-            )
+            // How many nodes stand on it, which opens the list of them — the canvas itself
+            // shows them too, but not while another one is on screen.
+            .child(used_by)
             .when(!playing && selected > 0 && !on, |this| {
                 this.child(
                     div()
@@ -2795,7 +3348,7 @@ impl Editor {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let ids = this.selection.nodes().to_vec();
                             let count = ids.len();
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             let cut = this.doc.move_to_flow(&ids, &to_move);
                             let s = if count == 1 { "" } else { "s" };
                             // The nodes just left this canvas, so nothing is selected on it.
@@ -2847,7 +3400,7 @@ impl Editor {
                         // The nodes come back to the main flow rather than going with it:
                         // deleting a canvas must not delete what is drawn on it.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             let moved = this.doc.remove_flow(&to_remove);
                             if this.flow == *to_remove {
                                 this.flow.clear();
@@ -2860,7 +3413,149 @@ impl Editor {
                             cx.notify();
                         })),
                 )
+            });
+        div().flex().flex_col().child(row).children(open)
+    }
+
+    /// One row of the Tags tab: the tag, how many nodes carry it (the "Used by" toggle), a
+    /// `+` that puts it on the selection when some of it lacks the tag — the picking half,
+    /// so an existing tag is clicked rather than retyped — and rename. Clicking the name
+    /// searches for it. There is no remove: a tag nobody carries is not in the list, so
+    /// taking it off the nodes (from the inspector) is the whole of removing one.
+    fn tag_row(
+        &self,
+        i: usize,
+        tag: String,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let target = Ref::Tag(tag.clone());
+        let used_by = self.used_by_toggle(("tag-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
+        let can_tag = self.doc.can_tag(self.selection.nodes(), &tag);
+        let shown = format!("#{}", split_set(&tag).1);
+        let (to_find, to_add, to_rename) = (tag.clone(), tag.clone(), tag);
+
+        let row = div()
+            .flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .id(("tag-name", i))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .one_line()
+                    .cursor_pointer()
+                    .text_color(theme::TEXT_MUTED)
+                    .hover(|style| style.text_color(theme::TEXT))
+                    .child(shown)
+                    // Only the search box changes, so no checkpoint.
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let query = format!("tag:{to_find}");
+                        this.search_input
+                            .update(cx, |input, cx| input.set_content(&query, cx));
+                        cx.notify();
+                    })),
+            )
+            .child(used_by)
+            .when(!playing && can_tag, |this| {
+                this.child(
+                    div()
+                        .id(("tag-add", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::TEXT))
+                        .child("+")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let ids = this.selection.nodes().to_vec();
+                            if !this.doc.can_tag(&ids, &to_add) {
+                                return;
+                            }
+                            this.checkpoint();
+                            let tagged = this.doc.add_tag(&ids, &to_add);
+                            let s = if tagged == 1 { "" } else { "s" };
+                            this.set_status(format!("Tagged {tagged} node{s} #{to_add}."), cx);
+                            cx.notify();
+                        })),
+                )
             })
+            .when(!playing, |this| {
+                this.child(
+                    div()
+                        .id(("tag-rename", i))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme::TEXT_FAINT)
+                        .hover(|style| style.text_color(theme::TEXT))
+                        .child("\u{270e}")
+                        // Not an edit yet, so no checkpoint — it only aims the shared field.
+                        // Split the way the declare field is joined, as a variable's rename
+                        // is: the picker holds the set, so a chip clicked mid-rename moves
+                        // the tag between sets rather than prefixing the set a second time.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let (set, rest) = split_set(&to_rename);
+                            this.set = set.unwrap_or_default().to_string();
+                            this.renaming = Some(Rename::Item(to_rename.clone()));
+                            this.var_input
+                                .update(cx, |input, cx| input.set_content(rest, cx));
+                            cx.notify();
+                        })),
+                )
+            });
+        div().flex().flex_col().child(row).children(open)
+    }
+
+    /// The inspector's tags: one chip per tag the node carries, each with a `×` that takes
+    /// it off. Tags are put *on* from the Tags tab, which works for a whole selection.
+    fn tag_chips(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let tags = self
+            .doc
+            .node(id)
+            .map(|node| node.tags.clone())
+            .unwrap_or_default();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .items_center()
+            .when(tags.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(theme::TEXT_FAINT)
+                        .child("none — add from the Tags tab"),
+                )
+            })
+            .children(tags.into_iter().enumerate().map(|(i, tag)| {
+                let label = format!("#{tag}");
+                div()
+                    .flex()
+                    .gap_1()
+                    .px_2()
+                    .rounded_sm()
+                    .bg(theme::RAISED)
+                    .text_color(theme::TEXT_MUTED)
+                    .child(label)
+                    .child(
+                        div()
+                            .id(("tag-off", i))
+                            .cursor_pointer()
+                            .text_color(theme::TEXT_FAINT)
+                            .hover(|style| style.text_color(theme::DANGER))
+                            .child("\u{d7}")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.doc.node(id).is_some_and(|n| n.tags.contains(&tag)) {
+                                    return;
+                                }
+                                this.checkpoint();
+                                this.doc.remove_tag(id, &tag);
+                                cx.notify();
+                            })),
+                    )
+            }))
     }
 
     /// One row of the cast list: the character's colour, their name, and the rename and
@@ -2876,11 +3571,20 @@ impl Editor {
         let character = &self.doc.characters[i];
         let color = character.color;
         let name = character.name.clone();
+        let target = Ref::Character(name.clone());
+        let used_by = self.used_by_toggle(("cast-refs", i), &target, cx);
+        let open = (self.used_by.as_ref() == Some(&target)).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(self.used_by_list(&target, cx))
+                .children(self.mentions_list(&target, cx))
+        });
         let to_recolor = name.clone();
         let to_rename = name.clone();
         let to_remove = name.clone();
 
-        div()
+        let row = div()
             .flex()
             .gap_2()
             .items_center()
@@ -2899,7 +3603,7 @@ impl Editor {
                                 let at = CAST_COLORS.iter().position(|c| *c == color);
                                 let next =
                                     CAST_COLORS[at.map_or(0, |at| (at + 1) % CAST_COLORS.len())];
-                                this.doc.checkpoint();
+                                this.checkpoint();
                                 this.doc.set_character_color(&to_recolor, next);
                                 cx.notify();
                             }))
@@ -2913,6 +3617,10 @@ impl Editor {
                     .text_color(theme::TEXT)
                     .child(name),
             )
+            // How many lines they speak — the number casting asks first, and the flow row's
+            // node count is its sibling — which opens the list of those lines. Words go at
+            // the foot of the tab, where there is width for them.
+            .child(used_by)
             .when(!playing, |this| {
                 this.child(
                     div()
@@ -2943,12 +3651,237 @@ impl Editor {
                         // Undeclaring only: the nodes keep saying the name, and the problem
                         // list is what points out that nobody declared it.
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.doc.checkpoint();
+                            this.checkpoint();
                             this.doc.remove_character(&to_remove);
                             cx.notify();
                         })),
                 )
+            });
+        div().flex().flex_col().child(row).children(open)
+    }
+
+    /// The count that opens a row's "Used by" list: how many nodes refer to the name, lit
+    /// while its list is open. Clicking it is view state, never an edit, so it stays live
+    /// during play — looking up where a flag is set is exactly what a play-through prompts.
+    fn used_by_toggle(
+        &self,
+        id: (&'static str, usize),
+        target: &Ref,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let mut nodes: Vec<NodeId> = self
+            .doc
+            .references(target)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        nodes.dedup();
+        // A cast row counts lines, the number the Cast foot adds up; a speaker on a blank
+        // node still shows up in the list, since that node does name them.
+        let count = match target {
+            Ref::Character(name) => self.doc.stats(|node| node.speaker == *name).lines,
+            _ => nodes.len(),
+        };
+        let open = self.used_by.as_ref() == Some(target);
+        let target = target.clone();
+        div()
+            .id(id)
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_color(if open {
+                theme::ACCENT
+            } else {
+                theme::TEXT_FAINT
             })
+            .hover(|style| style.text_color(theme::TEXT))
+            .child(count.to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.used_by = match this.used_by.take() {
+                    Some(open) if open == target => None,
+                    _ => Some(target.clone()),
+                };
+                cx.notify();
+            }))
+    }
+
+    /// Every node that refers to `target`, one clickable row each, jumping through
+    /// `jump_to` — so a row on another canvas crosses to it with no arm of its own. Shared
+    /// by the left pane's rows and the inspector's "Linked from", which differ only in
+    /// what they ask [`Doc::references`] about.
+    fn used_by_list(&self, target: &Ref, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        /// Past this the list stops being scannable in a pane this narrow.
+        const MAX_ROWS: usize = 12;
+
+        let found = self.doc.references(target);
+        let more = found.len().saturating_sub(MAX_ROWS);
+        let rows: Vec<_> = found
+            .into_iter()
+            .take(MAX_ROWS)
+            .enumerate()
+            .filter_map(|(row, (id, how))| {
+                let node = self.doc.node(id)?;
+                // Under a variable the row is already about that variable, so it says what
+                // the node does to it — `sets = true` — rather than repeating the name.
+                let what = match (target, how) {
+                    (Ref::Variable(var), Use::Writes) => self.doc.effect_of(id, var).map(|e| {
+                        format!(
+                            "{} sets {} {}",
+                            node_number(&self.doc, id),
+                            e.op.symbol(),
+                            e.value
+                        )
+                    }),
+                    (Ref::Variable(var), Use::Reads) => self.doc.condition_of(id, var).map(|c| {
+                        format!(
+                            "{} checks {} {}",
+                            node_number(&self.doc, id),
+                            c.op.symbol(),
+                            c.want
+                        )
+                    }),
+                    // Under a character, likewise: the line, not who says it.
+                    (Ref::Character(_), _) => Some(match node.text.trim() {
+                        "" => node_number(&self.doc, id),
+                        text => text.to_string(),
+                    }),
+                    _ => None,
+                };
+                let verb = if how == Use::LeadsHere && node.kind == NodeKind::Jump {
+                    "↪ "
+                } else {
+                    ""
+                };
+                let elsewhere = match node.flow.as_str() {
+                    flow if flow == self.flow => String::new(),
+                    "" => " · (main)".to_string(),
+                    flow => format!(" · {flow}"),
+                };
+                let what = what.unwrap_or_else(|| format!("{verb}{}", ref_label(&self.doc, node)));
+                let label = format!("{what}{elsewhere}");
+                Some(
+                    div()
+                        .id(("used-by", row))
+                        .px_1()
+                        .rounded_sm()
+                        .one_line()
+                        .cursor_pointer()
+                        .text_color(theme::TEXT_MUTED)
+                        .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                        .child(label)
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.jump_to(id, window, cx)),
+                        ),
+                )
+            })
+            .collect();
+        let empty = rows.is_empty();
+
+        div()
+            .flex()
+            .flex_col()
+            .ml_3()
+            .mb_1()
+            .pl_1()
+            .border_l_1()
+            .border_color(theme::DIVIDER)
+            .when(empty, |this| {
+                this.child(div().text_color(theme::TEXT_FAINT).child(match target {
+                    Ref::Node(_) => "Nothing leads here — a start.",
+                    _ => "Used nowhere.",
+                }))
+            })
+            .children(rows)
+            .when(more > 0, |this| {
+                this.child(
+                    div()
+                        .text_color(theme::TEXT_FAINT)
+                        .child(format!("…and {more} more")),
+                )
+            })
+    }
+
+    /// "Mentioned in": the prose that names `target` without a link to it, from
+    /// [`Doc::mentions`] — `None` when there is none, so a heading never sits over an empty
+    /// list. Each row shows the text around the name, since the name is the point and a
+    /// line truncated from its start could hide it. It never offers to fix a row: clicking
+    /// goes to it, and the author edits the line.
+    fn mentions_list(
+        &self,
+        target: &Ref,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        const MAX_ROWS: usize = 12;
+
+        let name = match target {
+            Ref::Character(name) => name.clone(),
+            Ref::Node(id) => self.doc.node(*id)?.alias.trim().to_string(),
+            _ => return None,
+        };
+        let found = self.doc.mentions(target);
+        if found.is_empty() {
+            return None;
+        }
+        let more = found.len().saturating_sub(MAX_ROWS);
+        let rows: Vec<_> = found
+            .into_iter()
+            .take(MAX_ROWS)
+            .enumerate()
+            .filter_map(|(row, at)| {
+                let text = match at {
+                    Mention::Node(id) => self.doc.node(id)?.text.as_str(),
+                    Mention::Edge(index) => self.doc.edges.get(index)?.label.as_str(),
+                };
+                let quote = snippet(text, &name);
+                let label = match at {
+                    Mention::Node(_) => quote,
+                    Mention::Edge(_) => format!("choice · {quote}"),
+                };
+                Some(
+                    div()
+                        .id(("mention", row))
+                        .px_1()
+                        .rounded_sm()
+                        .one_line()
+                        .cursor_pointer()
+                        .text_color(theme::TEXT_MUTED)
+                        .hover(|style| style.bg(theme::HOVER).text_color(theme::TEXT))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| match at {
+                            Mention::Node(id) => this.jump_to(id, window, cx),
+                            // A choice is found on the canvas at the node it leaves, and
+                            // selected as itself so the Choice field is right there.
+                            Mention::Edge(index) => this.select_edge(index, window, cx),
+                        })),
+                )
+            })
+            .collect();
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(div().type_section().child("MENTIONED IN"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .ml_3()
+                        .mb_1()
+                        .pl_1()
+                        .border_l_1()
+                        .border_color(theme::DIVIDER)
+                        .children(rows)
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .text_color(theme::TEXT_FAINT)
+                                    .child(format!("…and {more} more")),
+                            )
+                        }),
+                ),
+        )
     }
 
     /// What the instructions between the previous node the player saw and the current one
@@ -3058,8 +3991,8 @@ impl Editor {
                     .map(|(var, op, value)| {
                         div().text_color(theme::KIND_INSTRUCTION).child(format!(
                             "{var} {} {}",
-                            set_text(op),
-                            value_text(value)
+                            op.symbol(),
+                            value
                         ))
                     }),
             )
@@ -3118,7 +4051,7 @@ impl Editor {
                                         return;
                                     };
                                     this.doc.step_back(&mut path);
-                                    this.follow(&path, window);
+                                    this.follow(&path, window, cx);
                                     this.play = Some(path);
                                     cx.notify();
                                 }),
@@ -3699,7 +4632,7 @@ impl Editor {
                         if this.doc.node(id).is_none_or(|node| node.kind == kind) {
                             return;
                         }
-                        this.doc.checkpoint();
+                        this.checkpoint();
                         this.doc.set_kind(id, kind);
                         // Changing kind in place does not reload the fields.
                         this.text_input
@@ -3753,11 +4686,11 @@ impl Editor {
                             VarRow::Sets => self
                                 .doc
                                 .effect_of(id, &variable.name)
-                                .map(|e| (e.value, set_text(e.op))),
+                                .map(|e| (e.value, e.op.symbol())),
                             VarRow::Checks => self
                                 .doc
                                 .condition_of(id, &variable.name)
-                                .map(|c| (c.want, cmp_text(c.op))),
+                                .map(|c| (c.want, c.op.symbol())),
                         };
                         // A flag is a checkbox; a number has no box to tick, so it shows the
                         // operator there instead and the value beside the name.
@@ -3795,7 +4728,7 @@ impl Editor {
                                     .child(glyph)
                                     .child(variable.name.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.doc.checkpoint();
+                                        this.checkpoint();
                                         // One gesture per side, both ending back at cleared:
                                         // a flag cycles its two states, a number cycles its
                                         // operators and keeps whatever value it already had.
@@ -3885,7 +4818,7 @@ impl Editor {
                 if this.doc.edges.get(index).is_none() {
                     return;
                 }
-                this.doc.checkpoint();
+                this.checkpoint();
                 this.doc.edges[index].branch = !this.doc.edges[index].branch;
                 cx.notify();
             }))
@@ -3908,7 +4841,7 @@ impl Editor {
                 if this.doc.edges.get(index).is_none() {
                     return;
                 }
-                this.doc.checkpoint();
+                this.checkpoint();
                 this.doc.edges[index].once = !this.doc.edges[index].once;
                 cx.notify();
             }))
@@ -3931,7 +4864,7 @@ impl Editor {
                 if this.doc.node(id).is_none() {
                     return;
                 }
-                this.doc.checkpoint();
+                this.checkpoint();
                 if let Some(node) = this.doc.node_mut(id) {
                     node.end = !node.end;
                 }
@@ -4052,6 +4985,24 @@ impl Editor {
                                 this.child(self.end_toggle(id, cx))
                             }),
                     ))
+                    // Every kind, like the alias: a tag is orthogonal to `NodeKind`. Put on
+                    // from the Tags tab, which works for a whole selection; taken off here.
+                    .child(section("Tags", self.tag_chips(id, cx)))
+                    // A note takes no edges, so nothing can ever lead to one.
+                    .when(kind != NodeKind::Note, |this| {
+                        this.child(section(
+                            "Linked from",
+                            self.used_by_list(&Ref::Node(id), cx),
+                        ))
+                    })
+                    // Only an aliased node has a name prose could use.
+                    .children(self.mentions_list(&Ref::Node(id), cx).map(|list| {
+                        div()
+                            .pt_4()
+                            .border_t_1()
+                            .border_color(theme::DIVIDER)
+                            .child(list)
+                    }))
                     .into_any_element()
             }
             (None, Selection::Nodes(ids)) => div()
@@ -4304,11 +5255,61 @@ fn node_number(doc: &Doc, id: NodeId) -> String {
 
 /// How a node reads in a list: what it says, or who says it, or its position as a last resort.
 fn node_label(doc: &Doc, node: &Node) -> String {
-    match (node.speaker.trim(), node.text.trim()) {
+    // Only a speech node has a speaker: a hub converted from one still carries the
+    // field, and must not read as a line somebody says.
+    let speaker = match node.kind {
+        NodeKind::Speech => node.speaker.trim(),
+        _ => "",
+    };
+    match (speaker, node.text.trim()) {
         ("", "") => node_number(doc, node.id),
         ("", text) => text.to_string(),
         (speaker, "") => speaker.to_string(),
         (speaker, text) => format!("{speaker} — {text}"),
+    }
+}
+
+/// The kinds whose Text field the inspector draws — and so the only ones a double-click
+/// may send the keyboard into. Focus on a field that is not rendered lands nowhere, and
+/// every shortcut is dead until the canvas is clicked again.
+fn has_text_field(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::Speech | NodeKind::Hub | NodeKind::Note)
+}
+
+/// How a node reads in a "Used by" row: what it says, or, for the logic kinds that say
+/// nothing, what they do — a list of eight rows reading "Node 7" is no list at all.
+fn ref_label(doc: &Doc, node: &Node) -> String {
+    let joined = |parts: Vec<String>, sep: &str| parts.join(sep);
+    match node.kind {
+        NodeKind::Instruction if !node.effects.is_empty() => joined(
+            node.effects
+                .iter()
+                .map(|e| format!("{} {} {}", e.var, e.op.symbol(), e.value))
+                .collect(),
+            ", ",
+        ),
+        NodeKind::Condition if !node.conditions.is_empty() => joined(
+            node.conditions
+                .iter()
+                .map(|c| format!("{} {} {}", c.var, c.op.symbol(), c.want))
+                .collect(),
+            " and ",
+        ),
+        // A jump says nothing and does nothing on its own, so it is named by what leads into
+        // it: "↪ from Two coppers a night" is which branch returns here.
+        NodeKind::Jump => match doc.references(&Ref::Node(node.id)).first() {
+            Some(&(from, _)) => match doc.node(from) {
+                // One level only: a ring of jumps leading into each other would otherwise
+                // name itself forever.
+                Some(from) if from.kind == NodeKind::Jump => {
+                    format!("from {}", node_number(doc, from.id))
+                }
+                Some(from) => format!("from {}", ref_label(doc, from)),
+                None => node_number(doc, node.id),
+            },
+            None => node_number(doc, node.id),
+        },
+        _ => node_label(doc, node),
     }
 }
 
@@ -4319,7 +5320,16 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
         None => node_number(doc, id),
     };
     match problem {
-        Problem::CrossFlowEdge(_) => "Edge between two flows".to_string(),
+        // Named by its ends, since it is drawn on neither canvas: the row is how the
+        // author finds it at all.
+        Problem::CrossFlowEdge(index) => match doc.edges.get(*index) {
+            Some(edge) => format!(
+                "Edge between two flows: {} → {}",
+                label(edge.from),
+                label(edge.to)
+            ),
+            None => "Edge between two flows".to_string(),
+        },
         Problem::DanglingEdge(index) => format!("Edge {index} points at a missing node"),
         Problem::NoStart => "No start node — every node is linked to".into(),
         Problem::Unreachable(id) => format!("Unreachable: {}", label(*id)),
@@ -4427,8 +5437,80 @@ fn speaker_color(doc: &Doc, speaker: &str, fallback: u32) -> Rgba {
         .map_or(fallback, |character| character.color))
 }
 
-/// `jump_target` is the label of the node a jump points at, and `speaker` the colour of its
-/// cast member, both resolved by the caller.
+/// What hovering a jump shows of where it lands: who speaks there, the first line of what
+/// they say, and which canvas it is on — the three things the box's one-line `↪ target`
+/// has no room for, and the last of which is the reason to look before following it.
+#[derive(Clone)]
+struct JumpPreview {
+    speaker: Option<(String, Rgba)>,
+    line: String,
+    flow: String,
+}
+
+impl JumpPreview {
+    fn of(doc: &Doc, target: &Node) -> JumpPreview {
+        let speaker = match (target.kind, target.speaker.trim()) {
+            (NodeKind::Speech, name) if !name.is_empty() => Some((
+                name.to_string(),
+                speaker_color(doc, name, theme::SPEAKER_DEFAULT),
+            )),
+            _ => None,
+        };
+        let line = match target.text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            Some(line) => line.to_string(),
+            None => node_label(doc, target),
+        };
+        let flow = match target.flow.as_str() {
+            "" => "(main)".to_string(),
+            flow => flow.to_string(),
+        };
+        JumpPreview {
+            speaker,
+            line,
+            flow: format!("on {flow}"),
+        }
+    }
+}
+
+impl Render for JumpPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .bg(theme::RAISED)
+            .border_1()
+            .border_color(theme::KIND_JUMP)
+            .rounded_md()
+            .shadow_md()
+            .text_sm()
+            .when_some(self.speaker.clone(), |this, (name, color)| {
+                this.child(div().text_color(color).child(name))
+            })
+            .child(
+                div()
+                    .text_color(theme::TEXT)
+                    .line_clamp(3)
+                    .child(self.line.clone()),
+            )
+            .child(div().text_color(theme::TEXT_FAINT).child(self.flow.clone()))
+    }
+}
+
+/// What the canvas and the play-through are doing to a node, which is all its border says.
+/// Selection outranks where play is standing, which outranks where it has been; the box
+/// reads them in that order.
+#[derive(Clone, Copy)]
+struct NodeState {
+    selected: bool,
+    playing: bool,
+    passed: bool,
+}
+
+/// `jump_target` is the label of the node a jump points at, `preview` what hovering it
+/// shows, and `speaker` the colour of its cast member, all resolved by the caller.
 ///
 /// Every kind keeps the same `NODE_W`×`NODE_H` footprint on purpose: hit-testing is
 /// arithmetic over those constants in `doc.rs`, so a box drawn smaller than it is clicked
@@ -4436,14 +5518,24 @@ fn speaker_color(doc: &Doc, speaker: &str, fallback: u32) -> Rgba {
 fn node_box(
     node: &Node,
     view: View,
-    selected: bool,
-    playing: bool,
-    passed: bool,
+    state: NodeState,
     jump_target: Option<String>,
+    preview: Option<JumpPreview>,
     speaker: Rgba,
 ) -> impl IntoElement {
+    let NodeState {
+        selected,
+        playing,
+        passed,
+    } = state;
     let (x, y) = view.to_screen((node.x, node.y));
     div()
+        .id(("node", node.id))
+        // View-only, like everything a hover does: it never selects and never switches the
+        // canvas, so a glance at where a jump lands costs nothing.
+        .when_some(preview, |this, preview| {
+            this.tooltip(move |_, cx| cx.new(|_| preview.clone()).into())
+        })
         .absolute()
         .left(px(x))
         .top(px(y))
@@ -4565,6 +5657,27 @@ fn node_box(
                     .line_clamp(4)
                     .child(node.text.clone()),
             )),
+        })
+        // The first tag in a corner, over whatever text runs under it, so `#todo` can be
+        // seen without selecting anything — and the box stays `NODE_W`×`NODE_H`, since
+        // kinds and tags change what a node draws, never how big it is.
+        .when_some(node.tags.first(), |this, first| {
+            let more = match node.tags.len() {
+                1 => String::new(),
+                n => format!(" +{}", n - 1),
+            };
+            this.child(
+                div()
+                    .absolute()
+                    .right(px(4.0))
+                    .bottom(px(2.0))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(theme::RAISED)
+                    .text_size(px(view.scale(theme::TINY)))
+                    .text_color(theme::TEXT_FAINT)
+                    .child(format!("#{first}{more}")),
+            )
         })
 }
 
@@ -4697,6 +5810,7 @@ fn main() {
             KeyBinding::new("down", PaletteNext, Some("Palette")),
             KeyBinding::new("up", PalettePrev, Some("Palette")),
             KeyBinding::new("enter", PaletteRun, Some("Palette")),
+            KeyBinding::new("ctrl-m", ToggleFlowMap, Some("Editor")),
             // Ctrl+1 duplicates Tab so the number row is whole; the menu advertises Tab,
             // which is the older and better key for the kind you reach for most.
             KeyBinding::new("ctrl-1", Branch, Some("Editor")),

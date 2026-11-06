@@ -19,6 +19,9 @@ pub const FILE_EXT: &str = "dln";
 /// Extension of a Fluent translation file, written by [`Doc::export_ftl`].
 pub const FTL_EXT: &str = "ftl";
 
+/// Extension of a screenplay, written by [`Doc::export_screenplay`].
+pub const SCRIPT_EXT: &str = "md";
+
 /// Gives the path an extension unless it already has one.
 pub fn with_default_extension(path: PathBuf, ext: &str) -> PathBuf {
     match path.extension() {
@@ -90,6 +93,66 @@ pub fn node_center(node: &Node) -> (f32, f32) {
 pub const GAP_X: f32 = 160.0;
 /// Vertical gap between siblings sharing a parent.
 pub const GAP_Y: f32 = 30.0;
+
+/// A flow's box on the flow map. The map is laid out in *pane* pixels and ignores the
+/// canvas's pan and zoom: it is a table of contents, not a place anything is drawn at.
+pub const MAP_W: f32 = 180.0;
+pub const MAP_H: f32 = 64.0;
+/// Room between boxes for an arrow and its count.
+const MAP_GAP_X: f32 = 150.0;
+const MAP_GAP_Y: f32 = 110.0;
+const MAP_MARGIN: f32 = 40.0;
+
+/// How many columns a map of `n` flows is laid out in: the smallest square that holds
+/// them, so the grid grows in both directions rather than running off one edge.
+fn map_cols(n: usize) -> usize {
+    (1..).find(|c| c * c >= n).unwrap_or(1)
+}
+
+/// Top-left corner of the `i`th of `n` boxes on the flow map, in pane pixels. A fixed
+/// grid in [`Doc::all_flows`] order, main flow first — never a force simulation, so a
+/// flow is always where it was last time.
+// ponytail: past a few dozen flows the grid runs off the pane, and the map neither
+// scrolls nor zooms. Give it the canvas's `View` if a project ever gets there.
+pub fn map_cell(i: usize, n: usize) -> (f32, f32) {
+    let cols = map_cols(n);
+    let (col, row) = (i % cols, i / cols);
+    (
+        MAP_MARGIN + col as f32 * (MAP_W + MAP_GAP_X),
+        MAP_MARGIN + row as f32 * (MAP_H + MAP_GAP_Y),
+    )
+}
+
+/// Which of `n` map boxes, if any, a pane point falls in — the flow map's whole hit test,
+/// so the canvas's own (`hit_test`, `edge_at`…) never learns the map exists.
+pub fn map_hit(n: usize, x: f32, y: f32) -> Option<usize> {
+    (0..n).find(|&i| {
+        let (bx, by) = map_cell(i, n);
+        x >= bx && x <= bx + MAP_W && y >= by && y <= by + MAP_H
+    })
+}
+
+/// Where a ray from the middle of a `w`×`h` box towards `toward` crosses its border — so
+/// an arrow between two boxes starts and ends at their edges rather than under them.
+pub fn box_exit(center: (f32, f32), w: f32, h: f32, toward: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (toward.0 - center.0, toward.1 - center.1);
+    if dx == 0.0 && dy == 0.0 {
+        return center;
+    }
+    // The ray leaves by whichever side it reaches first.
+    let tx = if dx == 0.0 {
+        f32::INFINITY
+    } else {
+        (w / 2.0) / dx.abs()
+    };
+    let ty = if dy == 0.0 {
+        f32::INFINITY
+    } else {
+        (h / 2.0) / dy.abs()
+    };
+    let t = tx.min(ty);
+    (center.0 + dx * t, center.1 + dy * t)
+}
 
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 3.0;
@@ -283,6 +346,12 @@ pub struct Node {
     /// what every node in a file written before flows existed loads as.
     #[serde(default)]
     pub flow: String,
+    /// Bare labels — `todo`, `vo.recorded` — stored without the `#`. A tag has no value and
+    /// the walk never reads one: nothing that plays, exports or checks the graph looks at
+    /// this field, which is what keeps it from growing into a property bag. Orthogonal to
+    /// [`NodeKind`] like `alias`, so a note or a hub can carry one too.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Marked as a deliberate ending, so having no outgoing edges is not a fault.
     /// `default` so `.dln` files written before this field keep loading.
     #[serde(default)]
@@ -348,6 +417,17 @@ pub enum SetOp {
     Add,
 }
 
+impl SetOp {
+    /// How the write reads, on the canvas and in a screenplay alike — one spelling, so the
+    /// script an actor holds matches the box the author drew.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            SetOp::Set => "=",
+            SetOp::Add => "+=",
+        }
+    }
+}
+
 /// A check a [`NodeKind::Condition`] node makes. Every one on a node must hold for the flow
 /// to take its true branch. One per variable, like an effect.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -374,6 +454,18 @@ pub enum Cmp {
 }
 
 impl Cmp {
+    /// How the check reads, shared for the reason [`SetOp::symbol`] is.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Cmp::Eq => "==",
+            Cmp::Ne => "!=",
+            Cmp::Lt => "<",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Ge => ">=",
+        }
+    }
+
     /// Whether this comparison accepts the ordering the two values came out at.
     fn allows(self, ord: Ordering) -> bool {
         match self {
@@ -424,6 +516,15 @@ impl PartialOrd for Value {
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
             _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Value::Bool(b) => b.fmt(f),
+            Value::Int(n) => n.fmt(f),
         }
     }
 }
@@ -488,6 +589,192 @@ pub struct Character {
     pub color: u32,
 }
 
+/// What [`Doc::stats`] returns: spoken lines and the words in them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Count {
+    pub lines: usize,
+    pub words: usize,
+}
+
+/// A name something in the document can be referred to by — what [`Doc::references`] is
+/// asked about. The things the file keys by name or id and the find-and-replace functions
+/// rewrite, and nothing else.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Ref {
+    Variable(String),
+    Character(String),
+    Flow(String),
+    /// A tag and every tag under it — `act1` names `act1.tavern` too, as
+    /// [`Doc::rename_tag`] carries it.
+    Tag(String),
+    Node(NodeId),
+}
+
+/// How a node refers to a [`Ref`]: the field the reference lives in, said the way the "Used
+/// by" list says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Use {
+    /// An effect names the variable.
+    Writes,
+    /// A check names the variable.
+    Reads,
+    /// A `Speech` node's speaker is the character.
+    Speaks,
+    /// The node is drawn on the flow.
+    StandsOn,
+    /// The node carries the tag.
+    Tagged,
+    /// An edge from this node leads to the target — a choice, a branch, or a jump from any
+    /// canvas.
+    LeadsHere,
+}
+
+/// Where [`Doc::mentions`] found a name in prose. A choice label is text a rename cannot
+/// reach just as a line is, so an edge is a place too — by index, like
+/// `Selection::Edge`, since the list is rebuilt every frame and never outlives an edit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mention {
+    Node(NodeId),
+    Edge(usize),
+}
+
+/// Where `name` first occurs in `text` as a whole word, ignoring case, as a *char* index —
+/// or `None`. Whole-word means the characters either side are not letters, digits or `_`,
+/// so "Mara" is found in "Ask Mara." and "Mara's key" but not in "Marathon"; a name with a
+/// space in it ("Old Tom") matches as a phrase. A blank name is found nowhere.
+pub fn find_word(text: &str, name: &str) -> Option<usize> {
+    let name: Vec<char> = fold(name.trim()).map(|(_, c)| c).collect();
+    if name.is_empty() {
+        return None;
+    }
+    let (origin, text): (Vec<usize>, Vec<char>) = fold(text).unzip();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    (0..text.len().saturating_sub(name.len() - 1))
+        .find(|&at| {
+            text[at..].starts_with(&name)
+                && !word(at.checked_sub(1).and_then(|b| text.get(b)))
+                && !word(text.get(at + name.len()))
+        })
+        .map(|at| origin[at])
+}
+
+/// `text` lowercased char by char, each paired with the index of the char it came from.
+/// The pairing is what makes [`find_word`]'s answer an index into the *original*:
+/// lowercasing can turn one char into two (`İ`), so an index into the folded text does not
+/// fit the text it came from. The same fold on both sides is what keeps a name in capitals
+/// findable — Greek writes `Σ` as `ς` at the end of a word and `σ` elsewhere, and a
+/// string-wise lowercase picks one while a char-wise one picks the other, so the final
+/// form is folded onto the other here.
+fn fold(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    text.chars().enumerate().flat_map(|(at, c)| {
+        c.to_lowercase()
+            .map(move |c| (at, if c == 'ς' { 'σ' } else { c }))
+    })
+}
+
+/// The part of `text` around where `name` is found, on one line: a few words of lead-in,
+/// then the rest. A row truncates at its end, so starting at the text's own start would
+/// hide a name that comes late in a long line — the one thing the row is there to show.
+pub fn snippet(text: &str, name: &str) -> String {
+    /// How much lead-in to keep, in chars.
+    const LEAD: usize = 12;
+
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(at) = find_word(&flat, name) else {
+        return flat;
+    };
+    match at.checked_sub(LEAD) {
+        Some(start) if start > 0 => {
+            let rest: String = flat.chars().skip(start).collect();
+            // Start on a word, so the lead-in never opens mid-word — but only by skipping
+            // within the lead-in: with no space before the name ("—Mara"), the next one is
+            // after it, and skipping to it would cut the name off.
+            let name_at = rest.char_indices().nth(LEAD).map_or(rest.len(), |(b, _)| b);
+            let rest = match rest[..name_at].find(' ') {
+                Some(space) => &rest[space + 1..],
+                None => rest.as_str(),
+            };
+            format!("…{rest}")
+        }
+        _ => flat,
+    }
+}
+
+/// One `key:value` term of a [`Doc::query`], parsed. Values are lowercased once here, so
+/// the per-node test never allocates.
+#[derive(Clone, PartialEq, Debug)]
+enum Filter {
+    Speaker(String),
+    Flow(String),
+    Kind(NodeKind),
+    Sets(String),
+    Checks(String),
+    Tag(String),
+    End,
+    Aliased,
+    Start,
+    HasProblem,
+}
+
+impl Filter {
+    /// `None` when the term is not a filter at all and is plain text — no colon, a key
+    /// nobody knows, or an `is:`/`has:`/`kind:` value that matches nothing. `Some(None)`
+    /// for a known key with nothing after it yet, which filters nothing.
+    fn parse(term: &str) -> Option<Option<Filter>> {
+        // `#todo` is `tag:todo`, spelled the way it is written everywhere else. A bare `#`
+        // is plain text, like any other lone character.
+        if let Some(tag) = term.strip_prefix('#').filter(|tag| !tag.is_empty()) {
+            return Some(Some(Filter::Tag(tag.to_lowercase())));
+        }
+        let (key, value) = term.split_once(':')?;
+        let value = value.to_lowercase();
+        let key = key.to_lowercase();
+        let known = [
+            "speaker", "flow", "kind", "sets", "checks", "tag", "is", "has",
+        ];
+        if !known.contains(&key.as_str()) {
+            return None;
+        }
+        if value.is_empty() {
+            return Some(None);
+        }
+        let filter = match key.as_str() {
+            "speaker" => Filter::Speaker(value),
+            "flow" => Filter::Flow(value),
+            "sets" => Filter::Sets(value),
+            "checks" => Filter::Checks(value),
+            // `tag:#` is a tag not typed yet, not a prefix every tag starts with.
+            "tag" => match value.trim_start_matches('#') {
+                "" => return Some(None),
+                tag => Filter::Tag(tag.to_string()),
+            },
+            "kind" => {
+                const KINDS: [(&str, NodeKind); 6] = [
+                    ("speech", NodeKind::Speech),
+                    ("hub", NodeKind::Hub),
+                    ("jump", NodeKind::Jump),
+                    ("instruction", NodeKind::Instruction),
+                    ("condition", NodeKind::Condition),
+                    ("note", NodeKind::Note),
+                ];
+                let (_, kind) = KINDS.iter().find(|(name, _)| name.starts_with(&value))?;
+                Filter::Kind(*kind)
+            }
+            "is" => match value.as_str() {
+                "end" => Filter::End,
+                "aliased" => Filter::Aliased,
+                "start" => Filter::Start,
+                _ => return None,
+            },
+            _ => match value.as_str() {
+                "problem" => Filter::HasProblem,
+                _ => return None,
+            },
+        };
+        Some(Some(filter))
+    }
+}
+
 /// Splits a variable name into the set it belongs to and the rest: everything before the
 /// first `.`, which the variables pane renders as a group header.
 ///
@@ -516,6 +803,23 @@ pub fn join_set(set: &str, rest: &str) -> String {
         (false, true) => String::new(),
         (false, false) => format!("{set}.{rest}"),
     }
+}
+
+/// A typed tag as it is stored, or `None` when it cannot be one: trimmed, without its `#`,
+/// and a single word — a tag with a space in it could never be asked for with `tag:`.
+pub fn clean_tag(typed: &str) -> Option<String> {
+    let tag = typed.trim().trim_start_matches('#');
+    match tag.is_empty() || tag.contains(char::is_whitespace) {
+        true => None,
+        false => Some(tag.to_string()),
+    }
+}
+
+/// Whether `tag` is `name` or sits under it (`act1.tavern` under `act1`) — the one rule
+/// [`Doc::rename_tag`] and [`Doc::references`] share, so they cannot drift apart.
+fn tag_under(tag: &str, name: &str) -> bool {
+    tag.strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Every variable's value at one point in a play-through. Never stored on the editor —
@@ -802,10 +1106,11 @@ impl Doc {
                     [true, false]
                         .into_iter()
                         .filter(|branch| {
-                            !self
-                                .edges
-                                .iter()
-                                .any(|e| e.from == n.id && e.branch == *branch)
+                            // Wired to a node that exists: a dangling edge is a pin
+                            // wired to nothing, whatever `DanglingEdge` says about it.
+                            !self.edges.iter().any(|e| {
+                                e.from == n.id && e.branch == *branch && self.node(e.to).is_some()
+                            })
                         })
                         .map(|branch| Problem::UnwiredBranch(n.id, branch))
                 }),
@@ -914,11 +1219,23 @@ impl Doc {
             text: String::new(),
             alias: String::new(),
             flow: String::new(),
+            tags: Vec::new(),
             end: false,
             kind: NodeKind::Speech,
             effects: Vec::new(),
             conditions: Vec::new(),
         });
+        id
+    }
+
+    /// [`Doc::add_node`] onto a canvas. Every node the editor makes goes through here: one
+    /// made on the canvas the author is looking at has to land on it, and `add_node` alone
+    /// puts it on the main flow.
+    pub fn add_node_on(&mut self, flow: &str, x: f32, y: f32) -> NodeId {
+        let id = self.add_node(x, y);
+        if let Some(node) = self.node_mut(id) {
+            node.flow = flow.to_string();
+        }
         id
     }
 
@@ -1070,20 +1387,119 @@ impl Doc {
             .map(|n| n.id)
     }
 
-    /// Nodes whose speaker or text contains `query`, ignoring case, in document order.
-    /// A blank query matches nothing rather than everything, so an idle search box is free.
-    // ponytail: node text only; extend to edge labels if choices need finding too.
-    pub fn find(&self, query: &str) -> Vec<NodeId> {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
+    /// The nodes a search-box query matches, in document order — Dataview-lite over the
+    /// one search field, with no new widget.
+    ///
+    /// The query is split on whitespace. A `key:value` term with a key below is a filter;
+    /// everything else is put back together and matched the way plain search always was, a
+    /// case-insensitive substring of the speaker, the text or the alias — so a query with
+    /// no colon in it behaves exactly as search did before filters existed. Terms AND
+    /// together: there is no OR and no nesting, and anything wanting either is an
+    /// expression language, which is out of scope.
+    ///
+    /// - `speaker:` — the speaker contains it, ignoring case.
+    /// - `flow:` — the node stands on that flow; `main` is the unnamed one.
+    /// - `kind:` — `speech`, `hub`, `jump`, `instruction`, `condition` or `note`, or any
+    ///   prefix of one (`kind:cond`).
+    /// - `sets:` / `checks:` — an effect or a check names that variable, through
+    ///   [`Doc::references`] so it sees exactly the fields a rename does; a set name finds
+    ///   every variable in it (`sets:shop` finds `shop.paid`).
+    /// - `is:end`, `is:aliased`, `is:start` (nothing leads here), `has:problem`.
+    ///
+    /// An unknown key, or an `is:`/`has:` value it does not know, is matched as plain text
+    /// rather than refused: `sync_fields`-style, typing toward `speaker:` must never show
+    /// an error mid-word. A key with nothing after its colon yet filters nothing. A blank
+    /// query matches nothing rather than everything, so an idle search box is free.
+    // ponytail: a value cannot hold a space — `speaker:Old Tom` is `speaker:Old` AND the
+    // text "Tom". Quoting is the upgrade if two-word names start to bite.
+    pub fn query(&self, query: &str) -> Vec<NodeId> {
+        let mut filters: Vec<Filter> = Vec::new();
+        let mut text: Vec<&str> = Vec::new();
+        for term in query.split_whitespace() {
+            match Filter::parse(term) {
+                Some(Some(filter)) => filters.push(filter),
+                // A known key with no value yet: typed, but not finished.
+                Some(None) => {}
+                None => text.push(term),
+            }
+        }
+        if filters.is_empty() && text.is_empty() {
             return Vec::new();
         }
+        let text = text.join(" ").to_lowercase();
+
+        // The two filters that need the whole document are worked out once, not per node.
+        let faulty: HashSet<NodeId> = match filters.contains(&Filter::HasProblem) {
+            true => self.problems().iter().filter_map(Problem::node).collect(),
+            false => HashSet::new(),
+        };
+        let uses = |var: &str, how: Use| -> HashSet<NodeId> {
+            let var = var.to_lowercase();
+            let mut names: Vec<String> = self
+                .variables
+                .iter()
+                .map(|v| v.name.clone())
+                .filter(|name| {
+                    let name = name.to_lowercase();
+                    name == var || split_set(&name).0 == Some(var.as_str())
+                })
+                .collect();
+            // An undeclared name a hand-edit left behind is still findable.
+            names.push(var.clone());
+            names
+                .into_iter()
+                .flat_map(|name| self.references(&Ref::Variable(name)))
+                .filter(|&(_, used)| used == how)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let named: Vec<(usize, HashSet<NodeId>)> = filters
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| match f {
+                Filter::Sets(var) => Some((i, uses(var, Use::Writes))),
+                Filter::Checks(var) => Some((i, uses(var, Use::Reads))),
+                _ => None,
+            })
+            .collect();
+
+        // Only a speech node has a speaker: a hub converted from one still carries the
+        // field, and must not be found by a name nobody says there.
+        let speaker = |n: &Node| match n.kind {
+            NodeKind::Speech => n.speaker.to_lowercase(),
+            _ => String::new(),
+        };
         self.nodes
             .iter()
             .filter(|n| {
-                n.speaker.to_lowercase().contains(&query)
-                    || n.text.to_lowercase().contains(&query)
-                    || n.alias.to_lowercase().contains(&query)
+                text.is_empty()
+                    || speaker(n).contains(&text)
+                    || n.text.to_lowercase().contains(&text)
+                    || n.alias.to_lowercase().contains(&text)
+            })
+            .filter(|n| {
+                filters.iter().enumerate().all(|(i, filter)| match filter {
+                    Filter::Speaker(who) => speaker(n).contains(who.as_str()),
+                    Filter::Flow(flow) => {
+                        n.flow.to_lowercase() == *flow
+                            || (n.flow.is_empty() && matches!(flow.as_str(), "main" | "(main)"))
+                    }
+                    Filter::Kind(kind) => n.kind == *kind,
+                    Filter::Sets(_) | Filter::Checks(_) => named
+                        .iter()
+                        .any(|(at, ids)| *at == i && ids.contains(&n.id)),
+                    // A prefix, so `tag:vo` finds `vo.recorded`.
+                    Filter::Tag(tag) => n
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().starts_with(tag.as_str())),
+                    Filter::End => n.end,
+                    Filter::Aliased => !n.alias.trim().is_empty(),
+                    Filter::Start => {
+                        n.kind != NodeKind::Note && !self.edges.iter().any(|e| e.to == n.id)
+                    }
+                    Filter::HasProblem => faulty.contains(&n.id),
+                })
             })
             .map(|n| n.id)
             .collect()
@@ -1121,20 +1537,28 @@ impl Doc {
         self.edges.iter().any(|e| e.from == from && e.to == to)
     }
 
-    /// Connects two nodes. False when the edge would be a self-loop or a duplicate, or
-    /// would be a second target for a jump — a jump points at exactly one node, and a
-    /// second edge would leave the canvas badge naming one of several.
-    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> bool {
+    /// Whether [`Doc::add_edge`] would accept the edge. Separate so the view can ask
+    /// *before* it checkpoints, the way [`Doc::variable_name_free`] is: a refused drag
+    /// must not leave an empty undo step, a false dirty flag, or a selection pointing at
+    /// whatever edge happened to be last in the file.
+    pub fn can_add_edge(&self, from: NodeId, to: NodeId) -> bool {
+        // A jump points at exactly one node, and a second edge would leave the canvas
+        // badge naming one of several. A note is an annotation, not a node in the
+        // conversation: no edge may touch one at either end. This is the only gate — the
+        // canvas drag and `branch_from` both come through here.
         if from == to || self.has_edge(from, to) {
             return false;
         }
         if self.is_jump(from) && self.edges.iter().any(|e| e.from == from) {
             return false;
         }
-        // A note is an annotation, not a node in the conversation: no edge may touch one at
-        // either end. This is the only gate — the canvas drag and `branch_from` both come
-        // through here.
-        if self.is_note(from) || self.is_note(to) {
+        !self.is_note(from) && !self.is_note(to)
+    }
+
+    /// Connects two nodes. False when the edge would be a self-loop or a duplicate, would
+    /// be a second target for a jump, or would touch a note — see [`Doc::can_add_edge`].
+    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> bool {
+        if !self.can_add_edge(from, to) {
             return false;
         }
         // The first edge out of a condition is its true branch: the happy path is what gets
@@ -1188,11 +1612,49 @@ impl Doc {
         (x, y)
     }
 
+    /// Whether [`Doc::link`] would change anything — the pre-checkpoint check, for the
+    /// reason [`Doc::can_add_edge`] exists.
+    pub fn can_link(&self, from: NodeId, to: NodeId) -> bool {
+        match self.is_jump(from) {
+            true => from != to && !self.is_note(to) && !self.has_edge(from, to),
+            false => self.can_add_edge(from, to),
+        }
+    }
+
+    /// Connects two nodes the way a drag from an out-port does: an ordinary node gains a
+    /// choice, and a jump that already has a target is pointed at the new one instead, so
+    /// the one-target rule holds and the port stays a handle that lands. False, with
+    /// nothing changed, when [`Doc::can_link`] refuses.
+    pub fn link(&mut self, from: NodeId, to: NodeId) -> bool {
+        if !self.can_link(from, to) {
+            return false;
+        }
+        if self.is_jump(from) {
+            self.edges.retain(|e| e.from != from);
+        }
+        self.add_edge(from, to)
+    }
+
+    /// Whether [`Doc::branch_from`] would connect a new node to this one: it exists, takes
+    /// edges out, and — for a jump — has no target yet. The pre-checkpoint check, so a Tab
+    /// that cannot branch places the node instead of leaving an orphan beside the parent
+    /// and an empty undo step.
+    pub fn can_branch(&self, from: NodeId) -> bool {
+        self.node(from).is_some_and(|parent| match parent.kind {
+            NodeKind::Note => false,
+            NodeKind::Jump => !self.edges.iter().any(|e| e.from == from),
+            _ => true,
+        })
+    }
+
     /// Adds a node connected to `from`, to its right and below any children it already
     /// has, so a fan of choices stacks downward. Slides further down past anything else in
-    /// the way, children or not, via [`Doc::free_spot`]. None when `from` is gone, and then
-    /// nothing is added.
+    /// the way, children or not, via [`Doc::free_spot`]. None, with nothing added, when
+    /// [`Doc::can_branch`] refuses.
     pub fn branch_from(&mut self, from: NodeId) -> Option<NodeId> {
+        if !self.can_branch(from) {
+            return None;
+        }
         let parent = self.node(from)?;
         let (x, mut y) = (parent.x + NODE_W + GAP_X, parent.y);
         let lowest_child = self
@@ -1208,13 +1670,11 @@ impl Doc {
 
         let flow = parent.flow.clone();
         let (x, y) = self.free_spot(&flow, x, y);
-        let id = self.add_node(x, y);
         // Branching lands on the canvas the parent is drawn on, so Tab never creates a node
         // the author cannot see.
-        if let Some(node) = self.node_mut(id) {
-            node.flow = flow;
-        }
-        // A fresh id is neither a self-loop nor a duplicate, so this cannot fail.
+        let id = self.add_node_on(&flow, x, y);
+        // A fresh id is neither a self-loop nor a duplicate, and `can_branch` ruled out a
+        // note and a jump with a target, so this cannot fail.
         self.add_edge(from, id);
         Some(id)
     }
@@ -1588,6 +2048,41 @@ impl Doc {
         found
     }
 
+    /// Every flow the map draws a box for: the main one first, then [`Doc::all_flows`].
+    /// The same list, in the same order, as the Flows tab.
+    pub fn map_flows(&self) -> Vec<&str> {
+        std::iter::once("").chain(self.all_flows()).collect()
+    }
+
+    /// The flow map's arrows: for each ordered pair of flows, how many jumps on the first
+    /// land on a node on the second. Computed from the jump edges every time and never
+    /// stored — the map is a picture of the graph, not a second copy of it. A jump that
+    /// lands on its own canvas crosses nothing and is not counted; a jump pointing at
+    /// nothing has nowhere to draw an arrow to. Ordered by [`Doc::map_flows`], source then
+    /// target, so the map draws the same way every frame.
+    pub fn flow_links(&self) -> Vec<(String, String, usize)> {
+        let mut links: Vec<(String, String, usize)> = Vec::new();
+        for edge in self.edges.iter().filter(|e| self.is_jump(e.from)) {
+            let (Some(from), Some(to)) = (self.node(edge.from), self.node(edge.to)) else {
+                continue;
+            };
+            if from.flow == to.flow {
+                continue;
+            }
+            match links
+                .iter_mut()
+                .find(|(a, b, _)| *a == from.flow && *b == to.flow)
+            {
+                Some((_, _, count)) => *count += 1,
+                None => links.push((from.flow.clone(), to.flow.clone(), 1)),
+            }
+        }
+        let flows = self.map_flows();
+        let at = |flow: &str| flows.iter().position(|f| *f == flow);
+        links.sort_by_key(|(a, b, _)| (at(a), at(b)));
+        links
+    }
+
     /// Whether [`Doc::add_flow`] would accept this name. Separate for the reason
     /// [`Doc::variable_name_free`] is: a refused add must not leave an empty undo step.
     pub fn flow_name_free(&self, name: &str) -> bool {
@@ -1699,6 +2194,117 @@ impl Doc {
         true
     }
 
+    /// Every tag some node carries, once each, sorted ignoring case. Tags are never
+    /// declared: the list is whatever the nodes say, as [`Doc::all_flows`] is for the flows
+    /// nobody declared — so there is no removal policy to choose and no unknown tag.
+    pub fn all_tags(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = Vec::new();
+        for tag in self.nodes.iter().flat_map(|n| &n.tags) {
+            if !found.contains(&tag.as_str()) {
+                found.push(tag);
+            }
+        }
+        found.sort_by_key(|tag| tag.to_lowercase());
+        found
+    }
+
+    /// The groups the dotted tags fall into, through [`split_set`] exactly as a variable's
+    /// name does — what the tag picker offers, the way [`Doc::all_sets`] feeds the other.
+    pub fn tag_sets(&self) -> Vec<&str> {
+        let mut found: Vec<&str> = Vec::new();
+        for tag in self.all_tags() {
+            if let (Some(set), _) = split_set(tag)
+                && !found.contains(&set)
+            {
+                found.push(set);
+            }
+        }
+        found
+    }
+
+    /// Whether [`Doc::add_tag`] would change anything: the tag is well-formed and some
+    /// listed node lacks it. The pre-checkpoint check, for the empty-undo-step reason
+    /// [`Doc::variable_name_free`] exists.
+    pub fn can_tag(&self, ids: &[NodeId], tag: &str) -> bool {
+        let Some(tag) = clean_tag(tag) else {
+            return false;
+        };
+        self.nodes
+            .iter()
+            .any(|n| ids.contains(&n.id) && !n.tags.contains(&tag))
+    }
+
+    /// Tags every listed node that lacks the tag, returning how many gained it. A node
+    /// never carries one tag twice.
+    pub fn add_tag(&mut self, ids: &[NodeId], tag: &str) -> usize {
+        let Some(tag) = clean_tag(tag) else {
+            return 0;
+        };
+        let mut tagged = 0;
+        for node in self.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
+            if !node.tags.contains(&tag) {
+                node.tags.push(tag.clone());
+                tagged += 1;
+            }
+        }
+        tagged
+    }
+
+    /// Takes the tag off one node. False when it did not carry it.
+    pub fn remove_tag(&mut self, id: NodeId, tag: &str) -> bool {
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        let before = node.tags.len();
+        node.tags.retain(|t| t != tag);
+        node.tags.len() != before
+    }
+
+    /// Whether [`Doc::rename_tag`] would change anything — the pre-checkpoint check.
+    pub fn tag_rename_ok(&self, from: &str, to: &str) -> bool {
+        clean_tag(to).is_some_and(|to| to != from)
+            && self
+                .nodes
+                .iter()
+                .flat_map(|n| &n.tags)
+                .any(|t| tag_under(t, from))
+    }
+
+    /// Renames the tag on every node carrying it, and every tag under it — `act1` to
+    /// `act2` moves `act1.tavern` to `act2.tavern` — returning how many nodes changed. The
+    /// fifth find-and-replace in this file, and [`Doc::references`] visits the same tags.
+    ///
+    /// Unlike [`Doc::rename_set`] it merges rather than refuses when the new name is taken:
+    /// a tag has no value to conflict, so renaming a misspelt `#tood` onto `#todo` is the
+    /// ordinary way to fix it, and a node left carrying both keeps one.
+    pub fn rename_tag(&mut self, from: &str, to: &str) -> usize {
+        if !self.tag_rename_ok(from, to) {
+            return 0;
+        }
+        let Some(to) = clean_tag(to) else {
+            return 0;
+        };
+        let mut changed = 0;
+        for node in &mut self.nodes {
+            if !node.tags.iter().any(|t| tag_under(t, from)) {
+                continue;
+            }
+            let mut tags: Vec<String> = Vec::new();
+            for tag in &node.tags {
+                let tag = match tag_under(tag, from) {
+                    true => format!("{to}{}", &tag[from.len()..]),
+                    false => tag.clone(),
+                };
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+            node.tags = tags;
+            changed += 1;
+        }
+        changed
+    }
+
     fn snapshot(&self) -> Snapshot {
         (
             self.nodes.clone(),
@@ -1771,9 +2377,12 @@ impl Doc {
         // text field — an instruction that used to be a line — would ship a translator a
         // string nobody sees and nobody can edit.
         for node in &self.nodes {
-            // An empty value is a parse error in FTL, and a blank node is already
-            // `Problem::Empty` — the document says so somewhere the author can read it.
-            if let Some(text) = node.player_text().filter(|t| !t.is_empty()) {
+            // Only text the player reads: a line, or the label a hub shows over its
+            // choices (`Node::player_text` is that gate). An empty value is a parse error in
+            // FTL — a value of nothing but blanks too, since the parser skips the blanks and
+            // finds nothing — and a blank node is already `Problem::Empty`, so the document
+            // says so where the author reads it.
+            if let Some(text) = node.player_text().filter(|t| !t.trim().is_empty()) {
                 out += &Self::ftl_entry(&format!("node-{}", node.id), text);
             }
         }
@@ -1796,7 +2405,16 @@ impl Doc {
     /// blank lines are indented for the same reason. A brace opens a placeable, so text
     /// carrying one is escaped, and in a *single* pass: chaining two `replace` calls would
     /// mangle the braces the first one inserted.
+    ///
+    /// Two things a line may not open with are shielded behind `{""}`, an empty string
+    /// literal — a placeable that renders as nothing and that a line *may* open with. In a
+    /// block value a line whose first mark is `[`, `*` or `.` is a variant, a default
+    /// variant or an attribute, and the parser keeps the lines before it and drops the rest
+    /// as junk without a word; "...I suppose." is ordinary dialogue. And the blanks after
+    /// `=` are skipped, so a value starting with a space would lose it.
     fn ftl_entry(key: &str, value: &str) -> String {
+        const SHIELD: &str = "{\"\"}";
+
         let mut escaped = String::with_capacity(value.len());
         for c in value.chars() {
             match c {
@@ -1807,13 +2425,39 @@ impl Doc {
         }
 
         if !escaped.contains('\n') {
-            return format!("{key} = {escaped}\n");
+            let shield = if escaped.starts_with(' ') { SHIELD } else { "" };
+            return format!("{key} = {shield}{escaped}\n");
         }
         let mut out = format!("{key} =\n");
         for line in escaped.lines() {
-            out += &format!("    {line}\n");
+            let shield = match line.trim_start().chars().next() {
+                Some('[' | '*' | '.') => SHIELD,
+                _ => "",
+            };
+            out += &format!("    {shield}{line}\n");
         }
         out
+    }
+
+    /// How much dialogue the nodes `keep` accepts hold: one line per `Speech` node with
+    /// something in it, and its whitespace-separated words — what voice-over budgeting and
+    /// casting ask first. Speech only, so a hub's label, an instruction and a note are never
+    /// counted: a note is left out for the reason [`Doc::to_ftl`] leaves it out, since
+    /// nobody records author-facing text. A blank line is not a line, which is already
+    /// `Problem::Empty`'s business.
+    ///
+    /// ponytail: a full scan per call, and the view makes one per cast or flow row every
+    /// frame. Fine at the size a hand-authored graph reaches; cache per checkpoint if a
+    /// thousand-row cast ever stutters.
+    pub fn stats(&self, keep: impl Fn(&Node) -> bool) -> Count {
+        let mut count = Count::default();
+        for node in &self.nodes {
+            if node.kind == NodeKind::Speech && !node.text.trim().is_empty() && keep(node) {
+                count.lines += 1;
+                count.words += node.text.split_whitespace().count();
+            }
+        }
+        count
     }
 
     /// Writes [`Doc::to_ftl`]. Deliberately takes `&self`, which is the compiler saying an
@@ -1821,6 +2465,316 @@ impl Doc {
     /// document's own path.
     pub fn export_ftl(&self, path: &Path) -> Result<(), String> {
         std::fs::write(path, self.to_ftl()).map_err(|e| e.to_string())
+    }
+
+    /// Every node that refers to `target`, in document order, with the field it does it
+    /// through — Obsidian's backlinks, over the names this file keys by.
+    ///
+    /// The read-only twin of the find-and-replace functions, and it must visit **exactly**
+    /// the fields they rewrite: effects and checks on any kind for a variable, as
+    /// [`Doc::rename_variable`] does; a `Speech` node's trimmed speaker for a character, as
+    /// [`Doc::rename_character`] does; `Node::flow` for a flow, as [`Doc::rename_flow`] does.
+    /// A field that stores a name joins this function as well as those, and the
+    /// `references_match_*` tests are what catch it when it does not. A node is the fourth
+    /// target: every node with an edge into it, which is how a jump from another canvas
+    /// shows up without the crossing needing an arm of its own.
+    ///
+    /// A node that refers twice in one way is listed once; one that writes and reads the
+    /// same variable — only a hand-edit can make that — is listed for each.
+    pub fn references(&self, target: &Ref) -> Vec<(NodeId, Use)> {
+        let mut found = Vec::new();
+        for node in &self.nodes {
+            match target {
+                Ref::Variable(name) => {
+                    if node.effects.iter().any(|e| e.var == *name) {
+                        found.push((node.id, Use::Writes));
+                    }
+                    if node.conditions.iter().any(|c| c.var == *name) {
+                        found.push((node.id, Use::Reads));
+                    }
+                }
+                Ref::Character(name) => {
+                    if node.kind == NodeKind::Speech && node.speaker.trim() == name {
+                        found.push((node.id, Use::Speaks));
+                    }
+                }
+                Ref::Flow(name) => {
+                    if node.flow == *name {
+                        found.push((node.id, Use::StandsOn));
+                    }
+                }
+                Ref::Tag(name) => {
+                    if node.tags.iter().any(|t| tag_under(t, name)) {
+                        found.push((node.id, Use::Tagged));
+                    }
+                }
+                Ref::Node(id) => {
+                    if self.edges.iter().any(|e| e.from == node.id && e.to == *id) {
+                        found.push((node.id, Use::LeadsHere));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Every place whose *prose* names `target` without being linked to it — Obsidian's
+    /// unlinked mentions. For a character that is any text naming them that they do not
+    /// speak ("Ask Mara about the key", said by the Innkeeper); for a node, any text naming
+    /// its alias from a node that has no edge to it. Nodes first, in document order, then
+    /// choice labels.
+    ///
+    /// It exists chiefly because [`Doc::rename_character`] rewrites `Node::speaker` and
+    /// never `text`, deliberately — a blind replace inside prose would corrupt it — so after
+    /// renaming Mara this, asked about the *old* name, is the list of lines the rename could
+    /// not reach. That is also why a character is matched by name alone, declared or not:
+    /// the old name is not declared any more. It reports and never fixes; the author edits
+    /// the line.
+    ///
+    /// Notes are scanned too — a note about Mara is exactly what an author renaming her
+    /// wants to find. A hub's label is text like any other. Variables and flows have no
+    /// prose that names them, so they are mentioned nowhere.
+    pub fn mentions(&self, target: &Ref) -> Vec<Mention> {
+        let (name, linked) = match target {
+            Ref::Character(name) => (name.trim(), self.references(target)),
+            Ref::Node(id) => match self.node(*id) {
+                Some(node) => (node.alias.trim(), self.references(target)),
+                None => return Vec::new(),
+            },
+            Ref::Variable(_) | Ref::Flow(_) | Ref::Tag(_) => return Vec::new(),
+        };
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let linked = |id: NodeId| linked.iter().any(|&(at, _)| at == id);
+        let own = |id: NodeId| *target == Ref::Node(id);
+
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|n| !linked(n.id) && !own(n.id) && find_word(&n.text, name).is_some());
+        let mut found: Vec<Mention> = nodes.map(|n| Mention::Node(n.id)).collect();
+        // A choice leading to the node it names is already a link, so it is not "unlinked".
+        let edges = self
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| *target != Ref::Node(e.to) && find_word(&e.label, name).is_some());
+        found.extend(edges.map(|(index, _)| Mention::Edge(index)));
+        found
+    }
+
+    /// Every node with an alias, sorted by it: the author's own landmarks. No `starred`
+    /// flag, because an alias already *is* a hand-placed name for a place worth coming back
+    /// to, and a second field would be a second way of saying the same thing. Case-folded so
+    /// `Intro` does not sort after `zebra`.
+    pub fn bookmarks(&self) -> Vec<NodeId> {
+        let mut marked: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|n| !n.alias.trim().is_empty())
+            .collect();
+        marked.sort_by_cached_key(|n| n.alias.trim().to_lowercase());
+        marked.into_iter().map(|n| n.id).collect()
+    }
+
+    /// The document as a linear Markdown script, one section per flow, for table reads and
+    /// voice-over sessions. An export, like [`Doc::to_ftl`]: the pure half, with the write
+    /// beside it.
+    ///
+    /// A branching graph cannot be one line of text, so it is cut into numbered *blocks*, the
+    /// way a gamebook is. A block runs on while there is exactly one unlabelled way forward
+    /// into a node nothing else leads to; anything else — a choice, a condition, a jump, a
+    /// node several branches rejoin at — ends it and names where to go (`→ §3`). A node is
+    /// therefore written exactly once and referenced from everywhere else, which is also what
+    /// makes a cycle finite.
+    ///
+    /// Blocks are numbered breadth-first from each flow's roots — nodes nothing on the same
+    /// flow leads to, so a flow entered only by a jump starts where the jump lands — and then
+    /// from anything left over in document order, which catches a loop with no way in. So
+    /// the numbers only ever rise down the page, and every block is reachable from a
+    /// reference to it. Notes are author-facing and never written, for the reason `to_ftl`
+    /// leaves them out; `add_edge` keeps them out of every block anyway.
+    pub fn to_screenplay(&self) -> String {
+        let (sections, number) = self.script_blocks();
+        // Every block start is numbered by `script_blocks`; the `?` is for a node it could
+        // not reach, which would be a bug there rather than something to panic a save over.
+        let reference = |from: &Node, to: NodeId| {
+            let to = self.through_jumps(to);
+            let n = number.get(&to).map_or("?".to_string(), usize::to_string);
+            match self.node(to) {
+                Some(target) if target.flow != from.flow => {
+                    format!("§{n} ({})", flow_title(&target.flow))
+                }
+                _ => format!("§{n}"),
+            }
+        };
+
+        let mut out = String::new();
+        for (flow, blocks) in sections {
+            out += &format!("## {}\n", flow_title(flow));
+            for chain in blocks {
+                out += &format!("\n### §{}", number.get(&chain[0]).unwrap_or(&0));
+                // The author's own name for the place, if it has one: an alias, or what a
+                // hub is labelled. A reader turning to §4 sees where they have landed.
+                if let Some(first) = self.node(chain[0]) {
+                    let hub = if first.kind == NodeKind::Hub {
+                        first.text.trim()
+                    } else {
+                        ""
+                    };
+                    match (first.alias.trim(), hub) {
+                        ("", "") => {}
+                        ("", name) | (name, _) => out += &format!(" · {name}"),
+                    }
+                }
+                out += "\n";
+                for &id in &chain {
+                    let Some(node) = self.node(id) else { continue };
+                    out += &script_line(node);
+                }
+                let Some(last) = chain.last().and_then(|&id| self.node(id)) else {
+                    continue;
+                };
+                let exits = self.edges.iter().filter(|e| e.from == last.id);
+                let exits: Vec<&Edge> = exits.filter(|e| self.node(e.to).is_some()).collect();
+                match (last.kind, exits.as_slice()) {
+                    (NodeKind::Jump, [edge]) => {
+                        out += &format!("\n→ {}\n", reference(last, edge.to));
+                    }
+                    (NodeKind::Jump, _) => out += "\n→ nowhere\n",
+                    (_, []) => {}
+                    (NodeKind::Condition, exits) => {
+                        out += "\n";
+                        for edge in exits {
+                            out += &format!("- {} → {}\n", edge.branch, reference(last, edge.to));
+                        }
+                    }
+                    // A once-only choice is listed even alone, so its marker is written.
+                    (_, [edge]) if edge.label.trim().is_empty() && !edge.once => {
+                        out += &format!("\n→ {}\n", reference(last, edge.to));
+                    }
+                    (_, exits) => {
+                        out += "\n";
+                        for edge in exits {
+                            let label = match edge.label.trim() {
+                                "" => "*(continue)*",
+                                label => label,
+                            };
+                            let once = if edge.once { "(once) " } else { "" };
+                            out += &format!("- {once}{label} → {}\n", reference(last, edge.to));
+                        }
+                    }
+                }
+            }
+            out += "\n";
+        }
+        out
+    }
+
+    /// The blocks [`Doc::to_screenplay`] writes, grouped by flow in [`Doc::all_flows`] order,
+    /// and the number each block's first node is referenced by. Split out so every number
+    /// exists before the first reference to it is written.
+    fn script_blocks(&self) -> (Vec<ScriptSection<'_>>, HashMap<NodeId, usize>) {
+        let incoming = |id: NodeId| self.edges.iter().filter(|e| e.to == id).count();
+        let flow_of = |id: NodeId| self.node(id).map(|n| n.flow.as_str());
+        // The one way a block runs on: a single unlabelled edge, into a node on the same
+        // canvas that nothing else leads to. Jumps and conditions always end a block — the
+        // first because its edge is a reference by definition, the second because a branch
+        // is two ways forward even when one pin is unwired.
+        let runs_on = |node: &Node| -> Option<NodeId> {
+            if matches!(node.kind, NodeKind::Jump | NodeKind::Condition) {
+                return None;
+            }
+            let exits: Vec<&Edge> = self.edges.iter().filter(|e| e.from == node.id).collect();
+            match exits.as_slice() {
+                [edge]
+                    if edge.label.trim().is_empty()
+                        && flow_of(edge.to) == Some(node.flow.as_str())
+                        && incoming(edge.to) == 1 =>
+                {
+                    Some(edge.to)
+                }
+                _ => None,
+            }
+        };
+
+        let mut number: HashMap<NodeId, usize> = HashMap::new();
+        let mut sections = Vec::new();
+        let mut flows: Vec<&str> = vec![""];
+        flows.extend(self.all_flows());
+        for flow in flows {
+            let on_flow = || self.nodes_in(flow).filter(|n| n.kind != NodeKind::Note);
+            let roots = on_flow().filter(|n| {
+                !self
+                    .edges
+                    .iter()
+                    .any(|e| e.to == n.id && flow_of(e.from) == Some(flow))
+            });
+            let mut seeds: Vec<NodeId> = roots.map(|n| n.id).collect();
+            // Anything left over starts a block of its own, except a jump: every reference
+            // to one already points through it, so it has nothing left to say.
+            seeds.extend(on_flow().filter(|n| n.kind != NodeKind::Jump).map(|n| n.id));
+
+            let mut written: HashSet<NodeId> = HashSet::new();
+            let mut blocks = Vec::new();
+            for seed in seeds {
+                if written.contains(&seed) {
+                    continue;
+                }
+                let mut queue = std::collections::VecDeque::from([seed]);
+                let next = number.len() + 1;
+                number.entry(seed).or_insert(next);
+                while let Some(start) = queue.pop_front() {
+                    let mut chain = Vec::new();
+                    let mut at = Some(start);
+                    while let Some(id) = at.filter(|id| written.insert(*id)) {
+                        chain.push(id);
+                        let Some(node) = self.node(id) else { break };
+                        at = runs_on(node);
+                        if at.is_none() {
+                            // Everything this block ends at on the same canvas is a block of
+                            // its own; one on another canvas is numbered when its flow is.
+                            for edge in self.edges.iter().filter(|e| e.from == id) {
+                                let to = self.through_jumps(edge.to);
+                                if flow_of(to) == Some(flow) && !number.contains_key(&to) {
+                                    number.insert(to, number.len() + 1);
+                                    queue.push_back(to);
+                                }
+                            }
+                        }
+                    }
+                    if !chain.is_empty() {
+                        blocks.push(chain);
+                    }
+                }
+            }
+            if !blocks.is_empty() {
+                sections.push((flow, blocks));
+            }
+        }
+        (sections, number)
+    }
+
+    /// Where a script reference to `id` should point: through any jumps to what they land
+    /// on, since a block that says nothing but "→ §4" is a page turn with no page. Stops at
+    /// a jump with no target and guards a ring of jumps with a visited set, as `start_of`
+    /// guards a cycle.
+    fn through_jumps(&self, id: NodeId) -> NodeId {
+        let mut at = id;
+        let mut seen = HashSet::from([at]);
+        while self.is_jump(at) {
+            match self.choices(at).first() {
+                Some(&(to, _)) if seen.insert(to) => at = to,
+                _ => break,
+            }
+        }
+        at
+    }
+
+    /// Writes [`Doc::to_screenplay`]. `&self` for the reason [`Doc::export_ftl`] takes it.
+    pub fn export_screenplay(&self, path: &Path) -> Result<(), String> {
+        std::fs::write(path, self.to_screenplay()).map_err(|e| e.to_string())
     }
 
     /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
@@ -1979,6 +2933,53 @@ impl Doc {
         doc.add_edge(check, farewell);
         doc
     }
+}
+
+/// One flow of a screenplay: its name, and its blocks in print order, each a run of nodes
+/// written one after another.
+type ScriptSection<'a> = (&'a str, Vec<Vec<NodeId>>);
+
+/// A flow's heading in a script: the main flow has no name of its own.
+fn flow_title(flow: &str) -> &str {
+    if flow.is_empty() { "Main" } else { flow }
+}
+
+/// One node as a screenplay writes it, blank line first. Speech is the speaker in capitals
+/// over the line, as a script sets it; logic is a stage direction in brackets, so a reader
+/// can see *why* the path went where it did without reading it aloud. A hub says nothing —
+/// its choices, written after the block, are all it is.
+fn script_line(node: &Node) -> String {
+    let body = match node.kind {
+        NodeKind::Speech => {
+            let text = node.text.trim().lines().collect::<Vec<_>>().join("  \n");
+            let mut out = match node.speaker.trim() {
+                "" => text,
+                speaker => format!("**{}**  \n{text}", speaker.to_uppercase()),
+            };
+            if node.end {
+                out += "\n\n*(end)*";
+            }
+            out
+        }
+        NodeKind::Instruction if !node.effects.is_empty() => {
+            let sets: Vec<String> = node
+                .effects
+                .iter()
+                .map(|e| format!("{} {} {}", e.var, e.op.symbol(), e.value))
+                .collect();
+            format!("*[{}]*", sets.join(", "))
+        }
+        NodeKind::Condition => {
+            let checks: Vec<String> = node
+                .conditions
+                .iter()
+                .map(|c| format!("{} {} {}", c.var, c.op.symbol(), c.want))
+                .collect();
+            format!("*[if {}]*", checks.join(" and "))
+        }
+        _ => return String::new(),
+    };
+    format!("\n{body}\n")
 }
 
 fn distance_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -4060,7 +5061,7 @@ mod tests {
         let doc = Doc::sample();
 
         // "Innkeeper" is a speaker; "inn before the pass" is inside another node's text.
-        let hits = doc.find("inn");
+        let hits = doc.query("inn");
         let expected: Vec<NodeId> = doc
             .nodes
             .iter()
@@ -4081,7 +5082,7 @@ mod tests {
         doc.node_mut(id).unwrap().alias = "blacksmith_intro".into();
 
         assert_eq!(
-            doc.find("BLACKSMITH"),
+            doc.query("BLACKSMITH"),
             vec![id],
             "case-insensitive, like the rest"
         );
@@ -4090,16 +5091,16 @@ mod tests {
     #[test]
     fn find_ignores_case() {
         let doc = Doc::sample();
-        assert_eq!(doc.find("INNKEEPER"), doc.find("innkeeper"));
-        assert!(!doc.find("INNKEEPER").is_empty());
+        assert_eq!(doc.query("INNKEEPER"), doc.query("innkeeper"));
+        assert!(!doc.query("INNKEEPER").is_empty());
     }
 
     #[test]
     fn find_on_an_empty_query_returns_nothing() {
         let doc = Doc::sample();
-        assert!(doc.find("").is_empty());
-        assert!(doc.find("   ").is_empty(), "whitespace is not a match-all");
-        assert!(doc.find("no such speaker").is_empty());
+        assert!(doc.query("").is_empty());
+        assert!(doc.query("   ").is_empty(), "whitespace is not a match-all");
+        assert!(doc.query("no such speaker").is_empty());
     }
 
     #[test]
@@ -4639,6 +5640,253 @@ mod tests {
     }
 
     #[test]
+    fn stats_count_spoken_lines_and_their_words() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().text = "Good  evening,\ntraveller.".into();
+        let b = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(b).unwrap().text = "Ale?".into();
+
+        assert_eq!(doc.stats(|_| true), Count { lines: 2, words: 4 });
+    }
+
+    /// Nobody records a note, a hub's label or a blank line, so none of them is a line.
+    #[test]
+    fn stats_count_speech_only() {
+        let mut doc = Doc::default();
+        spoken(&mut doc, 0.0, 0.0);
+        for (i, kind) in [NodeKind::Note, NodeKind::Hub].into_iter().enumerate() {
+            let id = spoken(&mut doc, 400.0 * (i + 1) as f32, 0.0);
+            doc.node_mut(id).unwrap().kind = kind;
+        }
+        let blank = doc.add_node(0.0, 400.0);
+        doc.node_mut(blank).unwrap().text = "  ".into();
+
+        assert_eq!(doc.stats(|_| true), Count { lines: 1, words: 1 });
+    }
+
+    #[test]
+    fn stats_filter_by_speaker_and_flow() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(a).unwrap().speaker = "Mara".into();
+        let b = spoken(&mut doc, 400.0, 0.0);
+        doc.node_mut(b).unwrap().speaker = "Mara".into();
+        doc.node_mut(b).unwrap().flow = "cellar".into();
+        spoken(&mut doc, 800.0, 0.0);
+
+        assert_eq!(doc.stats(|n| n.speaker == "Mara").lines, 2);
+        assert_eq!(doc.stats(|n| n.flow == "cellar").lines, 1);
+        assert_eq!(doc.stats(|n| n.flow.is_empty()).lines, 2);
+    }
+
+    fn said(doc: &mut Doc, x: f32, text: &str) -> NodeId {
+        let id = doc.add_node(x, 0.0);
+        doc.node_mut(id).unwrap().text = text.into();
+        id
+    }
+
+    #[test]
+    fn bookmarks_are_aliased_nodes_sorted_by_alias() {
+        let mut doc = Doc::default();
+        let b = said(&mut doc, 0.0, "b");
+        let none = said(&mut doc, 400.0, "none");
+        let a = said(&mut doc, 800.0, "a");
+        doc.node_mut(b).unwrap().alias = "zebra".into();
+        doc.node_mut(a).unwrap().alias = "Intro".into();
+        doc.node_mut(none).unwrap().alias = "   ".into();
+
+        assert_eq!(doc.bookmarks(), vec![a, b]);
+    }
+
+    /// A single unlabelled edge runs on in the same block; a choice ends it, and every
+    /// target gets a number of its own, rising down the page.
+    #[test]
+    fn screenplay_runs_lines_on_and_numbers_branches() {
+        let script = Doc::sample().to_screenplay();
+        assert!(script.starts_with("## Main\n\n### §1\n\n**INNKEEPER**  \nYou look lost"));
+        assert!(script.contains("- Ask → §2\n- Refuse → §3\n"));
+        assert!(
+            script.contains("### §2\n\n**PLAYER**  \nWhere am I?\n\n**INNKEEPER**  \nSern's Rest.")
+        );
+        assert!(script.contains("### §4 · Anything else?\n"));
+        assert!(script.contains("*[if asked_about_pass == true]*\n\n- true → §9\n- false → §10\n"));
+    }
+
+    /// A reference to a jump is a reference to what it lands on, and the jump itself
+    /// never becomes a block that says nothing but where to turn.
+    #[test]
+    fn screenplay_points_through_jumps() {
+        let script = Doc::sample().to_screenplay();
+        assert!(script.contains("- Ask something else → §4\n"));
+        assert!(script.contains("*[asked_about_pass = true]*\n\n→ §4\n"));
+        assert!(!script.contains("### §11"));
+    }
+
+    /// A loop nothing enters is still written, once, and closes on a reference.
+    #[test]
+    fn screenplay_writes_a_cycle_once() {
+        let mut doc = Doc::default();
+        let a = said(&mut doc, 0.0, "round");
+        let b = said(&mut doc, 400.0, "and round");
+        doc.add_edge(a, b);
+        doc.add_edge(b, a);
+
+        let script = doc.to_screenplay();
+        assert_eq!(script.matches("and round").count(), 1);
+        assert_eq!(script.matches("\nround").count(), 1);
+        assert!(script.contains("and round\n\n→ §1\n"));
+    }
+
+    /// Author-facing text never reaches a script, and an empty flow has no section.
+    #[test]
+    fn screenplay_leaves_notes_out() {
+        let mut doc = Doc::default();
+        said(&mut doc, 0.0, "spoken");
+        let note = said(&mut doc, 400.0, "rewrite this");
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        doc.add_flow("empty");
+
+        let script = doc.to_screenplay();
+        assert!(script.contains("spoken"));
+        assert!(!script.contains("rewrite this"));
+        assert!(!script.contains("## empty"));
+    }
+
+    /// A jump into another flow names it, and the flow it lands in starts at the landing.
+    #[test]
+    fn screenplay_crosses_flows_by_name() {
+        let mut doc = Doc::default();
+        let here = said(&mut doc, 0.0, "down we go");
+        let jump = doc.add_node(400.0, 0.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let there = said(&mut doc, 800.0, "the cellar");
+        doc.node_mut(there).unwrap().flow = "cellar".into();
+        doc.add_edge(here, jump);
+        doc.add_edge(jump, there);
+
+        let script = doc.to_screenplay();
+        assert!(script.contains("down we go\n\n→ §2 (cellar)\n"));
+        assert!(script.contains("## cellar\n\n### §2\n\nthe cellar\n"));
+    }
+
+    /// The ids whose node differs between two documents with the same node list — what a
+    /// find-and-replace actually touched.
+    fn touched(before: &Doc, after: &Doc, differs: impl Fn(&Node, &Node) -> bool) -> Vec<NodeId> {
+        before
+            .nodes
+            .iter()
+            .zip(&after.nodes)
+            .filter(|(a, b)| differs(a, b))
+            .map(|(a, _)| a.id)
+            .collect()
+    }
+
+    fn ids(found: Vec<(NodeId, Use)>) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = found.into_iter().map(|(id, _)| id).collect();
+        ids.dedup();
+        ids
+    }
+
+    /// A document where a variable is written, read, and written-and-read by a hand-edit on
+    /// a kind that should not carry it — every field `rename_variable` reaches.
+    fn referencing_doc() -> Doc {
+        let mut doc = Doc::sample();
+        doc.add_variable("gold");
+        let set = doc.add_node(0.0, 800.0);
+        doc.node_mut(set).unwrap().kind = NodeKind::Instruction;
+        doc.set_effect(set, "gold", Some(Value::Int(5)), SetOp::Add);
+        let check = doc.add_node(400.0, 800.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(check, "gold", Some(Value::Int(3)), Cmp::Gt);
+        let odd = spoken(&mut doc, 800.0, 800.0);
+        doc.set_effect(odd, "gold", Some(Value::Int(1)), SetOp::Set);
+        doc.set_condition(odd, "gold", Some(Value::Int(1)), Cmp::Eq);
+        doc
+    }
+
+    #[test]
+    fn references_match_rename_variable() {
+        let doc = referencing_doc();
+        for name in ["gold", "asked_about_pass"] {
+            let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+            renamed.rename_variable(name, "renamed");
+            let rewritten = touched(&doc, &renamed, |a, b| {
+                a.effects != b.effects || a.conditions != b.conditions
+            });
+            let found = ids(doc.references(&Ref::Variable(name.into())));
+            assert!(!found.is_empty());
+            assert_eq!(found, rewritten, "{name}");
+        }
+    }
+
+    #[test]
+    fn references_match_rename_character() {
+        let mut doc = Doc::sample();
+        // A hub carrying a speaker is not a line, and the rename leaves it alone too.
+        let hub = doc
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Hub)
+            .unwrap()
+            .id;
+        doc.node_mut(hub).unwrap().speaker = "Innkeeper".into();
+        for name in ["Innkeeper", "Player"] {
+            let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+            renamed.rename_character(name, "Renamed");
+            let rewritten = touched(&doc, &renamed, |a, b| a.speaker != b.speaker);
+            let found = ids(doc.references(&Ref::Character(name.into())));
+            assert!(!found.is_empty());
+            assert_eq!(found, rewritten, "{name}");
+        }
+    }
+
+    #[test]
+    fn references_match_rename_flow() {
+        let mut doc = Doc::sample();
+        let moved: Vec<NodeId> = doc.nodes.iter().take(3).map(|n| n.id).collect();
+        doc.move_to_flow(&moved, "cellar");
+        let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+        renamed.rename_flow("cellar", "vault");
+        let rewritten = touched(&doc, &renamed, |a, b| a.flow != b.flow);
+        assert_eq!(ids(doc.references(&Ref::Flow("cellar".into()))), rewritten);
+        assert_eq!(rewritten, moved);
+    }
+
+    #[test]
+    fn references_name_the_field() {
+        let doc = referencing_doc();
+        let uses: Vec<Use> = doc
+            .references(&Ref::Variable("gold".into()))
+            .into_iter()
+            .map(|(_, how)| how)
+            .collect();
+        assert_eq!(uses, [Use::Writes, Use::Reads, Use::Writes, Use::Reads]);
+    }
+
+    /// Every edge in counts, a jump from another canvas included, and a node with two
+    /// edges in is listed once.
+    #[test]
+    fn references_to_a_node_are_its_incoming_edges() {
+        let mut doc = Doc::default();
+        let target = spoken(&mut doc, 0.0, 0.0);
+        let a = spoken(&mut doc, 400.0, 0.0);
+        let jump = doc.add_node(800.0, 0.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        doc.node_mut(jump).unwrap().flow = "cellar".into();
+        let unrelated = spoken(&mut doc, 1200.0, 0.0);
+        doc.add_edge(a, target);
+        doc.edges.push(doc.edges[0].clone());
+        doc.add_edge(jump, target);
+        doc.add_edge(target, unrelated);
+
+        assert_eq!(
+            doc.references(&Ref::Node(target)),
+            [(a, Use::LeadsHere), (jump, Use::LeadsHere)]
+        );
+    }
+
+    #[test]
     fn set_kind_to_jump_keeps_only_the_first_target() {
         let mut doc = Doc::default();
         let a = spoken(&mut doc, 0.0, 0.0);
@@ -4740,5 +5988,649 @@ mod tests {
 
         doc.set_kind(a, NodeKind::Hub);
         assert_eq!(doc.node(a).unwrap().player_speaker(), None);
+    }
+
+    #[test]
+    fn find_word_is_whole_word_and_case_insensitive() {
+        assert_eq!(find_word("Ask Mara about the key.", "mara"), Some(4));
+        assert_eq!(find_word("mara's key", "Mara"), Some(0));
+        assert_eq!(find_word("the Marathon", "Mara"), None);
+        assert_eq!(find_word("Tamara", "Mara"), None);
+        assert_eq!(find_word("mara_2", "Mara"), None);
+        assert_eq!(find_word("Old Tom said so", "old tom"), Some(0));
+        assert_eq!(find_word("anything", "  "), None);
+        // A char index, not a byte one: the accented letter before it is two bytes.
+        assert_eq!(find_word("é Mara", "Mara"), Some(2));
+    }
+
+    fn line(doc: &mut Doc, x: f32, speaker: &str, text: &str) -> NodeId {
+        let id = said(doc, x, text);
+        doc.node_mut(id).unwrap().speaker = speaker.into();
+        id
+    }
+
+    /// The lines naming a character they do not speak, notes included, and the choice
+    /// labels naming them too — and nothing that merely contains the name.
+    #[test]
+    fn mentions_of_a_character_are_the_prose_naming_them() {
+        let mut doc = Doc::default();
+        let ask = line(&mut doc, 0.0, "Innkeeper", "Ask Mara about the key.");
+        let own = line(&mut doc, 400.0, "Mara", "I'm Mara.");
+        let race = line(&mut doc, 800.0, "Innkeeper", "The Marathon is Tuesday.");
+        let note = said(&mut doc, 1200.0, "mara needs a second scene");
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        doc.add_edge(ask, own);
+        doc.add_edge(ask, race);
+        doc.edges[1].label = "Where's Mara?".into();
+
+        assert_eq!(
+            doc.mentions(&Ref::Character("Mara".into())),
+            [Mention::Node(ask), Mention::Node(note), Mention::Edge(1)]
+        );
+    }
+
+    /// The use it exists for: after a rename, the old name still turns up in the prose the
+    /// rename deliberately did not touch.
+    #[test]
+    fn mentions_find_what_a_rename_left_behind() {
+        let mut doc = Doc::default();
+        doc.add_character("Mara", 0);
+        let ask = line(&mut doc, 0.0, "Innkeeper", "Ask Mara about the key.");
+        line(&mut doc, 400.0, "Mara", "I'm Mara.");
+        doc.rename_character("Mara", "Marra");
+
+        // Her own line is no longer spoken by "Mara", so it is unlinked text now too.
+        let left = doc.mentions(&Ref::Character("Mara".into()));
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0], Mention::Node(ask));
+        assert!(doc.mentions(&Ref::Character("Marra".into())).is_empty());
+    }
+
+    /// A node's alias is its name; text naming it from a node with no edge to it is a
+    /// mention, and one that does link there is not.
+    #[test]
+    fn mentions_of_a_node_are_by_alias_and_skip_its_links() {
+        let mut doc = Doc::default();
+        let intro = said(&mut doc, 0.0, "Welcome back to the intro.");
+        doc.node_mut(intro).unwrap().alias = "intro".into();
+        let linked = said(&mut doc, 400.0, "Back to the intro.");
+        let loose = said(&mut doc, 800.0, "TODO: loop to INTRO");
+        doc.add_edge(linked, intro);
+        doc.add_edge(loose, linked);
+        doc.edges[1].label = "see intro".into();
+
+        assert_eq!(
+            doc.mentions(&Ref::Node(intro)),
+            [Mention::Node(loose), Mention::Edge(1)]
+        );
+        let unnamed = said(&mut doc, 1200.0, "");
+        assert!(doc.mentions(&Ref::Node(unnamed)).is_empty());
+        assert!(doc.mentions(&Ref::Variable("intro".into())).is_empty());
+    }
+
+    #[test]
+    fn snippet_keeps_the_name_in_view() {
+        // Short enough: the whole line, on one line.
+        assert_eq!(snippet("Ask Mara\nabout it", "mara"), "Ask Mara about it");
+        // A late name gets a lead-in that starts on a word.
+        assert_eq!(
+            snippet("You will want to go and find Mara by the well.", "Mara"),
+            "…and find Mara by the well."
+        );
+        // No space before the name: never skip past it looking for one.
+        assert_eq!(
+            snippet("Somebody had to say it—Mara said", "Mara"),
+            "…to say it—Mara said"
+        );
+        assert_eq!(snippet("no name here", "Mara"), "no name here");
+    }
+
+    /// No colon, no change: plain search is exactly what it was.
+    #[test]
+    fn a_query_without_filters_is_plain_search() {
+        let doc = Doc::sample();
+        assert_eq!(doc.query("where am"), doc.query("  Where   am "));
+        assert_eq!(doc.query("where am").len(), 1);
+        assert!(doc.query("").is_empty());
+    }
+
+    #[test]
+    fn query_filters_by_speaker_kind_and_flag() {
+        let mut doc = Doc::sample();
+        let player = doc.query("speaker:player");
+        assert_eq!(player.len(), 2);
+        // Filters AND with each other and with the text.
+        assert_eq!(doc.query("speaker:player where").len(), 1);
+        assert_eq!(doc.query("kind:hub").len(), 1);
+        assert_eq!(doc.query("kind:cond"), doc.query("kind:condition"));
+        assert_eq!(doc.query("is:start").len(), 1);
+
+        let farewell = doc.query("safe travels")[0];
+        doc.node_mut(farewell).unwrap().end = true;
+        doc.node_mut(farewell).unwrap().alias = "bye".into();
+        assert_eq!(doc.query("is:end"), [farewell]);
+        assert_eq!(doc.query("is:aliased"), [farewell]);
+    }
+
+    #[test]
+    fn query_filters_by_flow() {
+        let mut doc = Doc::sample();
+        let moved = doc.query("where am");
+        doc.move_to_flow(&moved, "Cellar");
+        assert_eq!(doc.query("flow:cellar"), moved);
+        assert_eq!(doc.query("flow:main").len(), doc.nodes.len() - 1);
+    }
+
+    /// Through `references`, so a set name finds every variable in it and writes are kept
+    /// apart from reads.
+    #[test]
+    fn query_finds_what_sets_and_checks_a_variable() {
+        let mut doc = Doc::sample();
+        let writes = doc.query("sets:asked_about_pass");
+        let reads = doc.query("checks:asked_about_pass");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(reads.len(), 1);
+        assert_ne!(writes, reads);
+
+        doc.rename_variable("asked_about_pass", "pass.asked");
+        assert_eq!(doc.query("sets:pass"), writes);
+        assert_eq!(doc.query("sets:PASS.ASKED"), writes);
+        assert!(doc.query("sets:pas").is_empty());
+    }
+
+    #[test]
+    fn query_finds_nodes_with_problems() {
+        let doc = Doc::sample();
+        // The sample's three dead ends, and nothing else.
+        assert_eq!(doc.query("has:problem").len(), 3);
+        assert_eq!(doc.query("has:problem speaker:player").len(), 0);
+    }
+
+    /// Typing toward a filter never errors: an unknown key is text, and a known key with no
+    /// value yet filters nothing.
+    #[test]
+    fn a_half_typed_filter_is_harmless() {
+        let doc = Doc::sample();
+        assert_eq!(doc.query("speaker:"), Vec::<NodeId>::new());
+        assert_eq!(doc.query("where speaker:"), doc.query("where"));
+        // Not a key, so the whole term is text — and it is in nobody's line.
+        assert!(doc.query("mood:happy").is_empty());
+        assert!(doc.query("is:e").is_empty());
+        assert!(doc.query("kind:zzz").is_empty());
+    }
+
+    /// A small tagged document: three nodes, one carrying a group and a child of it.
+    fn tagged_doc() -> (Doc, [NodeId; 3]) {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 600.0, 0.0);
+        doc.add_tag(&[a, b], "todo");
+        doc.add_tag(&[a], "#act1.tavern");
+        doc.add_tag(&[c], "act1");
+        doc.add_tag(&[c], "vo.recorded");
+        (doc, [a, b, c])
+    }
+
+    #[test]
+    fn clean_tag_drops_the_hash_and_refuses_a_space() {
+        assert_eq!(clean_tag("  #todo "), Some("todo".into()));
+        assert_eq!(clean_tag("vo.recorded"), Some("vo.recorded".into()));
+        assert_eq!(clean_tag("#"), None);
+        assert_eq!(clean_tag("   "), None);
+        assert_eq!(clean_tag("two words"), None);
+    }
+
+    #[test]
+    fn a_tag_is_added_once_and_removed() {
+        let (mut doc, [a, b, _]) = tagged_doc();
+        assert!(!doc.can_tag(&[a, b], "todo"));
+        assert_eq!(doc.add_tag(&[a, b], "#todo"), 0);
+        assert_eq!(doc.node(a).unwrap().tags, ["todo", "act1.tavern"]);
+        assert!(doc.remove_tag(a, "todo"));
+        assert!(!doc.remove_tag(a, "todo"));
+        assert!(doc.can_tag(&[a, b], "todo"));
+        assert_eq!(doc.add_tag(&[a, b], "todo"), 1);
+    }
+
+    #[test]
+    fn tags_are_whatever_the_nodes_carry() {
+        let (mut doc, [a, ..]) = tagged_doc();
+        doc.add_tag(&[a], "Draft");
+        assert_eq!(
+            doc.all_tags(),
+            ["act1", "act1.tavern", "Draft", "todo", "vo.recorded"]
+        );
+        assert_eq!(doc.tag_sets(), ["act1", "vo"]);
+    }
+
+    #[test]
+    fn an_old_file_loads_with_no_tags() {
+        let (doc, _) = tagged_doc();
+        let json = doc.to_json().replace("\"tags\"", "\"ignored\"");
+        let loaded = Doc::from_json(&json).unwrap();
+        assert!(loaded.all_tags().is_empty());
+    }
+
+    #[test]
+    fn rename_tag_carries_the_tags_under_it() {
+        let (mut doc, [a, b, c]) = tagged_doc();
+        assert_eq!(doc.rename_tag("act1", "act2"), 2);
+        assert_eq!(doc.node(a).unwrap().tags, ["todo", "act2.tavern"]);
+        assert_eq!(doc.node(c).unwrap().tags, ["act2", "vo.recorded"]);
+        // `todo` is not under `to`, whatever the letters say.
+        assert!(!doc.tag_rename_ok("to", "x"));
+        assert_eq!(doc.node(b).unwrap().tags, ["todo"]);
+    }
+
+    #[test]
+    fn rename_tag_merges_onto_a_taken_name() {
+        let (mut doc, [a, ..]) = tagged_doc();
+        doc.add_tag(&[a], "tood");
+        assert_eq!(doc.rename_tag("tood", "todo"), 1);
+        assert_eq!(doc.node(a).unwrap().tags, ["todo", "act1.tavern"]);
+    }
+
+    #[test]
+    fn rename_tag_refuses_a_no_op() {
+        let (mut doc, _) = tagged_doc();
+        assert_eq!(doc.rename_tag("todo", "todo"), 0);
+        assert_eq!(doc.rename_tag("todo", "two words"), 0);
+        assert_eq!(doc.rename_tag("nothing", "else"), 0);
+    }
+
+    #[test]
+    fn references_match_rename_tag() {
+        let (doc, _) = tagged_doc();
+        for name in ["todo", "act1", "act1.tavern", "vo"] {
+            let mut renamed = Doc::from_json(&doc.to_json()).unwrap();
+            renamed.rename_tag(name, "renamed");
+            let rewritten = touched(&doc, &renamed, |a, b| a.tags != b.tags);
+            let found = ids(doc.references(&Ref::Tag(name.into())));
+            assert!(!found.is_empty());
+            assert_eq!(found, rewritten, "{name}");
+        }
+    }
+
+    #[test]
+    fn query_finds_a_tag_by_prefix() {
+        let (doc, [a, b, c]) = tagged_doc();
+        assert_eq!(doc.query("tag:todo"), [a, b]);
+        assert_eq!(doc.query("tag:vo"), [c]);
+        assert_eq!(doc.query("#act1"), [a, c]);
+        assert_eq!(doc.query("tag:#TODO"), [a, b]);
+        assert_eq!(doc.query("#todo tag:act1"), [a]);
+        // Typing toward one filters nothing yet, and a lone `#` is plain text.
+        assert_eq!(doc.query("tag:").len(), 0);
+        assert!(doc.query("#").is_empty());
+    }
+
+    /// The walk, the exports and the problem list never read a tag.
+    #[test]
+    fn a_tag_changes_nothing_the_walk_or_an_export_sees() {
+        let mut doc = Doc::sample();
+        let before = (doc.to_ftl(), doc.to_screenplay(), doc.problems().len());
+        let ids: Vec<NodeId> = doc.nodes.iter().map(|n| n.id).collect();
+        doc.add_tag(&ids, "draft");
+        assert_eq!(
+            before,
+            (doc.to_ftl(), doc.to_screenplay(), doc.problems().len())
+        );
+        assert!(doc.mentions(&Ref::Tag("draft".into())).is_empty());
+    }
+
+    /// A jump node on `flow` pointing at `to`.
+    fn jump_on(doc: &mut Doc, flow: &str, to: NodeId) -> NodeId {
+        let jump = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(jump).unwrap();
+        node.kind = NodeKind::Jump;
+        node.flow = flow.to_string();
+        doc.add_edge(jump, to);
+        jump
+    }
+
+    #[test]
+    fn flow_links_count_the_jumps_between_flows() {
+        let mut doc = Doc::default();
+        let tavern = doc.add_node(0.0, 0.0);
+        let cellar = doc.add_node(0.0, 0.0);
+        doc.move_to_flow(&[cellar], "cellar");
+        let street = doc.add_node(0.0, 0.0);
+        doc.move_to_flow(&[street], "street");
+        doc.add_flow("empty");
+
+        jump_on(&mut doc, "", cellar);
+        jump_on(&mut doc, "", cellar);
+        jump_on(&mut doc, "cellar", tavern);
+        jump_on(&mut doc, "street", cellar);
+        // Lands on its own canvas: nothing crosses.
+        jump_on(&mut doc, "street", street);
+        // An ordinary edge that crosses is a `CrossFlowEdge`, not a jump, and not drawn.
+        let loose = doc.add_node(0.0, 0.0);
+        doc.add_edge(loose, cellar);
+        // A jump with no target has nowhere to point.
+        let dangling = doc.add_node(0.0, 0.0);
+        doc.node_mut(dangling).unwrap().kind = NodeKind::Jump;
+
+        // Declared flows first, then the ones nodes merely stand on — `all_flows`'s order.
+        assert_eq!(doc.map_flows(), ["", "empty", "cellar", "street"]);
+        assert_eq!(
+            doc.flow_links(),
+            [
+                ("".to_string(), "cellar".to_string(), 2),
+                ("cellar".to_string(), "".to_string(), 1),
+                ("street".to_string(), "cellar".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_map_grid_is_square_and_hit_by_its_boxes() {
+        // Five flows fit a 3×2 grid: three across, then two.
+        assert_eq!(map_cell(0, 5), (MAP_MARGIN, MAP_MARGIN));
+        assert_eq!(map_cell(2, 5).1, MAP_MARGIN);
+        assert_eq!(map_cell(3, 5), (MAP_MARGIN, MAP_MARGIN + MAP_H + MAP_GAP_Y));
+        assert_eq!(map_cols(1), 1);
+        assert_eq!(map_cols(4), 2);
+        assert_eq!(map_cols(5), 3);
+
+        let (x, y) = map_cell(4, 5);
+        assert_eq!(map_hit(5, x + 1.0, y + 1.0), Some(4));
+        assert_eq!(map_hit(5, x + MAP_W + 1.0, y), None);
+        assert_eq!(map_hit(5, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn box_exit_lands_on_the_border() {
+        // Straight right leaves by the right side, straight down by the bottom.
+        assert_eq!(box_exit((0.0, 0.0), 100.0, 40.0, (500.0, 0.0)), (50.0, 0.0));
+        assert_eq!(
+            box_exit((0.0, 0.0), 100.0, 40.0, (0.0, -500.0)),
+            (0.0, -20.0)
+        );
+        // A shallow diagonal still leaves by the side it reaches first.
+        let (x, y) = box_exit((0.0, 0.0), 100.0, 40.0, (200.0, 20.0));
+        assert_eq!((x, y), (50.0, 5.0));
+        assert_eq!(box_exit((3.0, 4.0), 10.0, 10.0, (3.0, 4.0)), (3.0, 4.0));
+    }
+
+    /// A drag from a jump's port when it already has a target is what the author means by
+    /// "point it here instead"; anything `add_edge` refuses, `link` refuses too, and
+    /// `can_link` says so *before* the view checkpoints.
+    #[test]
+    fn link_retargets_a_jump_and_refuses_what_add_edge_would() {
+        let mut doc = Doc::default();
+        let jump = doc.add_node(0.0, 0.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let first = spoken(&mut doc, 300.0, 0.0);
+        let second = spoken(&mut doc, 300.0, 200.0);
+        let note = doc.add_node(300.0, 400.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+
+        assert!(doc.can_link(jump, first));
+        assert!(doc.link(jump, first));
+        assert!(!doc.can_link(jump, first), "already the target");
+        assert!(doc.can_link(jump, second));
+        assert!(doc.link(jump, second));
+        assert_eq!(
+            doc.choices(jump),
+            vec![(second, "")],
+            "one target, the new one"
+        );
+
+        assert!(!doc.can_link(jump, note));
+        assert!(!doc.link(jump, note));
+        assert!(!doc.can_link(first, note));
+        assert!(!doc.link(first, note));
+        assert!(!doc.can_link(first, first));
+        assert_eq!(
+            doc.choices(jump),
+            vec![(second, "")],
+            "a refused link changes nothing"
+        );
+    }
+
+    #[test]
+    fn can_link_agrees_with_link_on_every_pair() {
+        let mut doc = Doc::sample();
+        let note = doc.add_node(0.0, 900.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        let ids: Vec<NodeId> = doc.nodes.iter().map(|n| n.id).collect();
+        for &from in &ids {
+            for &to in &ids {
+                let mut copy = Doc::from_json(&doc.to_json()).unwrap();
+                assert_eq!(
+                    doc.can_link(from, to),
+                    copy.link(from, to),
+                    "can_link and link disagree on {from} → {to}"
+                );
+            }
+        }
+    }
+
+    /// Tab off a note, or off a jump that already has its one target, used to make the
+    /// node and silently fail to connect it — an orphan parked where a child would go.
+    #[test]
+    fn branch_from_refuses_a_note_and_a_jump_with_a_target() {
+        let mut doc = Doc::default();
+        let note = doc.add_node(0.0, 0.0);
+        doc.node_mut(note).unwrap().kind = NodeKind::Note;
+        let jump = doc.add_node(0.0, 300.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        let landing = spoken(&mut doc, 300.0, 300.0);
+        assert!(doc.add_edge(jump, landing));
+        let (nodes, edges) = (doc.nodes.len(), doc.edges.len());
+
+        assert!(!doc.can_branch(note));
+        assert!(doc.branch_from(note).is_none());
+        assert!(!doc.can_branch(jump));
+        assert!(doc.branch_from(jump).is_none());
+        assert_eq!(
+            (doc.nodes.len(), doc.edges.len()),
+            (nodes, edges),
+            "nothing was added"
+        );
+
+        let empty_jump = doc.add_node(0.0, 600.0);
+        doc.node_mut(empty_jump).unwrap().kind = NodeKind::Jump;
+        assert!(
+            doc.can_branch(empty_jump),
+            "a jump with no target yet takes one"
+        );
+        let child = doc.branch_from(empty_jump).expect("branches");
+        assert!(doc.has_edge(empty_jump, child));
+    }
+
+    /// A double-click on any canvas but the main one used to make a node nobody could see.
+    #[test]
+    fn add_node_on_lands_on_the_canvas_named() {
+        let mut doc = Doc::default();
+        let id = doc.add_node_on("chapter1", 10.0, 20.0);
+        let node = doc.node(id).unwrap();
+        assert_eq!(
+            (node.flow.as_str(), node.x, node.y),
+            ("chapter1", 10.0, 20.0)
+        );
+        assert_eq!(doc.hit_test("chapter1", 15.0, 25.0), Some(id));
+        assert_eq!(doc.hit_test("", 15.0, 25.0), None);
+    }
+
+    /// The parser skips the blanks after `=` and finds no value, which is a parse error
+    /// — and the document already calls such a node empty.
+    #[test]
+    fn ftl_skips_a_node_that_is_blank_after_trimming() {
+        let mut doc = Doc::default();
+        let id = doc.add_node(0.0, 0.0);
+        doc.node_mut(id).unwrap().text = "  \n  ".into();
+
+        assert!(doc.problems().contains(&Problem::Empty(id)));
+        assert_eq!(doc.to_ftl(), "");
+    }
+
+    /// In a block value a line opening with `[`, `*` or `.` is syntax, and the reference
+    /// parser keeps the lines before it and drops the rest as junk. An empty string
+    /// literal in front is a placeable that renders as nothing and that a line may open
+    /// with. Leading spaces on a one-line value are skipped the same way.
+    #[test]
+    fn ftl_shields_a_line_the_parser_would_read_as_syntax() {
+        let mut doc = Doc::default();
+        let id = doc.add_node(0.0, 0.0);
+        doc.node_mut(id).unwrap().text = "Options:\n* rooms\n  .hidden\n[bracket\nplain".into();
+        let ftl = doc.to_ftl();
+        let body = ftl.split_once('\n').expect("a block value").1;
+
+        assert_eq!(
+            body,
+            "    Options:\n    {\"\"}* rooms\n    {\"\"}  .hidden\n    {\"\"}[bracket\n    plain\n"
+        );
+
+        doc.node_mut(id).unwrap().text = "  after a gap".into();
+        assert_eq!(
+            doc.to_ftl(),
+            format!("node-{id} = {{\"\"}}  after a gap\n"),
+            "the leading spaces survive behind the shield"
+        );
+        doc.node_mut(id).unwrap().text = ".single line".into();
+        assert_eq!(
+            doc.to_ftl(),
+            format!("node-{id} = .single line\n"),
+            "inline text may open with a dot; only a block line may not"
+        );
+    }
+
+    /// Text on a jump, an instruction or a condition is shown nowhere the player looks, so
+    /// a translator must never be asked to translate it; a hub's label is shown over its
+    /// choices and stays in.
+    #[test]
+    fn ftl_leaves_the_logic_kinds_out() {
+        let mut doc = Doc::default();
+        for kind in [NodeKind::Jump, NodeKind::Instruction, NodeKind::Condition] {
+            let id = doc.add_node(0.0, 0.0);
+            let node = doc.node_mut(id).unwrap();
+            node.kind = kind;
+            node.text = "stray".into();
+        }
+        assert_eq!(doc.to_ftl(), "");
+
+        let hub = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(hub).unwrap();
+        node.kind = NodeKind::Hub;
+        node.text = "Anything else?".into();
+        assert_eq!(doc.to_ftl(), format!("node-{hub} = Anything else?\n"));
+    }
+
+    /// Greek writes a final sigma differently, and a string-wise lowercase picks one form
+    /// while a char-wise one picks the other; a name in capitals must still be found.
+    #[test]
+    fn find_word_folds_a_final_sigma() {
+        assert_eq!(find_word("Ask ΟΔΥΣΣΕΥΣ about the sea", "Οδυσσευς"), Some(4));
+        assert_eq!(find_word("Ask Οδυσσευς about the sea", "ΟΔΥΣΣΕΥΣ"), Some(4));
+    }
+
+    /// Lowercasing `İ` yields two chars, so an index into the folded text is not an index
+    /// into the original — and `snippet` indexes the original.
+    #[test]
+    fn find_word_returns_an_index_into_the_original_text() {
+        let text = format!("{} Mara", "İ".repeat(16));
+        assert_eq!(find_word(&text, "Mara"), Some(17));
+        assert!(
+            snippet(&text, "Mara").ends_with("Mara"),
+            "the name stays in view"
+        );
+    }
+
+    /// `tag:#` is a tag not typed yet, not the empty prefix every tag starts with.
+    #[test]
+    fn a_tag_filter_with_no_tag_yet_filters_nothing() {
+        let mut doc = Doc::default();
+        let tagged = spoken(&mut doc, 0.0, 0.0);
+        doc.add_tag(&[tagged], "todo");
+        let plain = doc.add_node(0.0, 200.0);
+        doc.node_mut(plain).unwrap().text = "hello".into();
+
+        assert!(doc.query("tag:#").is_empty());
+        assert_eq!(
+            doc.query("tag:# hello"),
+            vec![plain],
+            "the rest is plain search"
+        );
+        assert_eq!(doc.query("tag:#todo"), vec![tagged]);
+    }
+
+    /// The marker went missing on exactly the shape a once-only choice most often has:
+    /// one unlabelled way forward.
+    #[test]
+    fn a_once_only_single_choice_is_marked_in_the_screenplay() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 0.0, 300.0);
+        doc.add_edge(a, b);
+        doc.add_edge(c, b);
+        doc.edges[0].once = true;
+
+        assert!(doc.to_screenplay().contains("- (once) *(continue)* → §"));
+    }
+
+    /// A pin wired to a node that is gone is a pin wired to nothing.
+    #[test]
+    fn an_unwired_pin_is_reported_when_its_edge_dangles() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let check = doc.add_node(0.0, 0.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(check, "paid", Some(Value::Bool(true)), Cmp::Eq);
+        let no = spoken(&mut doc, 300.0, 200.0);
+        doc.edges.push(Edge {
+            from: check,
+            to: 999,
+            label: String::new(),
+            branch: true,
+            once: false,
+        });
+        doc.add_edge(check, no);
+        doc.edges[1].branch = false;
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::UnwiredBranch(check, true)));
+        assert!(!problems.contains(&Problem::UnwiredBranch(check, false)));
+    }
+
+    /// `kind_picker` keeps the field, so the search must not read it on a kind nobody
+    /// speaks at — the same rule `references` and `stats` already follow.
+    #[test]
+    fn a_hub_is_not_found_by_the_speaker_it_no_longer_has() {
+        let mut doc = Doc::default();
+        let hub = doc.add_node(0.0, 0.0);
+        let node = doc.node_mut(hub).unwrap();
+        node.speaker = "Innkeeper".into();
+        node.text = "Anything else?".into();
+        node.kind = NodeKind::Hub;
+
+        assert!(doc.query("innkeeper").is_empty());
+        assert!(doc.query("speaker:inn").is_empty());
+        assert_eq!(
+            doc.query("anything"),
+            vec![hub],
+            "its label is still searched"
+        );
+    }
+
+    /// The problem row for an edge has to select it: a cross-flow edge is drawn on neither
+    /// canvas, so the row is the only way to reach it.
+    #[test]
+    fn a_problem_about_an_edge_names_the_edge() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.move_to_flow(&[b], "chapter2");
+
+        let problems = doc.problems();
+        assert!(problems.contains(&Problem::CrossFlowEdge(0)));
+        assert_eq!(Problem::CrossFlowEdge(0).edge(), Some(0));
+        assert_eq!(Problem::DanglingEdge(3).edge(), Some(3));
+        assert_eq!(Problem::DuplicateEdge(4).edge(), Some(4));
+        assert_eq!(Problem::DeadEnd(a).edge(), None);
     }
 }

@@ -62,6 +62,8 @@ SHOTS = [
     ("16-help", ["menu View/Keyboard shortcuts"]),
     ("24-play-trail", ["select node 1", "menu Play/Play conversation", "choose 0", "choose 0", "choose 0", "choose 1"]),
     ("17-play-over-problems", ["select node 1", "menu Play/Play conversation", "menu View/Problems"]),
+    ("25-tags", ["pane tags"]),
+    ("27-search-filter", ["menu Edit/Find", "field search kind:cond"]),
     ("21-palette", ["menu View/Command palette"]),
     # `zoom` matches two commands, so `palette next` leaves the second row highlighted.
     ("22-palette-query", ["menu View/Command palette", "field palette zoom", "palette next"]),
@@ -74,6 +76,8 @@ SHOTS = [
     # The view the editor opens on is captured separately, before any reset (see main()).
     # The Fit command is the overview: everything, however small.
     ("20-fit-all", ["menu View/Fit to view"]),
+    # Last: the map is a mode, not an overlay, so it stays up for every shot after it.
+    ("26-flow-map", ["menu View/Flow map"]),
 ]
 
 
