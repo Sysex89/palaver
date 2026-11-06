@@ -2310,7 +2310,7 @@ impl Editor {
                                 .w(px(self.view.scale(pill)))
                                 .px(px(self.view.scale(PAD_X)))
                                 .py(px(self.view.scale(2.0)))
-                                .rounded_md()
+                                .rounded_full()
                                 .bg(theme::raised())
                                 .border_1()
                                 .border_color(theme::outline())
@@ -4692,11 +4692,17 @@ impl Editor {
                     .justify_center()
                     .gap_1()
                     .py_1()
-                    .rounded_md()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if on {
+                        theme::accent()
+                    } else {
+                        theme::outline()
+                    })
                     .cursor_pointer()
                     .text_size(px(theme::SMALL))
                     .bg(if on {
-                        theme::pressed()
+                        theme::accent_wash()
                     } else {
                         theme::raised()
                     })
@@ -5494,19 +5500,18 @@ fn port_dot(node: &Node, view: View) -> impl IntoElement {
 /// and nothing else: a speaker's colour is deliberately not here, because colour on the
 /// box's outline would be confused with the selection and play highlights.
 ///
-/// Absolute, so it takes no room from the content and every kind keeps its footprint. The
-/// two left corners follow the box's own rounding (its radius less the 1px border) or the
-/// bar would square off the corner.
+/// Absolute, so it takes no room from the content and every kind keeps its footprint.
 fn kind_strip(kind: NodeKind, view: View) -> impl IntoElement {
     div()
         .absolute()
-        .left(px(0.0))
-        .top(px(0.0))
-        .bottom(px(0.0))
+        // Inset and rounded off, not flush against the edge: a bar down a 10px-radius corner
+        // squares the corner off, and the inset leaves the in-port ring a clear place to sit.
+        .left(px(6.0))
+        .top(px(8.0))
+        .bottom(px(8.0))
         // Floored, so a zoomed-out node still shows its kind.
         .w(px(view.scale(4.0).max(3.0)))
-        .rounded_tl(px(5.0))
-        .rounded_bl(px(5.0))
+        .rounded_full()
         .bg(kind_style(kind).2)
 }
 
@@ -5654,8 +5659,15 @@ fn node_box(
         // ponytail: padding, border and radius stay fixed while the box scales, so a node
         // reads chrome-heavy at 0.25x and thin at 3x. Scale them too if that starts to grate.
         .gap_1()
-        .p_2()
-        .bg(theme::raised())
+        // The left padding clears the inset kind strip.
+        .py_2()
+        .pr_2()
+        .pl(px(18.0))
+        .bg(if node.kind == NodeKind::Note {
+            theme::note_fill()
+        } else {
+            theme::raised()
+        })
         .border_1()
         // Where the play-through is standing outranks where it has been, which outranks an
         // ending; the selection outranks all three.
@@ -5664,9 +5676,12 @@ fn node_box(
             (false, true, ..) => theme::playing(),
             (false, false, true, _) => theme::trail(),
             (false, false, false, true) => theme::ending(),
+            (false, false, false, false) if node.kind == NodeKind::Note => theme::note_edge(),
             (false, false, false, false) => theme::outline(),
         })
-        .rounded_md()
+        // Scaled with the box, so a zoomed-out node keeps its proportions; the floor stops it
+        // squaring off at the zoom a large document opens on.
+        .rounded(px((10.0 * view.zoom).clamp(4.0, 12.0)))
         .shadow_md()
         .child(kind_strip(node.kind, view))
         .map(|this| match node.kind {

@@ -714,7 +714,7 @@ impl Render for TextInput {
                     .min_h(px(20. + 4. * 2.))
                     .w_full()
                     .p(px(4.))
-                    .bg(theme::canvas())
+                    .bg(theme::field())
                     .border_1()
                     .border_color(if focused {
                         theme::accent()

@@ -182,6 +182,9 @@ def main():
         # The view the document opens on, before RESET touches the zoom. Skipped by --only
         # unless asked for by name, like any other shot.
         if not only or "00-open" in only:
+            # Pinned like every other shot, or the open view takes whatever theme the desktop has.
+            editor.send("theme dark")
+            time.sleep(SETTLE)
             try:
                 capture(editor, out_dir / "00-open.png", tmp)
                 print(f"  {'00-open':22} {editor.send('state')}")

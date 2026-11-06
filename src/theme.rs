@@ -105,6 +105,9 @@ struct Palette {
     kind_condition: Rgba,
     kind_note: Rgba,
     ending: Rgba,
+    field: Rgba,
+    note_fill: Rgba,
+    note_edge: Rgba,
 }
 
 const DARK: Palette = Palette {
@@ -135,6 +138,9 @@ const DARK: Palette = Palette {
     kind_condition: hex(0xf29fc5),
     kind_note: hex(0xc8b88a),
     ending: hex(0xf5a97f),
+    field: hex(0x1e1e22),
+    note_fill: hex(0x2b2b33),
+    note_edge: hex(0x4a4a57),
 };
 
 /// "Paper": warm greys with white cards. The ladder runs the other way — a higher surface
@@ -168,6 +174,9 @@ const LIGHT: Palette = Palette {
     kind_condition: hex(0xc2255c),
     kind_note: hex(0xa37f12),
     ending: hex(0xc2622d),
+    field: hex(0xffffff),
+    note_fill: hex(0xfff7d6),
+    note_edge: hex(0xe6d9a3),
 };
 
 fn palette() -> &'static Palette {
@@ -316,6 +325,21 @@ pub fn kind_note() -> Rgba {
 /// the `DeadEnd` warning it exists to silence.
 pub fn ending() -> Rgba {
     palette().ending
+}
+
+/// A text field's fill. Sunk into the pane in the dark palette, where the ladder runs
+/// darker; in the light one a grey field reads as disabled, so it is the white of a card
+/// with an outline, which is how a paper form draws a place to write.
+pub fn field() -> Rgba {
+    palette().field
+}
+/// A note's fill and edge: its own surface, so the author's marginalia never reads as a
+/// line of dialogue. Plain card colours in the dark palette; a sticky note in the light.
+pub fn note_fill() -> Rgba {
+    palette().note_fill
+}
+pub fn note_edge() -> Rgba {
+    palette().note_edge
 }
 
 /// The tint for a speaker nobody declared. A `u32`, not an `Rgba`, because it stands in
