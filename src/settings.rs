@@ -1,4 +1,5 @@
-//! The author's preferences: which palette, and which two typefaces. Not document state — a
+//! The author's preferences: which palette, which two typefaces, and whether placeholder
+//! lines are on. Not document state — a
 //! `.dln` never records them, so opening someone else's file does not change how your editor
 //! looks — and **imports no `gpui`**, so it is testable like `doc.rs`.
 //!
@@ -114,6 +115,10 @@ pub struct Settings {
     pub theme: ThemePref,
     pub ui_font: UiFont,
     pub text_font: TextFont,
+    /// Placeholder lines from a local model. Off until the author turns it on: while off,
+    /// the Generate menu is hidden and no model is looked for or loaded. About this machine
+    /// and this author, not the document, so opening someone's file never starts a model.
+    pub generate: bool,
 }
 
 impl Settings {
@@ -189,12 +194,26 @@ mod tests {
             theme: ThemePref::Light,
             ui_font: UiFont::Geist,
             text_font: TextFont::CourierPrime,
+            generate: true,
         };
         assert_eq!(Settings::from_json(&s.to_json()), Some(s));
     }
 
     /// An older file with only some keys, a newer one with extras, and a value this build
     /// does not know: each keeps whatever it can read and defaults the rest.
+    #[test]
+    fn placeholder_lines_are_off_until_turned_on() {
+        assert!(!Settings::default().generate);
+        // A file from before the setting existed loads with it off.
+        let older = Settings::from_json(r#"{ "theme": "light" }"#).unwrap();
+        assert!(!older.generate);
+        let on = Settings {
+            generate: true,
+            ..Settings::default()
+        };
+        assert_eq!(Settings::from_json(&on.to_json()), Some(on));
+    }
+
     #[test]
     fn a_partial_or_foreign_file_keeps_what_it_can() {
         let partial = Settings::from_json(r#"{ "theme": "dark" }"#).unwrap();

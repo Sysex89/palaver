@@ -1,15 +1,22 @@
 #[cfg(all(feature = "automation", unix))]
 mod automation;
 mod doc;
+// Built in every configuration so its tests run in a default build; without the engine
+// nothing calls it.
+#[cfg_attr(not(feature = "generate"), allow(dead_code))]
+mod fill;
+#[cfg(feature = "generate")]
+mod llama;
 mod settings;
 mod text_input;
 mod theme;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId,
-    NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use, Value,
-    VarState, View, WIRE_STUB, box_exit, clean_tag, clear_backup, in_port, join_set, map_cell,
-    map_hit, node_center, out_port, read_backup, route, snippet, split_set, with_default_extension,
+    Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Line, MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node,
+    NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use,
+    Value, VarState, View, WIRE_STUB, box_exit, clean_tag, clear_backup, in_port, join_set,
+    map_cell, map_hit, node_center, out_port, read_backup, route, snippet, split_set,
+    with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -59,7 +66,10 @@ actions!(
         ShowPrefs,
         PaletteNext,
         PalettePrev,
-        PaletteRun
+        PaletteRun,
+        FillLine,
+        RerollLine,
+        AcceptLine
     ]
 );
 
@@ -115,6 +125,10 @@ fn declare_hint(pane: SidePane) -> &'static str {
 const CAST_COLORS: [u32; 8] = [
     0x9ecbff, 0xf7c96a, 0x8ce99a, 0xc3a6f7, 0xff7a7a, 0x7aa2f7, 0xb8b8c4, 0x9a9aa6,
 ];
+
+/// How often the editor looks for a line the model thread has finished.
+#[cfg(feature = "generate")]
+const FILL_POLL: Duration = Duration::from_millis(100);
 
 /// How often a dirty document gets a crash copy. Also the most work a crash can cost.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
@@ -262,7 +276,28 @@ const MENUS: &[MenuSpec] = &[
             ("Stop", "Esc", |e, w, cx| e.on_stop_play(&StopPlay, w, cx)),
         ],
     ),
+    // Hidden unless this build has the engine and the author turned placeholder lines on.
+    // The bar, the F1 sheet and the palette all ask `Editor::menu_shown`, so the three
+    // cannot disagree about whether it is there.
+    (
+        GENERATE_MENU,
+        &[
+            ("Fill line", "Ctrl+G", |e, w, cx| {
+                e.on_fill_line(&FillLine, w, cx)
+            }),
+            ("Reroll line", "Ctrl+Shift+G", |e, w, cx| {
+                e.on_reroll_line(&RerollLine, w, cx)
+            }),
+            ("Accept line", "", |e, w, cx| {
+                e.on_accept_line(&AcceptLine, w, cx)
+            }),
+        ],
+    ),
 ];
+
+/// The menu of placeholder-line commands, named once because it is the one menu that can
+/// be hidden.
+const GENERATE_MENU: &str = "Generate";
 
 /// A document's display name, or a placeholder while it has no file yet.
 fn document_name(path: Option<&std::path::Path>) -> String {
@@ -333,6 +368,9 @@ struct Editor {
     /// `sync_fields` loop — unlike `search_input` and `var_input` below.
     alias_input: Entity<TextInput>,
     label_input: Entity<TextInput>,
+    /// The document's premise. Document content but not the selected node's, so it is in
+    /// neither observer group: it has a third observer of its own that writes `doc.premise`.
+    premise_input: Entity<TextInput>,
     /// Search query. Deliberately outside the `sync_fields` loop — it is not document content.
     search_input: Entity<TextInput>,
     /// Name for a variable about to be declared. Outside the `sync_fields` loop for the
@@ -427,6 +465,10 @@ struct Editor {
     /// rather than a pane of its own, since `window_pos` is where a new pane breaks every
     /// hit test; `Editor::show` is what closes it, so anything that goes to a node leaves.
     flow_map: bool,
+    /// The placeholder generator's model thread, started on first use. Only in a build
+    /// with the engine; `Settings::generate` is whether the author has turned it on.
+    #[cfg(feature = "generate")]
+    filler: llama::Filler,
 }
 
 /// What the shared `var_input` is renaming. `Editor::pane` already says which *list* an
@@ -561,6 +603,22 @@ impl Editor {
                 .detach();
         }
 
+        // Document content, but not the selected node's: so neither in the loop above (it
+        // would be written into the node) nor the one below (it has to reach the document).
+        // A typing session is one undo step, as a line of dialogue is.
+        let premise_input =
+            cx.new(|cx| TextInput::new("Where and what this is, in a sentence", cx));
+        cx.observe(&premise_input, |this, input, cx| {
+            let premise = input.read(cx).content().to_string();
+            if premise == this.doc.premise {
+                return;
+            }
+            this.checkpoint_once();
+            this.doc.premise = premise;
+            cx.notify();
+        })
+        .detach();
+
         // Neither of these is document content, so they stay out of the loop above and only
         // ask for a re-render — without this, typing would not refresh what they drive.
         let search_input = cx.new(|cx| TextInput::new("Find — or #tag speaker: is:end", cx));
@@ -603,6 +661,7 @@ impl Editor {
             text_input,
             alias_input,
             label_input,
+            premise_input,
             search_input,
             var_input,
             value_input,
@@ -635,6 +694,8 @@ impl Editor {
             flow_map: false,
             flow: String::new(),
             fit_pending: true,
+            #[cfg(feature = "generate")]
+            filler: llama::Filler::default(),
         }
     }
 
@@ -775,7 +836,13 @@ impl Editor {
         self.flow = String::new();
         self.path = path;
         self.status = None;
+        // A line being written belongs to the document that left.
+        #[cfg(feature = "generate")]
+        self.filler.forget();
         self.select(Selection::None, cx);
+        // `select` only reloads the fields when the selection changed, and it was probably
+        // empty already.
+        self.load_premise(cx);
         cx.notify();
     }
 
@@ -810,24 +877,63 @@ impl Editor {
     }
 
     /// Writes the translatable strings out for a game build.
-    fn on_export_fluent(&mut self, _: &ExportFluent, _: &mut Window, cx: &mut Context<Self>) {
-        self.export(FTL_EXT, Doc::export_ftl, cx);
+    fn on_export_fluent(&mut self, _: &ExportFluent, window: &mut Window, cx: &mut Context<Self>) {
+        self.export(FTL_EXT, Doc::export_ftl, window, cx);
     }
 
     /// Writes the dialogue out as a script for a table read or a recording session.
     fn on_export_screenplay(
         &mut self,
         _: &ExportScreenplay,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.export(SCRIPT_EXT, Doc::export_screenplay, cx);
+        self.export(SCRIPT_EXT, Doc::export_screenplay, window, cx);
     }
 
     /// Asks where, then runs `write` there. Deliberately not a save: it leaves `self.path`,
     /// the dirty flag and the crash copy alone, so exporting never re-points the editor at
     /// the file it wrote — and `write` takes `&Doc`, so it could not if it tried.
+    ///
+    /// With placeholders still in the document it asks first. A warning the author can click
+    /// through rather than a refusal: a draft screenplay with placeholders in it is a
+    /// reasonable thing to print, and both writers mark them so a reader can tell.
     fn export(
+        &mut self,
+        ext: &'static str,
+        write: fn(&Doc, &std::path::Path) -> Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholders = self
+            .doc
+            .problems()
+            .iter()
+            .filter(|p| matches!(p, Problem::Placeholder(_) | Problem::PlaceholderChoice(_)))
+            .count();
+        if placeholders == 0 {
+            return self.export_dialog(ext, write, cx);
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &match placeholders {
+                1 => "1 line is still a placeholder.".to_string(),
+                n => format!("{n} lines are still placeholders."),
+            },
+            Some("They are marked in the file."),
+            &["Export anyway", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.export_dialog(ext, write, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn export_dialog(
         &mut self,
         ext: &'static str,
         write: fn(&Doc, &std::path::Path) -> Result<(), String>,
@@ -991,6 +1097,15 @@ impl Editor {
             .update(cx, |input, cx| input.set_placeholder(text_prompt(kind), cx));
         self.edited = selection;
         self.text_dirty = false;
+        self.load_premise(cx);
+    }
+
+    /// The premise field shows the document's premise. Separate from the rest of
+    /// `load_fields` because a document swap has to run it when the selection did not change.
+    fn load_premise(&mut self, cx: &mut Context<Self>) {
+        let premise = self.doc.premise.clone();
+        self.premise_input
+            .update(cx, |input, cx| input.set_content(&premise, cx));
     }
 
     /// Writes the fields back into the edited node or edge. Runs on every input
@@ -1010,6 +1125,11 @@ impl Editor {
                 }
                 self.checkpoint_once();
                 if let Some(node) = self.doc.node_mut(id) {
+                    // The one place a human edit lands, so the one place a placeholder
+                    // stops being one. Only the text: renaming the speaker keeps the line.
+                    if node.text != text {
+                        node.placeholder = None;
+                    }
                     node.speaker = speaker;
                     node.text = text;
                     node.alias = alias;
@@ -1027,6 +1147,7 @@ impl Editor {
                 }
                 self.checkpoint_once();
                 self.doc.edges[index].label = label;
+                self.doc.edges[index].placeholder = None;
             }
             _ => return,
         }
@@ -1513,7 +1634,7 @@ impl Editor {
     /// command instead of stopping dead.
     fn palette_step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let query = self.palette_input.read(cx).content().to_string();
-        let rows = palette_entries(&query).len();
+        let rows = self.palette_rows(&query).len();
         if rows == 0 {
             return;
         }
@@ -1534,7 +1655,7 @@ impl Editor {
     /// Enter: runs the highlighted command.
     fn on_palette_run(&mut self, _: &PaletteRun, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.palette_input.read(cx).content().to_string();
-        let entries = palette_entries(&query);
+        let entries = self.palette_rows(&query);
         let row = self.palette_sel.min(entries.len().saturating_sub(1));
         if let Some((_, (_, _, action))) = entries.get(row) {
             self.run_command(*action, window, cx);
@@ -1982,6 +2103,185 @@ impl Editor {
         cx.notify();
     }
 
+    /// Placeholder lines on or off. Turning them on loads nothing: the model is found and
+    /// read in on the first Fill, so opting in costs no memory until it is used.
+    fn set_generate(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.generate = on;
+        self.save_settings(cx);
+        cx.notify();
+    }
+
+    /// Whether the Generate menu and the inspector's line controls are live: this build has
+    /// the engine, and the author turned placeholder lines on.
+    fn generator_on(&self) -> bool {
+        cfg!(feature = "generate") && self.settings.generate
+    }
+
+    /// Whether a menu is in the bar, the F1 sheet and the palette. Every menu is, except
+    /// Generate while the generator is off.
+    fn menu_shown(&self, menu: &str) -> bool {
+        menu != GENERATE_MENU || self.generator_on()
+    }
+
+    /// `palette_entries` minus the menus that are hidden. The function stays pure over the
+    /// whole table; which menus are hidden is a fact about this editor, not the table.
+    fn palette_rows(&self, query: &str) -> Vec<(&'static str, &'static MenuItem)> {
+        palette_entries(query)
+            .into_iter()
+            .filter(|(menu, _)| self.menu_shown(menu))
+            .collect()
+    }
+
+    /// The line a selection is: one node's text, or an edge's label.
+    fn line_of(&self, selection: &Selection) -> Option<Line> {
+        match (selection.only_node(), selection) {
+            (Some(id), _) => Some(Line::Node(id)),
+            (None, Selection::Edge(index)) => {
+                self.doc.edges.get(*index).map(|e| Line::Edge(e.from, e.to))
+            }
+            _ => None,
+        }
+    }
+
+    fn on_fill_line(&mut self, _: &FillLine, _: &mut Window, cx: &mut Context<Self>) {
+        self.fill_line(false, cx);
+    }
+
+    fn on_reroll_line(&mut self, _: &RerollLine, _: &mut Window, cx: &mut Context<Self>) {
+        self.fill_line(true, cx);
+    }
+
+    /// Keeps a placeholder as written, for the read-through where some of them happen to be
+    /// fine. One undo step.
+    fn on_accept_line(&mut self, _: &AcceptLine, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(line) = self
+            .line_of(&self.selection)
+            .filter(|&line| self.doc.placeholder_of(line).is_some())
+        else {
+            return self.set_status("Nothing to accept: that is not a placeholder.".into(), cx);
+        };
+        self.checkpoint();
+        self.doc.accept_line(line);
+        cx.notify();
+    }
+
+    /// Fill writes the selected line when it is empty, and regenerates it — same seed, the
+    /// conversation as it stands now — when it is a placeholder. Reroll is the same with the
+    /// next seed, which the mark then stores. A line a person wrote is never touched, so
+    /// both refuse one with a reason rather than doing nothing.
+    fn fill_line(&mut self, reroll: bool, cx: &mut Context<Self>) {
+        if !self.generator_on() {
+            let why = if cfg!(feature = "generate") {
+                "Placeholder lines are off. Turn them on in Preferences (Ctrl+,)."
+            } else {
+                "This build has no placeholder generator: build with --features generate."
+            };
+            return self.set_status(why.into(), cx);
+        }
+        let Some(line) = self.line_of(&self.selection) else {
+            return self.set_status("Select a line of dialogue or a choice to fill.".into(), cx);
+        };
+        let Some(mut prompt) = fill::prompt(&self.doc, line) else {
+            return self.set_status(
+                "Only a speech node or a choice the player picks takes a placeholder.".into(),
+                cx,
+            );
+        };
+        let was = self.doc.line_text(line).unwrap_or_default().to_string();
+        if !was.trim().is_empty() && self.doc.placeholder_of(line).is_none() {
+            return self.set_status(
+                "That line is written. Fill only writes an empty line or a placeholder.".into(),
+                cx,
+            );
+        }
+        if reroll {
+            prompt.seed = doc::reroll(prompt.seed);
+        }
+        self.start_fill(line, prompt, was, cx);
+    }
+
+    /// Hands the prompt to the model thread and polls for the answer, the way the autosave
+    /// loop runs: a timer on the foreground, so the result is applied where the document is.
+    #[cfg(feature = "generate")]
+    fn start_fill(
+        &mut self,
+        line: Line,
+        prompt: fill::Prompt,
+        was: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(why) = self.filler.start(line, prompt, was) {
+            return self.set_status(why, cx);
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FILL_POLL).await;
+                // Stops when nothing is out, or when the window has gone.
+                if !matches!(this.update(cx, |this, cx| this.poll_fill(cx)), Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Never reached: `fill_line` stops at `generator_on`, which is false without the engine.
+    #[cfg(not(feature = "generate"))]
+    fn start_fill(&mut self, _: Line, _: fill::Prompt, _: String, _: &mut Context<Self>) {}
+
+    /// Applies a line that came back, if one has. True while one is still out.
+    #[cfg(feature = "generate")]
+    fn poll_fill(&mut self, cx: &mut Context<Self>) -> bool {
+        let busy = self.filler.busy();
+        let Some(llama::Finished { line, was, result }) = self.filler.poll() else {
+            // "Loading model…" turning into "Writing a line…" is worth a frame.
+            if self.filler.busy() != busy {
+                cx.notify();
+            }
+            return self.filler.is_writing();
+        };
+        cx.notify();
+        match result {
+            Err(why) => self.set_status(format!("No line written: {why}"), cx),
+            // The line has to still say what it said when it was asked for: a person may
+            // have typed into it meanwhile, and a human line is never overwritten.
+            Ok(_) if self.doc.line_text(line) != Some(was.as_str()) => self.set_status(
+                "That line changed while it was being written, so it was left alone.".into(),
+                cx,
+            ),
+            Ok((text, seed)) => {
+                self.checkpoint();
+                self.doc.write_placeholder(line, &text, seed);
+                // The inspector's field still holds the old text, and the next keystroke
+                // would write it back over the new one.
+                if self.line_of(&self.edited) == Some(line) {
+                    self.load_fields(self.edited.clone(), cx);
+                }
+            }
+        }
+        self.filler.is_writing()
+    }
+
+    /// Whether `line` is the one being written right now, for the inspector's "Writing…".
+    fn writing(&self, line: Line) -> bool {
+        #[cfg(feature = "generate")]
+        return self.filler.writing() == Some(line);
+        #[cfg(not(feature = "generate"))]
+        {
+            let _ = line;
+            false
+        }
+    }
+
+    /// What the status bar says while the generator works.
+    fn fill_busy(&self) -> Option<&'static str> {
+        #[cfg(feature = "generate")]
+        return self.filler.busy();
+        #[cfg(not(feature = "generate"))]
+        None
+    }
+
     fn switch_pane(&mut self, pane: SidePane, cx: &mut Context<Self>) {
         self.pane = pane;
         self.renaming = None;
@@ -2101,6 +2401,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_play))
             .on_action(cx.listener(Self::on_play_from_here))
             .on_action(cx.listener(Self::on_stop_play))
+            .on_action(cx.listener(Self::on_fill_line))
+            .on_action(cx.listener(Self::on_reroll_line))
+            .on_action(cx.listener(Self::on_accept_line))
             // Here, on the root, and not on the canvas pane: an action reaches only the
             // listeners between the root and the focused element, and Escape asks for the
             // canvas back from a text field, which lives in a side pane beside the canvas.
@@ -2149,26 +2452,28 @@ impl Editor {
             .border_b_1()
             .border_color(theme::divider())
             .text_color(theme::text())
-            .children(MENUS.iter().map(|(name, items)| {
-                let open = self.open_menu == Some(*name);
-                div()
-                    .relative()
-                    .child(
-                        div()
-                            .id(*name)
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .when(open, |this| this.bg(theme::pressed()))
-                            .hover(|style| style.bg(theme::hover()))
-                            .child(*name)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_menu = (!open).then_some(*name);
-                                cx.notify();
-                            })),
-                    )
-                    .when(open, |this| this.child(menu_dropdown(items, cx)))
-            }))
+            .children(MENUS.iter().filter(|(name, _)| self.menu_shown(name)).map(
+                |(name, items)| {
+                    let open = self.open_menu == Some(*name);
+                    div()
+                        .relative()
+                        .child(
+                            div()
+                                .id(*name)
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .when(open, |this| this.bg(theme::pressed()))
+                                .hover(|style| style.bg(theme::hover()))
+                                .child(*name)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_menu = (!open).then_some(*name);
+                                    cx.notify();
+                                })),
+                        )
+                        .when(open, |this| this.child(menu_dropdown(items, cx)))
+                },
+            ))
     }
 
     /// The graph itself. Owns the mouse handling, so sidebar clicks never reach it, and
@@ -2355,6 +2660,9 @@ impl Editor {
             })
             .filter_map(|edge| {
                 let is_pin = self.doc.is_condition(edge.from);
+                // A generated choice wears the placeholder hue on its outline, the way a
+                // node wears it in its corner; there is no corner on a pill.
+                let placeholder = self.doc.is_placeholder_choice(edge);
                 let (text, color) = if is_pin {
                     match edge.branch {
                         true => ("true".to_string(), theme::true_pin()),
@@ -2416,7 +2724,11 @@ impl Editor {
                                 .rounded_full()
                                 .bg(theme::raised())
                                 .border_1()
-                                .border_color(theme::outline())
+                                .border_color(if placeholder {
+                                    theme::placeholder()
+                                } else {
+                                    theme::outline()
+                                })
                                 .text_color(color)
                                 // A choice is what the player reads; `true`/`false` on a
                                 // condition is the editor's own word, so it stays in the UI face.
@@ -4351,6 +4663,12 @@ impl Editor {
                         this.on_zoom_reset(&ZoomReset, window, cx)
                     })),
             )
+            // A cell, not a status message: a message expires, and the work has not.
+            .children(self.fill_busy().map(|busy| {
+                cell("fill-cell")
+                    .child(div().text_color(theme::placeholder()).child("✎"))
+                    .child(busy)
+            }))
             .child(
                 div()
                     .flex_1()
@@ -4531,7 +4849,7 @@ impl Editor {
     fn palette_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         const CARD_W: f32 = 480.0;
         let query = self.palette_input.read(cx).content().to_string();
-        let entries = palette_entries(&query);
+        let entries = self.palette_rows(&query);
         let selected = self.palette_sel.min(entries.len().saturating_sub(1));
 
         deferred(
@@ -4759,17 +5077,21 @@ impl Editor {
                                 .gap_x_6()
                                 .gap_y_4()
                                 .w(px(540.0))
-                                .children(MENUS.iter().map(|(name, items)| {
-                                    group(
-                                        name,
-                                        items
-                                            .iter()
-                                            .map(|(label, keys, _)| {
-                                                (label.to_string(), keys.to_string())
-                                            })
-                                            .collect(),
-                                    )
-                                }))
+                                .children(
+                                    MENUS.iter().filter(|(name, _)| self.menu_shown(name)).map(
+                                        |(name, items)| {
+                                            group(
+                                                name,
+                                                items
+                                                    .iter()
+                                                    .map(|(label, keys, _)| {
+                                                        (label.to_string(), keys.to_string())
+                                                    })
+                                                    .collect(),
+                                            )
+                                        },
+                                    ),
+                                )
                                 .child(group(
                                     "Mouse",
                                     MOUSE
@@ -4874,6 +5196,55 @@ impl Editor {
             },
             cx,
         );
+        // Only in a build that has the engine: a toggle that can never do anything is a lie.
+        let generate_row = cfg!(feature = "generate").then(|| {
+            let row = Self::pref_row(
+                PrefRow {
+                    id: "pref-generate",
+                    title: "Placeholder lines",
+                    hint: "Fill an empty line or choice with a bland one from a local model \
+                           (Ctrl+G), to play a graph before it is written. Nothing leaves \
+                           this machine.",
+                    options: &[false, true],
+                    current: self.settings.generate,
+                    describe: |on| (if on { "On" } else { "Off" }, None),
+                    set: Editor::set_generate,
+                },
+                cx,
+            );
+            // Which file the first Fill will load, or where to put one. Looked up only
+            // while the card is open and the row is on: off means nothing is looked for.
+            let model = self.settings.generate.then(|| match fill::find_model() {
+                Some(path) => {
+                    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    (
+                        format!("Model: {name} ({:.1} GB)", size as f64 / 1e9),
+                        theme::text_muted(),
+                    )
+                }
+                None => (
+                    format!(
+                        "No model found. Put a .gguf file in {}",
+                        fill::model_dirs()
+                            .first()
+                            .map_or("models/".into(), |d| d.display().to_string())
+                    ),
+                    theme::warning(),
+                ),
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(row)
+                .children(model.map(|(text, color)| {
+                    div()
+                        .text_size(px(theme::SMALL))
+                        .text_color(color)
+                        .child(text)
+                }))
+        });
         // A line of dialogue as the canvas will draw it, so the Text font choice is judged on
         // the thing it is for.
         let preview = div()
@@ -4947,7 +5318,8 @@ impl Editor {
                         .child(theme_row)
                         .child(ui_row)
                         .child(text_row)
-                        .child(preview),
+                        .child(preview)
+                        .children(generate_row),
                 ),
         )
     }
@@ -5261,6 +5633,65 @@ impl Editor {
             }))
     }
 
+    /// Under a line's field: whether it is a placeholder, and the buttons that act on it.
+    /// Absent when there is nothing to say — no mark, and the generator off — so a build
+    /// without the engine shows a placeholder from someone else's file and nothing more.
+    fn placeholder_row(&self, line: Line, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let marked = self.doc.placeholder_of(line).is_some();
+        let on = self.generator_on();
+        let empty = self
+            .doc
+            .line_text(line)
+            .is_some_and(|text| text.trim().is_empty());
+        if !marked && !(on && empty) {
+            return None;
+        }
+        let button = |id: &'static str, label: &'static str, run: MenuAction| {
+            div()
+                .id(id)
+                .px_2()
+                .rounded_full()
+                .border_1()
+                .border_color(theme::outline())
+                .text_color(theme::text())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover()))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| run(this, window, cx)))
+        };
+        let row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .text_size(px(theme::SMALL))
+            .text_color(theme::text_muted());
+        let row = if self.writing(line) {
+            row.child(div().text_color(theme::placeholder()).child("✎ Writing…"))
+        } else if marked {
+            row.child(
+                div()
+                    .text_color(theme::placeholder())
+                    .child("✎ Placeholder"),
+            )
+            .child(button("accept-line", "Accept", |e, w, cx| {
+                e.on_accept_line(&AcceptLine, w, cx)
+            }))
+            .when(on, |row| {
+                row.child(button("reroll-line", "Reroll", |e, w, cx| {
+                    e.on_reroll_line(&RerollLine, w, cx)
+                }))
+            })
+        } else {
+            row.child(button("fill-line", "✎ Fill", |e, w, cx| {
+                e.on_fill_line(&FillLine, w, cx)
+            }))
+            .child("Ctrl+G")
+        };
+        Some(row.into_any_element())
+    }
+
     /// Inspector for the selected node or edge.
     /// The inspector: scoped to the selection, and nothing else. Find, the problem list, the
     /// key hints and the last status message used to be stacked in here at the same weight as
@@ -5350,7 +5781,8 @@ impl Editor {
                                 .flex_col()
                                 .gap_3()
                                 .child(dialogue_field("Speaker", &self.speaker_input))
-                                .child(dialogue_field("Text", &self.text_input)),
+                                .child(dialogue_field("Text", &self.text_input))
+                                .children(self.placeholder_row(Line::Node(id), cx)),
                         ))
                     })
                     .when(matches!(kind, NodeKind::Hub | NodeKind::Note), |this| {
@@ -5466,6 +5898,9 @@ impl Editor {
                                         .font_family(theme::text_font())
                                         .child(self.label_input.clone()),
                                 )
+                                .children(edge.and_then(|edge| {
+                                    self.placeholder_row(Line::Edge(edge.from, edge.to), cx)
+                                }))
                                 // Only where the player is the one choosing. Out of an
                                 // instruction or a jump the walk has to take the edge it
                                 // finds, so a once-only flag there would be a promise
@@ -5513,6 +5948,25 @@ impl Editor {
                         "Document",
                         self.file_name(),
                     ))
+                    // Only the generator reads it, so it is only asked for once the
+                    // generator is on — or once a document already has one to show.
+                    .when(
+                        self.generator_on() || !self.doc.premise.is_empty(),
+                        |this| {
+                            this.child(section(
+                                "Project",
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(field("Premise", &self.premise_input))
+                                    .child(div().type_hint().child(
+                                        "One sentence of setting and tone. Placeholder \
+                                         lines are written to fit it.",
+                                    )),
+                            ))
+                        },
+                    )
                     .child(section(
                         "Overview",
                         div()
@@ -5788,6 +6242,15 @@ fn problem_text(problem: &Problem, doc: &Doc) -> String {
             ),
             None => format!("Edge {index} is a duplicate"),
         },
+        Problem::Placeholder(id) => format!("Placeholder line: {}", label(*id)),
+        Problem::PlaceholderChoice(index) => match doc.edges.get(*index) {
+            Some(edge) => format!(
+                "Placeholder choice: {} → {}",
+                label(edge.from),
+                label(edge.to)
+            ),
+            None => "Placeholder choice".to_string(),
+        },
     }
 }
 
@@ -6010,7 +6473,13 @@ fn node_box(
                     div()
                         .w_full()
                         .font_family(theme::text_font())
-                        .text_color(theme::text())
+                        // Fainter than a written line, as well as marked: a placeholder is
+                        // candidate dialogue, never mistaken for the script.
+                        .text_color(if node.is_placeholder() {
+                            theme::text_muted()
+                        } else {
+                            theme::text()
+                        })
                         .text_ellipsis()
                         .line_clamp(3)
                         .child(node.text.clone()),
@@ -6097,22 +6566,38 @@ fn node_box(
         // sat on the third line of a wrapped line of dialogue and hid its last word. The box
         // stays `NODE_W`×`NODE_H` — kinds and tags change what a node draws, never how big it
         // is.
-        .when_some(node.tags.first(), |this, first| {
-            let more = match node.tags.len() {
-                1 => String::new(),
-                n => format!(" +{}", n - 1),
+        //
+        // A placeholder's mark shares the corner, ahead of the tag: it is the one that says
+        // the line in the box is not the script.
+        .when(node.is_placeholder() || !node.tags.is_empty(), |this| {
+            let mark = |text: String, color: Rgba| {
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(theme::raised())
+                    .text_color(color)
+                    .child(text)
             };
+            let tag = node.tags.first().map(|first| {
+                let more = match node.tags.len() {
+                    1 => String::new(),
+                    n => format!(" +{}", n - 1),
+                };
+                mark(format!("#{first}{more}"), theme::text_faint())
+            });
             this.child(
                 div()
                     .absolute()
                     .right(px(4.0))
                     .top(px(2.0))
-                    .px_1()
-                    .rounded_sm()
-                    .bg(theme::raised())
+                    .flex()
+                    .flex_row()
+                    .gap_1()
                     .text_size(px(view.scale(theme::TINY)))
-                    .text_color(theme::text_faint())
-                    .child(format!("#{first}{more}")),
+                    .when(node.is_placeholder(), |this| {
+                        this.child(mark("placeholder".into(), theme::placeholder()))
+                    })
+                    .children(tag),
             )
         })
 }
@@ -6266,6 +6751,10 @@ fn main() {
             KeyBinding::new("ctrl-4", NewInstruction, Some("Editor")),
             KeyBinding::new("ctrl-5", NewCondition, Some("Editor")),
             KeyBinding::new("ctrl-6", NewNote, Some("Editor")),
+            // Registered in every build: bindings are a startup list, and the handler says
+            // why nothing happened rather than leaving a dead key.
+            KeyBinding::new("ctrl-g", FillLine, Some("Editor")),
+            KeyBinding::new("ctrl-shift-g", RerollLine, Some("Editor")),
             KeyBinding::new("ctrl-y", Redo, Some("Editor")),
             KeyBinding::new("ctrl-n", New, Some("Editor")),
             KeyBinding::new("ctrl-s", Save, Some("Editor")),

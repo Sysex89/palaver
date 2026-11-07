@@ -333,16 +333,18 @@ impl View {
 
 const UNDO_DEPTH: usize = 50;
 
-/// Everything an undo restores: the document data, minus the history itself.
-// ponytail: a five-tuple is at the edge of readable; make it a struct if a sixth
-// field joins.
-type Snapshot = (
-    Vec<Node>,
-    Vec<Edge>,
-    Vec<Variable>,
-    Vec<Character>,
-    Vec<String>,
-);
+/// Everything an undo restores: the document data, minus the history itself. Every
+/// serialized field of [`Doc`] belongs here, or a whole class of edit quietly stops being
+/// undoable.
+#[derive(Clone)]
+struct Snapshot {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    variables: Vec<Variable>,
+    characters: Vec<Character>,
+    flows: Vec<String>,
+    premise: String,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Doc {
@@ -362,6 +364,12 @@ pub struct Doc {
     /// sitting in the unnamed main flow, and looks exactly as it did.
     #[serde(default)]
     pub flows: Vec<String>,
+    /// A sentence or two on where and what this is — "A tavern on the mountain road. Low
+    /// fantasy, dry humour." For the author, and for the placeholder generator, which is its
+    /// only reader: no export, no walk and no problem looks at it. One string, so it cannot
+    /// grow into a property bag. `default` so an older `.dln` loads with none.
+    #[serde(default)]
+    pub premise: String,
     // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
     #[serde(skip)]
     undo: Vec<Snapshot>,
@@ -443,6 +451,12 @@ pub struct Node {
     /// "effects" would be a name that lies, and the two share their *editor* instead.
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// Set while `text` is a line the generator wrote and nobody has touched since. Cleared
+    /// by a human edit (`sync_fields` in the view) or an Accept, never by a kind change —
+    /// readers go through [`Node::is_placeholder`]. Not written when absent, so a document
+    /// with no placeholders is byte-identical to one from before they existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<Placeholder>,
 }
 
 /// A field the current kind does not show is *ignored*, not erased. Changing a node's kind
@@ -469,6 +483,12 @@ impl Node {
     /// Who is talking — only ever on a speech node, see [`Node::player_text`].
     pub fn player_speaker(&self) -> Option<&str> {
         (self.kind == NodeKind::Speech).then_some(self.speaker.as_str())
+    }
+
+    /// The flag *and* a kind whose text the player reads, so a stale flag on a node that
+    /// became an instruction is neither drawn nor counted.
+    pub fn is_placeholder(&self) -> bool {
+        self.placeholder.is_some() && self.player_text().is_some()
     }
 }
 
@@ -789,6 +809,7 @@ enum Filter {
     End,
     Aliased,
     Start,
+    Placeholder,
     HasProblem,
 }
 
@@ -840,6 +861,7 @@ impl Filter {
                 "end" => Filter::End,
                 "aliased" => Filter::Aliased,
                 "start" => Filter::Start,
+                "placeholder" => Filter::Placeholder,
                 _ => return None,
             },
             _ => match value.as_str() {
@@ -920,6 +942,49 @@ pub struct Edge {
     /// reason `branch` is: an older `.dln` has none, so the value never matters to it.
     #[serde(default)]
     pub once: bool,
+    /// A choice label the generator wrote; see [`Node::placeholder`]. Read through
+    /// [`Doc::is_placeholder_choice`], since a label out of a condition is never read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<Placeholder>,
+}
+
+/// Marks a line as written by the placeholder generator rather than by a person. `seed` is
+/// what the next regenerate samples with, so regenerating gives the same line until the
+/// author rerolls — anything else would churn every diff. A node's first seed is its id,
+/// an edge's is [`edge_seed`]; a reroll stores [`reroll`] of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Placeholder {
+    pub seed: u64,
+}
+
+/// A line the generator can write: a node's text, or a choice label. An edge is named by
+/// its endpoints rather than its index, because a generation runs on another thread and an
+/// index is invalidated by any edge removal in the meantime — the key `to_ftl` uses, for
+/// the same reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Line {
+    Node(NodeId),
+    Edge(NodeId, NodeId),
+}
+
+/// splitmix64's finaliser: a fixed, well-mixed `u64 → u64`. Seeds have to come out the same
+/// on every run and every build, which rules out `RandomState` (seeded per process) and
+/// `DefaultHasher` (free to change between Rust releases).
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// A choice label's first seed, from the pair that keys an edge everywhere else.
+pub fn edge_seed(from: NodeId, to: NodeId) -> u64 {
+    mix(from ^ mix(to))
+}
+
+/// The seed after this one: what Reroll stores.
+pub fn reroll(seed: u64) -> u64 {
+    mix(seed)
 }
 
 /// Something wrong with the document, as found by [`Doc::problems`]. Carries no message
@@ -966,6 +1031,11 @@ pub enum Problem {
     /// selects the edge, since neither canvas can be clicked on to reach it. A jump's edge
     /// is exempt: crossing flows is exactly what the kind is for.
     CrossFlowEdge(usize),
+    /// A line the generator wrote that nobody has written over or accepted yet. A warning:
+    /// a draft full of them plays perfectly well, it is just not finished.
+    Placeholder(NodeId),
+    /// The same, on a choice label.
+    PlaceholderChoice(usize),
 }
 
 /// A leaf node is an ordinary way for a conversation to end, so most findings are
@@ -987,11 +1057,13 @@ impl Problem {
             | Problem::TypeMismatch(id, _)
             | Problem::UnwiredBranch(id, _)
             | Problem::DuplicateAlias(id, _)
-            | Problem::UnknownSpeaker(id, _) => Some(*id),
+            | Problem::UnknownSpeaker(id, _)
+            | Problem::Placeholder(id) => Some(*id),
             Problem::DanglingEdge(_)
             | Problem::NoStart
             | Problem::DuplicateEdge(_)
-            | Problem::CrossFlowEdge(_) => None,
+            | Problem::CrossFlowEdge(_)
+            | Problem::PlaceholderChoice(_) => None,
         }
     }
 
@@ -1003,7 +1075,8 @@ impl Problem {
         match self {
             Problem::DanglingEdge(index)
             | Problem::DuplicateEdge(index)
-            | Problem::CrossFlowEdge(index) => Some(*index),
+            | Problem::CrossFlowEdge(index)
+            | Problem::PlaceholderChoice(index) => Some(*index),
             _ => None,
         }
     }
@@ -1023,7 +1096,9 @@ impl Problem {
             | Problem::Empty(_)
             | Problem::UnwiredBranch(..)
             | Problem::UnknownSpeaker(..)
-            | Problem::DuplicateEdge(_) => Severity::Warning,
+            | Problem::DuplicateEdge(_)
+            | Problem::Placeholder(_)
+            | Problem::PlaceholderChoice(_) => Severity::Warning,
         }
     }
 }
@@ -1264,6 +1339,20 @@ impl Doc {
                 .map(|(index, _)| Problem::DuplicateEdge(index)),
         );
 
+        found.extend(
+            self.nodes
+                .iter()
+                .filter(|n| n.is_placeholder())
+                .map(|n| Problem::Placeholder(n.id)),
+        );
+        found.extend(
+            self.edges
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| self.is_placeholder_choice(e))
+                .map(|(index, _)| Problem::PlaceholderChoice(index)),
+        );
+
         // Stable, so rule order survives inside each severity band.
         found.sort_by_key(|p| p.severity());
         found
@@ -1300,6 +1389,7 @@ impl Doc {
             kind: NodeKind::Speech,
             effects: Vec::new(),
             conditions: Vec::new(),
+            placeholder: None,
         });
         id
     }
@@ -1326,6 +1416,106 @@ impl Doc {
 
     pub fn is_condition(&self, id: NodeId) -> bool {
         self.node(id).is_some_and(|n| n.kind == NodeKind::Condition)
+    }
+
+    /// A generated choice label nobody has written over or accepted, where a label is
+    /// something a player reads — the gate [`Doc::to_ftl`] uses. A label out of a condition
+    /// is replaced by `true`/`false` on the canvas, so a flag there is neither drawn nor
+    /// counted, the way [`Node::is_placeholder`] ignores one on an instruction.
+    pub fn is_placeholder_choice(&self, edge: &Edge) -> bool {
+        edge.placeholder.is_some()
+            && self
+                .node(edge.from)
+                .is_some_and(|n| n.player_text().is_some())
+    }
+
+    /// The edge a [`Line::Edge`] names: the first between the pair, which is the one the
+    /// canvas hits and draws on top.
+    pub fn edge_between(&self, from: NodeId, to: NodeId) -> Option<usize> {
+        self.edges.iter().position(|e| e.from == from && e.to == to)
+    }
+
+    /// What the line says now, or `None` when it is gone or is not a line a player reads —
+    /// a choice out of a condition, a note, an instruction.
+    pub fn line_text(&self, line: Line) -> Option<&str> {
+        match line {
+            Line::Node(id) => self.node(id)?.player_text(),
+            Line::Edge(from, to) => {
+                self.node(from)?.player_text()?;
+                Some(&self.edges[self.edge_between(from, to)?].label)
+            }
+        }
+    }
+
+    /// The line's placeholder mark, read through the same gates the problems list uses.
+    pub fn placeholder_of(&self, line: Line) -> Option<Placeholder> {
+        match line {
+            Line::Node(id) => self.node(id).filter(|n| n.is_placeholder())?.placeholder,
+            Line::Edge(from, to) => {
+                let edge = &self.edges[self.edge_between(from, to)?];
+                self.is_placeholder_choice(edge)
+                    .then_some(edge.placeholder)
+                    .flatten()
+            }
+        }
+    }
+
+    /// The seed the next generation of this line samples with: its mark's, or the line's
+    /// first seed when it has none yet.
+    pub fn seed_of(&self, line: Line) -> u64 {
+        match (self.placeholder_of(line), line) {
+            (Some(mark), _) => mark.seed,
+            (None, Line::Node(id)) => id,
+            (None, Line::Edge(from, to)) => edge_seed(from, to),
+        }
+    }
+
+    /// Writes a generated line and marks it, with the seed it was sampled from. False, and
+    /// nothing written, when the line is gone. The view checkpoints first and decides
+    /// whether a human line is in the way; this only writes.
+    // Only the engine writes one, and a build without it has no engine.
+    #[cfg_attr(not(feature = "generate"), allow(dead_code))]
+    pub fn write_placeholder(&mut self, line: Line, text: &str, seed: u64) -> bool {
+        let mark = Some(Placeholder { seed });
+        match line {
+            Line::Node(id) => match self.node_mut(id) {
+                Some(node) => {
+                    node.text = text.to_string();
+                    node.placeholder = mark;
+                    true
+                }
+                None => false,
+            },
+            Line::Edge(from, to) => match self.edge_between(from, to) {
+                Some(index) => {
+                    self.edges[index].label = text.to_string();
+                    self.edges[index].placeholder = mark;
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// Keeps a placeholder as written: the text stays, the mark goes. False when there was
+    /// no mark to clear, so the view can skip an empty undo step.
+    pub fn accept_line(&mut self, line: Line) -> bool {
+        if self.placeholder_of(line).is_none() {
+            return false;
+        }
+        match line {
+            Line::Node(id) => {
+                if let Some(node) = self.node_mut(id) {
+                    node.placeholder = None;
+                }
+            }
+            Line::Edge(from, to) => {
+                if let Some(index) = self.edge_between(from, to) {
+                    self.edges[index].placeholder = None;
+                }
+            }
+        }
+        true
     }
 
     pub fn is_note(&self, id: NodeId) -> bool {
@@ -1574,6 +1764,15 @@ impl Doc {
                     Filter::Start => {
                         n.kind != NodeKind::Note && !self.edges.iter().any(|e| e.to == n.id)
                     }
+                    // A node, or a choice out of it: "what is left to write" has to find
+                    // a generated label too, and the list only holds nodes.
+                    Filter::Placeholder => {
+                        n.is_placeholder()
+                            || self
+                                .edges
+                                .iter()
+                                .any(|e| e.from == n.id && self.is_placeholder_choice(e))
+                    }
                     Filter::HasProblem => faulty.contains(&n.id),
                 })
             })
@@ -1646,6 +1845,7 @@ impl Doc {
             label: String::new(),
             branch,
             once: false,
+            placeholder: None,
         });
         true
     }
@@ -2383,21 +2583,31 @@ impl Doc {
     }
 
     fn snapshot(&self) -> Snapshot {
-        (
-            self.nodes.clone(),
-            self.edges.clone(),
-            self.variables.clone(),
-            self.characters.clone(),
-            self.flows.clone(),
-        )
+        Snapshot {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            variables: self.variables.clone(),
+            characters: self.characters.clone(),
+            flows: self.flows.clone(),
+            premise: self.premise.clone(),
+        }
     }
 
-    fn restore(&mut self, (nodes, edges, variables, characters, flows): Snapshot) {
+    fn restore(&mut self, snapshot: Snapshot) {
+        let Snapshot {
+            nodes,
+            edges,
+            variables,
+            characters,
+            flows,
+            premise,
+        } = snapshot;
         self.nodes = nodes;
         self.edges = edges;
         self.variables = variables;
         self.characters = characters;
         self.flows = flows;
+        self.premise = premise;
     }
 
     /// Records the current state so the next mutation can be undone. Every mutation
@@ -2460,6 +2670,9 @@ impl Doc {
             // finds nothing — and a blank node is already `Problem::Empty`, so the document
             // says so where the author reads it.
             if let Some(text) = node.player_text().filter(|t| !t.trim().is_empty()) {
+                if node.is_placeholder() {
+                    out += PLACEHOLDER_FTL;
+                }
                 out += &Self::ftl_entry(&format!("node-{}", node.id), text);
             }
         }
@@ -2471,6 +2684,9 @@ impl Doc {
                 .node(edge.from)
                 .is_some_and(|n| n.player_text().is_some());
             if chosen && !edge.label.is_empty() {
+                if self.is_placeholder_choice(edge) {
+                    out += PLACEHOLDER_FTL;
+                }
                 out += &Self::ftl_entry(&format!("edge-{}-{}", edge.from, edge.to), &edge.label);
             }
         }
@@ -2739,7 +2955,12 @@ impl Doc {
                                 label => label,
                             };
                             let once = if edge.once { "(once) " } else { "" };
-                            out += &format!("- {once}{label} → {}\n", reference(last, edge.to));
+                            let mark = match self.is_placeholder_choice(edge) {
+                                true => PLACEHOLDER_SCRIPT,
+                                false => "",
+                            };
+                            out +=
+                                &format!("- {once}{label}{mark} → {}\n", reference(last, edge.to));
                         }
                     }
                 }
@@ -2923,6 +3144,7 @@ impl Doc {
                 label: label.into(),
                 branch: false,
                 once: false,
+                placeholder: None,
             });
         };
 
@@ -3066,6 +3288,12 @@ impl Doc {
 type ScriptSection<'a> = (&'a str, Vec<Vec<NodeId>>);
 
 /// A flow's heading in a script: the main flow has no name of its own.
+/// What an export writes on a line the generator wrote and nobody has accepted, so a
+/// translator or a reader at a table read knows it is not the script. A Fluent comment —
+/// it attaches to the entry under it, so tools keep it with the string.
+const PLACEHOLDER_FTL: &str = "# placeholder\n";
+const PLACEHOLDER_SCRIPT: &str = " *(placeholder)*";
+
 fn flow_title(flow: &str) -> &str {
     if flow.is_empty() { "Main" } else { flow }
 }
@@ -3077,7 +3305,10 @@ fn flow_title(flow: &str) -> &str {
 fn script_line(node: &Node) -> String {
     let body = match node.kind {
         NodeKind::Speech => {
-            let text = node.text.trim().lines().collect::<Vec<_>>().join("  \n");
+            let mut text = node.text.trim().lines().collect::<Vec<_>>().join("  \n");
+            if node.is_placeholder() {
+                text += PLACEHOLDER_SCRIPT;
+            }
             let mut out = match node.speaker.trim() {
                 "" => text,
                 speaker => format!("**{}**  \n{text}", speaker.to_uppercase()),
@@ -3578,6 +3809,7 @@ mod tests {
             label: String::new(),
             branch: false,
             once: false,
+            placeholder: None,
         });
 
         let problems = doc.problems();
@@ -6847,6 +7079,7 @@ mod tests {
             label: String::new(),
             branch: true,
             once: false,
+            placeholder: None,
         });
         doc.add_edge(check, no);
         doc.edges[1].branch = false;
@@ -6892,5 +7125,172 @@ mod tests {
         assert_eq!(Problem::DanglingEdge(3).edge(), Some(3));
         assert_eq!(Problem::DuplicateEdge(4).edge(), Some(4));
         assert_eq!(Problem::DeadEnd(a).edge(), None);
+    }
+
+    /// The first speech node with something said in it, and the first labelled choice out
+    /// of a node the player reads — the two kinds of line the generator writes.
+    fn a_line_and_a_choice(doc: &Doc) -> (NodeId, (NodeId, NodeId)) {
+        let line = doc
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Speech && !n.text.trim().is_empty())
+            .unwrap()
+            .id;
+        let edge = doc
+            .edges
+            .iter()
+            .find(|e| !e.label.is_empty() && doc.node(e.from).unwrap().kind == NodeKind::Speech)
+            .unwrap();
+        (line, (edge.from, edge.to))
+    }
+
+    #[test]
+    fn a_placeholder_is_a_warning_on_its_line_and_accepting_it_clears_it() {
+        let mut doc = Doc::tavern();
+        let (line, (from, to)) = a_line_and_a_choice(&doc);
+        let before = doc.problems().len();
+        doc.write_placeholder(Line::Node(line), "Evening.", line);
+        doc.write_placeholder(Line::Edge(from, to), "Go on.", 7);
+        let problems = doc.problems();
+        assert_eq!(problems.len(), before + 2);
+        assert!(problems.contains(&Problem::Placeholder(line)));
+        let index = doc.edge_between(from, to).unwrap();
+        assert!(problems.contains(&Problem::PlaceholderChoice(index)));
+        assert_eq!(Problem::PlaceholderChoice(index).edge(), Some(index));
+        assert_eq!(Problem::Placeholder(line).severity(), Severity::Warning);
+
+        assert!(doc.accept_line(Line::Node(line)));
+        assert!(doc.accept_line(Line::Edge(from, to)));
+        assert!(!doc.accept_line(Line::Node(line)), "nothing left to accept");
+        assert_eq!(doc.problems().len(), before);
+        assert_eq!(doc.node(line).unwrap().text, "Evening.");
+    }
+
+    /// A field the current kind does not show is ignored, never erased.
+    #[test]
+    fn a_stale_mark_on_a_kind_without_a_line_is_neither_counted_nor_lost() {
+        let mut doc = Doc::tavern();
+        let (line, _) = a_line_and_a_choice(&doc);
+        doc.write_placeholder(Line::Node(line), "Evening.", line);
+        doc.set_kind(line, NodeKind::Instruction);
+        assert!(!doc.node(line).unwrap().is_placeholder());
+        assert!(!doc.problems().contains(&Problem::Placeholder(line)));
+        assert!(doc.query("is:placeholder").is_empty());
+        doc.set_kind(line, NodeKind::Speech);
+        assert!(doc.node(line).unwrap().is_placeholder());
+        assert_eq!(doc.query("is:placeholder"), vec![line]);
+    }
+
+    #[test]
+    fn the_mark_and_its_seed_survive_undo() {
+        let mut doc = Doc::tavern();
+        let (line, _) = a_line_and_a_choice(&doc);
+        doc.checkpoint();
+        doc.write_placeholder(Line::Node(line), "Evening.", 42);
+        doc.checkpoint();
+        doc.write_placeholder(Line::Node(line), "Evening again.", reroll(42));
+        doc.undo();
+        assert_eq!(
+            doc.placeholder_of(Line::Node(line)),
+            Some(Placeholder { seed: 42 })
+        );
+        assert_eq!(doc.seed_of(Line::Node(line)), 42);
+        doc.undo();
+        assert_eq!(doc.placeholder_of(Line::Node(line)), None);
+        assert_eq!(
+            doc.seed_of(Line::Node(line)),
+            line,
+            "a node's first seed is its id"
+        );
+    }
+
+    #[test]
+    fn a_choice_seeds_from_its_pair_and_a_reroll_changes_it() {
+        assert_eq!(edge_seed(1, 2), edge_seed(1, 2));
+        assert_ne!(edge_seed(1, 2), edge_seed(2, 1));
+        assert_ne!(reroll(5), 5);
+        assert_ne!(reroll(reroll(5)), reroll(5));
+    }
+
+    /// Both exports mark a placeholder, and only a placeholder.
+    #[test]
+    fn exports_mark_a_placeholder_and_nothing_else() {
+        let mut doc = Doc::tavern();
+        let (line, (from, to)) = a_line_and_a_choice(&doc);
+        assert!(!doc.to_ftl().contains("# placeholder"));
+        assert!(!doc.to_screenplay().contains("(placeholder)"));
+
+        doc.write_placeholder(Line::Node(line), "Evening.", line);
+        let ftl = doc.to_ftl();
+        assert!(ftl.contains(&format!("# placeholder\nnode-{line} = Evening.\n")));
+        assert_eq!(ftl.matches("# placeholder").count(), 1);
+        let script = doc.to_screenplay();
+        assert!(script.contains("Evening. *(placeholder)*"));
+        assert_eq!(script.matches("(placeholder)").count(), 1);
+
+        doc.write_placeholder(Line::Edge(from, to), "Go on.", 7);
+        assert!(
+            doc.to_ftl()
+                .contains(&format!("# placeholder\nedge-{from}-{to} = Go on.\n"))
+        );
+        assert!(doc.to_screenplay().contains("Go on. *(placeholder)*"));
+    }
+
+    /// No placeholders, no new keys: a file from before the feature is written back as it was.
+    #[test]
+    fn a_document_without_placeholders_writes_no_placeholder_key() {
+        let mut doc = Doc::tavern();
+        assert!(!doc.to_json().contains("\"placeholder\""));
+        let (line, _) = a_line_and_a_choice(&doc);
+        doc.write_placeholder(Line::Node(line), "Evening.", 9);
+        let json = doc.to_json();
+        assert_eq!(json.matches("\"placeholder\"").count(), 1);
+        let back = Doc::from_json(&json).unwrap();
+        assert_eq!(
+            back.placeholder_of(Line::Node(line)),
+            Some(Placeholder { seed: 9 })
+        );
+    }
+
+    /// The premise is read by the generator and nothing else.
+    #[test]
+    fn a_premise_changes_nothing_the_walk_or_an_export_sees() {
+        let mut doc = Doc::sample();
+        let before = (doc.to_ftl(), doc.to_screenplay(), doc.problems().len());
+        doc.premise = "A tavern on the mountain road.".into();
+        assert_eq!(
+            before,
+            (doc.to_ftl(), doc.to_screenplay(), doc.problems().len())
+        );
+        assert!(doc.query("mountain").is_empty());
+    }
+
+    #[test]
+    fn undo_restores_the_premise() {
+        let mut doc = Doc::default();
+        doc.checkpoint();
+        doc.premise = "A tavern.".into();
+        doc.undo();
+        assert_eq!(doc.premise, "");
+        doc.redo();
+        assert_eq!(doc.premise, "A tavern.");
+    }
+
+    /// A generated line can only land on a line the player reads.
+    #[test]
+    fn a_choice_out_of_a_condition_is_no_line() {
+        let mut doc = Doc::default();
+        let cond = doc.add_node(0.0, 0.0);
+        let to = doc.add_node(200.0, 0.0);
+        doc.add_edge(cond, to);
+        doc.set_kind(cond, NodeKind::Condition);
+        assert_eq!(doc.line_text(Line::Edge(cond, to)), None);
+        doc.write_placeholder(Line::Edge(cond, to), "x", 1);
+        assert_eq!(doc.placeholder_of(Line::Edge(cond, to)), None);
+        assert!(
+            doc.problems()
+                .iter()
+                .all(|p| !matches!(p, Problem::PlaceholderChoice(_)))
+        );
     }
 }

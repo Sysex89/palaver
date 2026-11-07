@@ -322,6 +322,12 @@ pub fn kind_condition() -> Rgba {
 pub fn kind_note() -> Rgba {
     palette().kind_note
 }
+/// A line the placeholder generator wrote and nobody has written over or accepted. The
+/// warning hue on purpose, not a new one: a placeholder *is* a warning — the status bar's
+/// badge counts it — so the node it is about wears the colour of the count it is in.
+pub fn placeholder() -> Rgba {
+    warning()
+}
 /// A node marked as a deliberate ending. Peach rather than amber, so it never reads as
 /// the `DeadEnd` warning it exists to silence.
 pub fn ending() -> Rgba {

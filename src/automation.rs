@@ -176,6 +176,18 @@ fn run(
             Ok(String::new())
         }
 
+        // `generate on|off` — the Preferences row's own setter. Persisting is already off
+        // under automation, so a script never turns it on for the real settings file.
+        "generate" => {
+            let on = match rest {
+                "on" => true,
+                "off" => false,
+                _ => return Err(format!("expected on or off, not {rest:?}")),
+            };
+            editor.set_generate(on, cx);
+            Ok(String::new())
+        }
+
         "prefs" => {
             editor.on_show_prefs(&crate::ShowPrefs, window, cx);
             Ok(String::new())
@@ -386,6 +398,7 @@ fn field<'a>(editor: &'a Editor, name: &str) -> Result<&'a gpui::Entity<crate::T
         "text" => &editor.text_input,
         "alias" => &editor.alias_input,
         "label" => &editor.label_input,
+        "premise" => &editor.premise_input,
         "search" => &editor.search_input,
         "palette" => &editor.palette_input,
         "var" => &editor.var_input,
