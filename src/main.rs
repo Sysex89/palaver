@@ -23,8 +23,8 @@ use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder,
     PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle, ScrollWheelEvent,
-    SharedString, Window, WindowAppearance, WindowBounds, WindowHandle, WindowOptions, actions,
-    canvas, deferred, div, point, prelude::*, px, rgb, size,
+    SharedString, Subscription, Window, WindowAppearance, WindowBounds, WindowHandle,
+    WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
 };
 use settings::{Settings, TextFont, ThemePref, UiFont};
 use std::path::PathBuf;
@@ -461,6 +461,12 @@ struct Editor {
     /// where there is a window — and so the very first frame, whose size is the real one, is
     /// fitted rather than guessed at in `new`.
     fit_pending: bool,
+    /// The node the command line asked for, centred again at the window's first resize:
+    /// a tiling desktop resizes a window just after it opens, which would leave the node off
+    /// centre. Taken by that resize, so later ones are the person's (`link.rs`).
+    recenter: Option<NodeId>,
+    /// Keeps the resize hook for `recenter` alive for the window's life.
+    _bounds_hook: Option<Subscription>,
     /// Which canvas is on screen. A flow is a *view* onto the one flat node list, so this
     /// is editor state and never serialized — the whole feature is this filter plus a tab.
     flow: String,
@@ -703,6 +709,8 @@ impl Editor {
             flow_map: false,
             flow: String::new(),
             fit_pending: true,
+            recenter: None,
+            _bounds_hook: None,
             #[cfg(feature = "generate")]
             filler: llama::Filler::default(),
         }
@@ -1087,7 +1095,15 @@ impl Editor {
                 return;
             }
         }
-        self.go_to(request.flow.as_deref(), request.node.as_deref(), window, cx);
+        self.recenter = self.go_to(request.flow.as_deref(), request.node.as_deref(), window, cx);
+        if self.recenter.is_some() {
+            self._bounds_hook = Some(cx.observe_window_bounds(window, |this, window, cx| {
+                if let Some(id) = this.recenter.take() {
+                    this.show(id, window, cx);
+                    cx.notify();
+                }
+            }));
+        }
         #[cfg(unix)]
         self.take_handovers(file, window, cx);
     }
@@ -1100,25 +1116,27 @@ impl Editor {
         node: Option<&str>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<NodeId> {
         let node = node.filter(|node| !node.trim().is_empty());
         let flow = flow.filter(|flow| !flow.trim().is_empty());
         if let Some(name) = node {
-            match self.doc.find_node(name) {
-                Some(id) => {
-                    self.jump_to(id, window, cx);
-                    // The opening fit would pull the view off the node again.
-                    self.fit_pending = false;
-                }
-                None => self.set_status(format!("No node {name} in this file"), cx),
-            }
-        } else if let Some(name) = flow {
+            let Some(id) = self.doc.find_node(name) else {
+                self.set_status(format!("No node {name} in this file"), cx);
+                return None;
+            };
+            self.jump_to(id, window, cx);
+            // The opening fit would pull the view off the node again.
+            self.fit_pending = false;
+            return Some(id);
+        }
+        if let Some(name) = flow {
             if self.doc.flows.iter().any(|known| known == name) {
                 self.show_flow(name, cx);
             } else {
                 self.set_status(format!("No flow {name} in this file"), cx);
             }
         }
+        None
     }
 
     /// Takes the places later launches for `file` hand over, while this window still has
@@ -1138,7 +1156,7 @@ impl Editor {
                         if current.as_ref() != Some(&file) {
                             return false;
                         }
-                        this.go_to(Some(&goto.flow), Some(&goto.node), window, cx);
+                        let _ = this.go_to(Some(&goto.flow), Some(&goto.node), window, cx);
                         window.activate_window();
                         cx.notify();
                         true
