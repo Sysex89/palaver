@@ -5,6 +5,7 @@ mod doc;
 // nothing calls it.
 #[cfg_attr(not(feature = "generate"), allow(dead_code))]
 mod fill;
+mod link;
 #[cfg(feature = "generate")]
 mod llama;
 mod settings;
@@ -132,6 +133,11 @@ const FILL_POLL: Duration = Duration::from_millis(100);
 
 /// How often a dirty document gets a crash copy. Also the most work a crash can cost.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
+
+/// How often a window looks for a place a later launch handed it (`link.rs`): quick enough
+/// to feel like the launch opened it, slow enough to cost nothing.
+#[cfg(unix)]
+const HANDOVER_POLL: Duration = Duration::from_millis(150);
 
 /// One arrow on the flow map, in pane pixels: where it leaves, where it lands, where its
 /// count sits, and the count — how many jumps it stands for.
@@ -402,6 +408,8 @@ struct Editor {
     text_dirty: bool,
     /// Where the document was last saved or loaded from.
     path: Option<PathBuf>,
+    /// The command line's `--after-save`: run after every successful save (`link.rs`).
+    after_save: Option<String>,
     /// Outcome of the last save or load, shown in the status bar until it clears itself.
     status: Option<String>,
     /// Bumped by every `set_status`, so a message's expiry timer can tell it is still the
@@ -671,6 +679,7 @@ impl Editor {
             edited: Selection::None,
             text_dirty: false,
             path: None,
+            after_save: None,
             status: None,
             status_gen: 0,
             searching: false,
@@ -1028,12 +1037,120 @@ impl Editor {
             Ok(()) => {
                 // The work is on disk under its own name now; the crash copy is redundant.
                 clear_backup();
-                self.path = Some(path);
+                self.path = Some(path.clone());
                 let status = format!("Saved {}", self.file_name());
                 self.set_status(status, cx);
+                if let Some(command) = self.after_save.clone() {
+                    self.run_after_save(command, path, cx);
+                }
             }
             Err(error) => self.set_status(format!("Save failed: {error}"), cx),
         }
+    }
+
+    /// The `--after-save` command, off the foreground; the status bar says how it went. The
+    /// save itself has already happened and is not undone by a command that fails.
+    fn run_after_save(&mut self, command: String, path: PathBuf, cx: &mut Context<Self>) {
+        let saved = self.file_name();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { link::run_after_save(&command, &path) })
+                .await;
+            let status = match outcome.ok {
+                true => format!("Saved {saved} · after-save ran"),
+                false => format!("Saved {saved} · after-save failed, {}", outcome.detail),
+            };
+            this.update(cx, |this, cx| this.set_status(status, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// What the command line asked for, once the window is up: the file opened (through
+    /// [`Editor::replace_doc`], as every open is), the place gone to, the after-save
+    /// command kept, and, on Unix, the window made the one later launches for this file
+    /// hand their place to (`link.rs`).
+    fn open_requested(
+        &mut self,
+        request: link::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.after_save = request.after_save;
+        let Some(file) = request.file else {
+            return;
+        };
+        match Doc::load(&file) {
+            Ok(doc) => self.replace_doc(doc, Some(file.clone()), cx),
+            Err(error) => {
+                self.set_status(format!("Open failed: {error}"), cx);
+                return;
+            }
+        }
+        self.go_to(request.flow.as_deref(), request.node.as_deref(), window, cx);
+        #[cfg(unix)]
+        self.take_handovers(file, window, cx);
+    }
+
+    /// Shows a flow, or selects a node and brings it into view, by the names another tool
+    /// has for them. A name the document lacks is said in the status bar, not guessed at.
+    fn go_to(
+        &mut self,
+        flow: Option<&str>,
+        node: Option<&str>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let node = node.filter(|node| !node.trim().is_empty());
+        let flow = flow.filter(|flow| !flow.trim().is_empty());
+        if let Some(name) = node {
+            match self.doc.find_node(name) {
+                Some(id) => {
+                    self.jump_to(id, window, cx);
+                    // The opening fit would pull the view off the node again.
+                    self.fit_pending = false;
+                }
+                None => self.set_status(format!("No node {name} in this file"), cx),
+            }
+        } else if let Some(name) = flow {
+            if self.doc.flows.iter().any(|known| known == name) {
+                self.show_flow(name, cx);
+            } else {
+                self.set_status(format!("No flow {name} in this file"), cx);
+            }
+        }
+    }
+
+    /// Takes the places later launches for `file` hand over, while this window still has
+    /// that file open; a launch handed a refusal opens the file itself.
+    #[cfg(unix)]
+    fn take_handovers(&mut self, file: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(inbox) = link::listen(&file) else {
+            return;
+        };
+        let file = file.canonicalize().unwrap_or(file);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(HANDOVER_POLL).await;
+                while let Ok(goto) = inbox.try_recv() {
+                    let took = this.update_in(cx, |this, window, cx| {
+                        let current = this.path.as_ref().and_then(|path| path.canonicalize().ok());
+                        if current.as_ref() != Some(&file) {
+                            return false;
+                        }
+                        this.go_to(Some(&goto.flow), Some(&goto.node), window, cx);
+                        window.activate_window();
+                        cx.notify();
+                        true
+                    });
+                    let Ok(took) = took else {
+                        return; // The window closed.
+                    };
+                    let _ = goto.reply.send(took);
+                }
+            }
+        })
+        .detach();
     }
 
     /// Shows a message in the status bar and clears it after [`STATUS_FOR`]. A message that
@@ -6707,7 +6824,30 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>, zoom: f32) -> Option<Path
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    // The command line first: a mistake in it is said and nothing opens.
+    let request = match link::parse(std::env::args().skip(1)) {
+        Ok(request) => request,
+        Err(why) => {
+            if !why.is_empty() {
+                eprintln!("palaver: {why}");
+            }
+            eprintln!("{}", link::USAGE);
+            std::process::exit(if why.is_empty() { 0 } else { 2 });
+        }
+    };
+    // A file already open in a window is shown there, not opened twice (`link.rs`).
+    #[cfg(unix)]
+    if let Some(file) = &request.file
+        && link::hand_over(
+            file,
+            request.flow.as_deref().unwrap_or_default(),
+            request.node.as_deref().unwrap_or_default(),
+        )
+    {
+        return;
+    }
+
+    Application::new().run(move |cx: &mut App| {
         // Before the window opens, so the first frame already has its faces.
         if let Err(why) = cx.text_system().add_fonts(
             FONT_FILES
@@ -6804,6 +6944,13 @@ fn main() {
         // Anything a previous run left behind is offered back before the first frame.
         handle
             .update(cx, |this, window, cx| this.offer_recovery(window, cx))
+            .unwrap();
+
+        // Then the command line's file, place and after-save command.
+        handle
+            .update(cx, |this, window, cx| {
+                this.open_requested(request, window, cx)
+            })
             .unwrap();
 
         // Development builds only: a socket a script drives the editor through, so it can be

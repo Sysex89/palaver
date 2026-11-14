@@ -1624,6 +1624,21 @@ impl Doc {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
+    /// The node a name from outside the editor means — the command line's `--node`: its
+    /// alias, or failing that its id. Not its position (`Node 3`), which an insertion
+    /// renumbers; an alias is the author's handle and an id never changes.
+    pub fn find_node(&self, name: &str) -> Option<NodeId> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.nodes
+            .iter()
+            .find(|n| n.alias == name)
+            .map(|n| n.id)
+            .or_else(|| name.parse().ok().filter(|id| self.node(*id).is_some()))
+    }
+
     /// Topmost node of one flow containing the point, in document coordinates. Scoped
     /// because only that flow's nodes are drawn: a node on another canvas that happens to
     /// sit under the cursor must not be clickable through this one.
@@ -3353,6 +3368,22 @@ fn distance_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn find_node_takes_an_alias_or_an_id_and_nothing_else() {
+        let mut doc = Doc::sample();
+        let first = doc.nodes[0].id;
+        let second = doc.nodes[1].id;
+        doc.nodes[1].alias = "greeting".into();
+        assert_eq!(doc.find_node("greeting"), Some(second));
+        assert_eq!(doc.find_node(&first.to_string()), Some(first));
+        assert_eq!(doc.find_node(" greeting "), Some(second));
+        assert_eq!(doc.find_node("no such alias"), None);
+        assert_eq!(doc.find_node(""), None);
+        // A number no node has is not a node, whatever it looks like.
+        let unused = doc.nodes.iter().map(|n| n.id).max().unwrap() + 1;
+        assert_eq!(doc.find_node(&unused.to_string()), None);
+    }
     use super::*;
 
     #[test]
