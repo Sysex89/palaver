@@ -13,11 +13,11 @@ mod text_input;
 mod theme;
 
 use doc::{
-    Cmp, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Line, MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node,
-    NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use,
-    Value, VarState, View, WIRE_STUB, box_exit, clean_tag, clear_backup, in_port, join_set,
-    map_cell, map_hit, node_center, out_port, read_backup, route, snippet, split_set,
-    with_default_extension,
+    Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Line, MAP_H, MAP_W, Mention,
+    NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT,
+    SetOp, Severity, Use, Value, VarState, View, WIRE_STUB, box_exit, clean_tag, clear_backup,
+    in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup, route, snippet,
+    split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -116,6 +116,10 @@ fn declare_hint(pane: SidePane) -> &'static str {
         SidePane::Tags => "Tag the selection",
     }
 }
+
+/// What a row declared from outside shows where its type, rename and remove buttons would
+/// be (`Doc::set_outside`): the names came from elsewhere, and are that tool's to change.
+const OUTSIDE_MARK: &str = "↗";
 
 /// The colours a character can be tinted, cycled by clicking the swatch. The one set of hex
 /// literals outside `theme.rs`, deliberately: these values are written into `.dln` files, so
@@ -1095,6 +1099,9 @@ impl Editor {
                 return;
             }
         }
+        if let Some(path) = &request.declarations {
+            self.declare_from(path, cx);
+        }
         self.recenter = self.go_to(request.flow.as_deref(), request.node.as_deref(), window, cx);
         if self.recenter.is_some() {
             self._bounds_hook = Some(cx.observe_window_bounds(window, |this, window, cx| {
@@ -1142,6 +1149,32 @@ impl Editor {
     /// Takes the places later launches for `file` hand over, while this window still has
     /// that file open; a launch handed a refusal opens the file itself.
     #[cfg(unix)]
+    /// Reads a declarations file (`link.rs`) into the open document: names another tool
+    /// gives this session, which the panes show locked and no save writes. A character the
+    /// file gives no colour gets the next of the cast's. A file that does not read is said in
+    /// the status bar, and the names from before stay.
+    fn declare_from(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match Declarations::load(path) {
+            Ok(declared) => {
+                let characters = declared
+                    .characters
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, character)| Character {
+                        name: character.name,
+                        color: character
+                            .color
+                            .unwrap_or(CAST_COLORS[i % CAST_COLORS.len()]),
+                    })
+                    .collect();
+                self.doc
+                    .set_outside(&declared.from, declared.variables, characters);
+                cx.notify();
+            }
+            Err(error) => self.set_status(format!("Declarations not read: {error}"), cx),
+        }
+    }
+
     fn take_handovers(&mut self, file: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let Some(inbox) = link::listen(&file) else {
             return;
@@ -1155,6 +1188,9 @@ impl Editor {
                         let current = this.path.as_ref().and_then(|path| path.canonicalize().ok());
                         if current.as_ref() != Some(&file) {
                             return false;
+                        }
+                        if !goto.declarations.is_empty() {
+                            this.declare_from(std::path::Path::new(&goto.declarations), cx);
                         }
                         let _ = this.go_to(Some(&goto.flow), Some(&goto.node), window, cx);
                         window.activate_window();
@@ -3186,6 +3222,17 @@ impl Editor {
                         .child("Live values — read-only"),
                 )
             })
+            // Whose the locked names are, once, above the list that marks them.
+            .when(
+                !self.doc.outside_from().is_empty()
+                    && matches!(self.pane, SidePane::Variables | SidePane::Cast),
+                |this| {
+                    this.child(div().type_hint().child(format!(
+                        "{OUTSIDE_MARK} from {}, locked",
+                        self.doc.outside_from()
+                    )))
+                },
+            )
             .child(
                 // The list scrolls, not the pane: the heading above and the declare field
                 // below stay put however many variables the document holds. `min_h(0)` is
@@ -3780,6 +3827,8 @@ impl Editor {
         // Under a group header the set is already overhead, so the row shows only the rest.
         let label = split_set(&variable.name).1.to_string();
         let is_int = matches!(variable.default, Value::Int(_));
+        // Declared by another tool for this session: shown and used, never changed here.
+        let outside = self.doc.is_outside_variable(&variable.name);
         let editing = self
             .editing_target()
             .is_some_and(|target| *target == ValueTarget::Default(name.clone()));
@@ -3802,7 +3851,7 @@ impl Editor {
                     .text_color(if on { theme::true_pin() } else { theme::text() })
                     .child(div().flex_none().child(if on { "☑" } else { "☐" }))
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
-                    .when(playing.is_none(), |this| {
+                    .when(playing.is_none() && !outside, |this| {
                         this.cursor_pointer()
                             .hover(|style| style.text_color(theme::text()))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3824,8 +3873,9 @@ impl Editor {
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .child(if editing {
                         self.value_editor(cx).into_any_element()
-                    } else if playing.is_some() {
-                        // Read-only while playing, like everything else in the pane.
+                    } else if playing.is_some() || outside {
+                        // Read-only while playing, like everything else in the pane, and
+                        // always when another tool declared it.
                         div()
                             .px_1()
                             .text_color(theme::text())
@@ -3838,7 +3888,15 @@ impl Editor {
                     .into_any_element(),
             })
             .when(!editing, |this| this.child(used_by))
-            .when(playing.is_none() && !editing, |this| {
+            .when(outside, |this| {
+                this.child(
+                    div()
+                        .px_1()
+                        .text_color(theme::text_faint())
+                        .child(OUTSIDE_MARK),
+                )
+            })
+            .when(playing.is_none() && !editing && !outside, |this| {
                 this.child(
                     // The one place a variable's type changes. Lit when it holds a number,
                     // since a row showing 0 says nothing about the type on its own.
@@ -4202,6 +4260,8 @@ impl Editor {
         let character = &self.doc.characters[i];
         let color = character.color;
         let name = character.name.clone();
+        // Declared by another tool for this session, like `var_row`'s.
+        let outside = self.doc.is_outside_character(&name);
         let target = Ref::Character(name.clone());
         let used_by = self.used_by_toggle(("cast-refs", i), &target, cx);
         let open = (self.used_by.as_ref() == Some(&target)).then(|| {
@@ -4228,7 +4288,7 @@ impl Editor {
                     .size_3()
                     .rounded_sm()
                     .bg(rgb(color))
-                    .when(!playing, |this| {
+                    .when(!playing && !outside, |this| {
                         this.cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let at = CAST_COLORS.iter().position(|c| *c == color);
@@ -4252,7 +4312,15 @@ impl Editor {
             // node count is its sibling — which opens the list of those lines. Words go at
             // the foot of the tab, where there is width for them.
             .child(used_by)
-            .when(!playing, |this| {
+            .when(outside, |this| {
+                this.child(
+                    div()
+                        .px_1()
+                        .text_color(theme::text_faint())
+                        .child(OUTSIDE_MARK),
+                )
+            })
+            .when(!playing && !outside, |this| {
                 this.child(
                     div()
                         .id(("cast-rename", i))
@@ -6860,6 +6928,16 @@ fn main() {
             file,
             request.flow.as_deref().unwrap_or_default(),
             request.node.as_deref().unwrap_or_default(),
+            &request
+                .declarations
+                .as_deref()
+                .map(|path| {
+                    path.canonicalize()
+                        .unwrap_or_else(|_| path.to_path_buf())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default(),
         )
     {
         return;

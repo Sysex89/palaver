@@ -1,9 +1,9 @@
 //! The editor from outside: what the command line asks for, the one window a file is open
 //! in, and a command run after each save.
 //!
-//! `palaver [FILE] [--flow NAME] [--node ALIAS|ID] [--after-save COMMAND]` opens FILE,
-//! shows the flow and selects the node, so another tool (a game's level editor, a script)
-//! can open a conversation at the line it is about. `--node` takes what [`Doc::find_node`]
+//! `palaver [FILE] [--flow NAME] [--node ALIAS|ID] [--after-save COMMAND]
+//! [--declarations FILE]` opens FILE, shows the flow and selects the node, so another tool
+//! (a game's level editor, a script) can open a conversation at the line it is about. `--node` takes what [`Doc::find_node`]
 //! takes: an alias, or an id, never a position.
 //!
 //! **A file is edited in one window**, because two would each save over the other's work.
@@ -19,12 +19,19 @@
 //! exporter) that would otherwise be forgotten. It runs off the foreground, and the status
 //! bar says how it went; a save is never undone by a failing command.
 //!
+//! **`--declarations` names a JSON file of variables and characters** the conversation may
+//! use without declaring them ([`Declarations`]): the tool's own names, a game's quests and
+//! people, shown in the panes as declared from outside, locked, and never written into the
+//! `.dln`. A later launch hands its file over with its place, so a window already open
+//! picks up names the tool has added since.
+//!
 //! [`Doc::find_node`]: crate::doc::Doc::find_node
+//! [`Declarations`]: crate::doc::Declarations
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const USAGE: &str =
-    "usage: palaver [FILE] [--flow NAME] [--node ALIAS|ID] [--after-save COMMAND]";
+pub const USAGE: &str = "usage: palaver [FILE] [--flow NAME] [--node ALIAS|ID] \
+     [--after-save COMMAND] [--declarations FILE]";
 
 /// What the command line asked for.
 #[derive(Debug, Default, PartialEq)]
@@ -33,6 +40,7 @@ pub struct Request {
     pub flow: Option<String>,
     pub node: Option<String>,
     pub after_save: Option<String>,
+    pub declarations: Option<PathBuf>,
 }
 
 /// Reads the arguments after the program's name. `Err("")` is a request for the usage
@@ -46,6 +54,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Request, String> 
             "--flow" => request.flow = Some(value("--flow")?),
             "--node" => request.node = Some(value("--node")?),
             "--after-save" => request.after_save = Some(value("--after-save")?),
+            "--declarations" => {
+                request.declarations = Some(PathBuf::from(value("--declarations")?));
+            }
             "-h" | "--help" => return Err(String::new()),
             option if option.starts_with("--") => return Err(format!("unknown option {option}")),
             file => {
@@ -142,6 +153,8 @@ mod socket {
     pub struct Goto {
         pub flow: String,
         pub node: String,
+        /// A declarations file to read again, or empty.
+        pub declarations: String,
         pub reply: mpsc::Sender<bool>,
     }
 
@@ -160,14 +173,22 @@ mod socket {
         field.replace(['\t', '\n', '\r'], " ")
     }
 
-    /// Hands `flow` and `node` to the window that has `file` open. True when that window
-    /// took them; false when there is none, or it has another file open now.
-    pub fn hand_over(file: &Path, flow: &str, node: &str) -> bool {
+    /// Hands `flow`, `node` and a declarations file (empty for none) to the window that
+    /// has `file` open. True when that window took them; false when there is none, or it
+    /// has another file open now. The declarations ride as a fourth field, which a window
+    /// from before them reads past.
+    pub fn hand_over(file: &Path, flow: &str, node: &str, declarations: &str) -> bool {
         let Ok(mut stream) = UnixStream::connect(path_for(file)) else {
             return false;
         };
         let _ = stream.set_read_timeout(Some(PATIENCE));
-        if writeln!(stream, "goto\t{}\t{}", clean(flow), clean(node)).is_err() {
+        let line = format!(
+            "goto\t{}\t{}\t{}",
+            clean(flow),
+            clean(node),
+            clean(declarations)
+        );
+        if writeln!(stream, "{line}").is_err() {
             return false;
         }
         let mut answer = String::new();
@@ -213,8 +234,16 @@ mod socket {
         }
         let flow = fields.next().unwrap_or_default().to_string();
         let node = fields.next().unwrap_or_default().to_string();
+        let declarations = fields.next().unwrap_or_default().to_string();
         let (reply, answer) = mpsc::channel();
-        requests.send(Goto { flow, node, reply }).map_err(|_| ())?;
+        requests
+            .send(Goto {
+                flow,
+                node,
+                declarations,
+                reply,
+            })
+            .map_err(|_| ())?;
         let took = answer.recv_timeout(PATIENCE).unwrap_or(false);
         let _ = writeln!(writer, "{}", if took { "ok" } else { "no" });
         Ok(())
@@ -237,6 +266,8 @@ mod tests {
         assert_eq!(request.node.as_deref(), Some("greeting"));
         let request = parse(["--after-save".to_string(), "make dialogue".to_string()]).unwrap();
         assert_eq!(request.after_save.as_deref(), Some("make dialogue"));
+        let request = parse(args("talk.dln --declarations names.json")).unwrap();
+        assert_eq!(request.declarations, Some(PathBuf::from("names.json")));
         assert_eq!(parse(Vec::new()).unwrap(), Request::default());
     }
 
@@ -277,20 +308,27 @@ mod tests {
         let file = folder.join("talk.dln");
         std::fs::write(&file, "{}").unwrap();
 
-        assert!(!hand_over(&file, "road", "greeting"), "nothing listens yet");
+        assert!(
+            !hand_over(&file, "road", "greeting", ""),
+            "nothing listens yet"
+        );
         let inbox = listen(&file).expect("a socket");
         let window = std::thread::spawn(move || {
             let first = inbox.recv().unwrap();
             first.reply.send(true).unwrap();
             let second = inbox.recv().unwrap();
             second.reply.send(false).unwrap(); // another file is open by now
-            (first.flow, first.node)
+            (first.flow, first.node, first.declarations)
         });
-        assert!(hand_over(&file, "road", "greeting"));
-        assert!(!hand_over(&file, "road", "greeting"));
+        assert!(hand_over(&file, "road", "greeting", "/tmp/names.json"));
+        assert!(!hand_over(&file, "road", "greeting", ""));
         assert_eq!(
             window.join().unwrap(),
-            ("road".to_string(), "greeting".to_string())
+            (
+                "road".to_string(),
+                "greeting".to_string(),
+                "/tmp/names.json".to_string()
+            )
         );
     }
 }

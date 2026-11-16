@@ -346,7 +346,9 @@ struct Snapshot {
     premise: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+/// Serialized by hand ([`Doc::serialize`]), field for field as a derive would, so that what
+/// [`Doc::set_outside`] declared is never written into a file.
+#[derive(Default, Deserialize)]
 pub struct Doc {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -378,6 +380,80 @@ pub struct Doc {
     redo: Vec<Snapshot>,
     #[serde(skip)]
     dirty: bool,
+    /// Declared by another tool for this session, not by the document: see
+    /// [`Doc::set_outside`].
+    #[serde(skip)]
+    outside: Outside,
+}
+
+/// The names another tool declared for this session ([`Doc::set_outside`]): kept whole so
+/// they can be merged back after an undo, and the names of those actually merged — the
+/// ones the document did not declare itself — so they can be left out of every write and
+/// locked in the panes.
+#[derive(Default)]
+struct Outside {
+    from: String,
+    variables: Vec<Variable>,
+    characters: Vec<Character>,
+    merged_variables: HashSet<String>,
+    merged_characters: HashSet<String>,
+}
+
+/// Variables and speakers a document may use without declaring them, handed to the editor
+/// by another tool (`--declarations FILE`): a game's quests, items and people, say, so its
+/// conversations pick them rather than retyping them in every file. `from` names the tool
+/// for the panes ("Saint Geometry"). A character's colour is optional; the view picks one.
+#[derive(Clone, PartialEq, Debug, Default, Deserialize)]
+pub struct Declarations {
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub variables: Vec<Variable>,
+    #[serde(default)]
+    pub characters: Vec<DeclaredCharacter>,
+}
+
+/// A [`Character`] as a declarations file gives it: the colour may be left to the view.
+#[derive(Clone, PartialEq, Debug, Deserialize)]
+pub struct DeclaredCharacter {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<u32>,
+}
+
+impl Declarations {
+    pub fn load(path: &Path) -> Result<Declarations, String> {
+        let json = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_str(&json).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+impl Serialize for Doc {
+    /// The document as a derive would write it, minus what was declared from outside: a
+    /// save, a crash copy and every other write leave those names to the tool that gave
+    /// them. Same fields, same order, so a file with nothing from outside is byte for byte
+    /// what it always was.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let variables: Vec<&Variable> = self
+            .variables
+            .iter()
+            .filter(|v| !self.outside.merged_variables.contains(&v.name))
+            .collect();
+        let characters: Vec<&Character> = self
+            .characters
+            .iter()
+            .filter(|c| !self.outside.merged_characters.contains(&c.name))
+            .collect();
+        let mut doc = serializer.serialize_struct("Doc", 6)?;
+        doc.serialize_field("nodes", &self.nodes)?;
+        doc.serialize_field("edges", &self.edges)?;
+        doc.serialize_field("variables", &variables)?;
+        doc.serialize_field("characters", &characters)?;
+        doc.serialize_field("flows", &self.flows)?;
+        doc.serialize_field("premise", &self.premise)?;
+        doc.end()
+    }
 }
 
 /// What a node *is*. Deliberately not where `Node::end` lives: an ending has text
@@ -2056,6 +2132,14 @@ impl Doc {
         if from.is_empty() || to.is_empty() || to.contains('.') {
             return 0;
         }
+        // A set holding a name declared from outside is that tool's to name.
+        if self
+            .variables
+            .iter()
+            .any(|v| split_set(&v.name).0 == Some(from) && self.is_outside_variable(&v.name))
+        {
+            return 0;
+        }
 
         // Every rename this would perform, as (old, new). Computed before anything is
         // written, so a refusal leaves the document untouched.
@@ -2099,6 +2183,10 @@ impl Doc {
     /// behind is not an option. It is one checkpoint's worth of change, so a single undo
     /// brings the variable and all of its references back together.
     pub fn remove_variable(&mut self, name: &str) -> usize {
+        // Declared from outside: not the document's to take away.
+        if self.is_outside_variable(name) {
+            return 0;
+        }
         self.variables.retain(|v| v.name != name);
         let mut dropped = 0;
         for node in &mut self.nodes {
@@ -2121,6 +2209,9 @@ impl Doc {
     /// does, so a refused rename leaves no empty undo step.
     pub fn rename_variable(&mut self, from: &str, to: &str) -> usize {
         let to = to.trim();
+        if self.is_outside_variable(from) {
+            return 0;
+        }
         let Some(variable) = self.variables.iter_mut().find(|v| v.name == from) else {
             return 0;
         };
@@ -2150,6 +2241,9 @@ impl Doc {
     /// Operators are clamped as well as values, since `gold > 5` means nothing once `gold` is
     /// a flag: an ordering check becomes `==`, and `+=` becomes `=`.
     pub fn retype_variable(&mut self, name: &str, to: Value) -> usize {
+        if self.is_outside_variable(name) {
+            return 0;
+        }
         let Some(variable) = self.variables.iter_mut().find(|v| v.name == name) else {
             return 0;
         };
@@ -2250,6 +2344,9 @@ impl Doc {
 
     /// Sets the value a play-through starts this variable from. Unknown names are ignored.
     pub fn set_default(&mut self, name: &str, value: Value) {
+        if self.is_outside_variable(name) {
+            return;
+        }
         if let Some(variable) = self.variables.iter_mut().find(|v| v.name == name) {
             variable.default = value;
         }
@@ -2286,6 +2383,9 @@ impl Doc {
     /// same reason: the name *is* the key, so there is nowhere else a reference can hide.
     pub fn rename_character(&mut self, from: &str, to: &str) -> usize {
         let to = to.trim();
+        if self.is_outside_character(from) {
+            return 0;
+        }
         let Some(character) = self.characters.iter_mut().find(|c| c.name == from) else {
             return 0;
         };
@@ -2308,12 +2408,18 @@ impl Doc {
     /// meaning, but "Innkeeper" still speaks the line whether or not anybody declared them.
     /// [`Problem::UnknownSpeaker`] is what then says so, as a warning.
     pub fn remove_character(&mut self, name: &str) {
+        if self.is_outside_character(name) {
+            return;
+        }
         self.characters.retain(|c| c.name != name);
     }
 
     /// The [`Doc::set_default`] of the cast: the colour every line this character speaks is
     /// tinted. Unknown names are ignored.
     pub fn set_character_color(&mut self, name: &str, color: u32) {
+        if self.is_outside_character(name) {
+            return;
+        }
         if let Some(character) = self.characters.iter_mut().find(|c| c.name == name) {
             character.color = color;
         }
@@ -2623,6 +2729,63 @@ impl Doc {
         self.characters = characters;
         self.flows = flows;
         self.premise = premise;
+        // A snapshot from before the declarations came lacks them.
+        self.merge_outside();
+    }
+
+    /// Takes `variables` and `characters` as declared for this session by the tool named
+    /// `from`, replacing any it gave before. Those the document already declares stay its
+    /// own; the rest are merged into the panes, the walk and the problem list like any
+    /// declaration, but locked ([`Doc::is_outside_variable`]) and never written to a file.
+    /// Not an edit: no checkpoint, and the document stays as clean as it was.
+    pub fn set_outside(
+        &mut self,
+        from: &str,
+        variables: Vec<Variable>,
+        characters: Vec<Character>,
+    ) {
+        self.outside.from = from.to_string();
+        self.outside.variables = variables;
+        self.outside.characters = characters;
+        self.merge_outside();
+    }
+
+    /// Who declared the outside names, for the panes; empty when nobody did.
+    pub fn outside_from(&self) -> &str {
+        &self.outside.from
+    }
+
+    /// Whether `name` is a variable declared from outside rather than by the document.
+    pub fn is_outside_variable(&self, name: &str) -> bool {
+        self.outside.merged_variables.contains(name)
+    }
+
+    /// Whether `name` is a character declared from outside rather than by the document.
+    pub fn is_outside_character(&self, name: &str) -> bool {
+        self.outside.merged_characters.contains(name)
+    }
+
+    /// Puts the outside declarations into the lists the rest of the editor reads: the old
+    /// merge out first, then each name the document does not declare itself, in.
+    fn merge_outside(&mut self) {
+        let merged = std::mem::take(&mut self.outside.merged_variables);
+        self.variables.retain(|v| !merged.contains(&v.name));
+        let merged = std::mem::take(&mut self.outside.merged_characters);
+        self.characters.retain(|c| !merged.contains(&c.name));
+        for variable in &self.outside.variables {
+            if self.variables.iter().all(|v| v.name != variable.name) {
+                self.outside.merged_variables.insert(variable.name.clone());
+                self.variables.push(variable.clone());
+            }
+        }
+        for character in &self.outside.characters {
+            if self.characters.iter().all(|c| c.name != character.name) {
+                self.outside
+                    .merged_characters
+                    .insert(character.name.clone());
+                self.characters.push(character.clone());
+            }
+        }
     }
 
     /// Records the current state so the next mutation can be undone. Every mutation
@@ -4878,6 +5041,117 @@ mod tests {
             doc.effect_of(two, "paid").map(|e| e.value),
             Some(Value::Bool(false))
         );
+    }
+
+    fn outside(doc: &mut Doc) {
+        doc.set_outside(
+            "Game",
+            vec![
+                Variable {
+                    name: "quest.find".into(),
+                    default: Value::Int(-1),
+                },
+                Variable {
+                    name: "paid".into(),
+                    default: Value::Bool(true),
+                },
+            ],
+            vec![Character {
+                name: "Lady".into(),
+                color: 1,
+            }],
+        );
+    }
+
+    /// What another tool declares is used like any declaration — an effect naming it is
+    /// no problem — and written nowhere: the file is what it was before, byte for byte. A
+    /// name the document declares itself stays its own, with its own default.
+    #[test]
+    fn outside_declarations_are_used_and_never_written() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let id = sets(&mut doc, "quest.find", true);
+        let before = doc.to_json();
+        assert!(
+            doc.problems()
+                .iter()
+                .any(|p| matches!(p, Problem::UnknownVar(..)))
+        );
+
+        outside(&mut doc);
+        assert!(doc.variable("quest.find").is_some());
+        assert!(doc.character("Lady").is_some());
+        assert!(doc.is_outside_variable("quest.find"));
+        assert!(!doc.is_outside_variable("paid"), "the document's own");
+        assert_eq!(doc.variable("paid").unwrap().default, Value::Bool(false));
+        assert!(
+            !doc.problems()
+                .iter()
+                .any(|p| matches!(p, Problem::UnknownVar(n, _) if *n == id))
+        );
+        assert_eq!(doc.to_json(), before);
+        assert!(!doc.is_dirty(), "not an edit");
+        assert_eq!(doc.outside_from(), "Game");
+    }
+
+    /// The document cannot rename, retype, remove or recolour what it does not own, nor
+    /// rename the set it sits in.
+    #[test]
+    fn outside_declarations_are_locked() {
+        let mut doc = Doc::default();
+        outside(&mut doc);
+        assert_eq!(doc.rename_variable("quest.find", "quest.lost"), 0);
+        assert_eq!(doc.rename_set("quest", "q"), 0);
+        assert_eq!(doc.retype_variable("quest.find", Value::Bool(false)), 0);
+        doc.set_default("quest.find", Value::Int(3));
+        assert_eq!(doc.remove_variable("quest.find"), 0);
+        assert_eq!(doc.variable("quest.find").unwrap().default, Value::Int(-1));
+        assert_eq!(doc.rename_character("Lady", "Lord"), 0);
+        doc.set_character_color("Lady", 7);
+        doc.remove_character("Lady");
+        assert_eq!(doc.character("Lady").unwrap().color, 1);
+    }
+
+    /// An undo back past the declarations' arrival keeps them; a second set replaces the
+    /// first.
+    #[test]
+    fn outside_declarations_survive_undo_and_are_replaced_whole() {
+        let mut doc = Doc::default();
+        doc.checkpoint();
+        doc.add_variable("mine");
+        outside(&mut doc);
+        assert!(doc.undo());
+        assert!(doc.variable("mine").is_none());
+        assert!(
+            doc.variable("quest.find").is_some(),
+            "merged back after the undo"
+        );
+
+        doc.set_outside(
+            "Game",
+            vec![Variable {
+                name: "quest.other".into(),
+                default: Value::Int(-1),
+            }],
+            vec![],
+        );
+        assert!(doc.variable("quest.find").is_none());
+        assert!(doc.variable("quest.other").is_some());
+        assert!(doc.character("Lady").is_none());
+    }
+
+    /// The file another tool writes: names and defaults, characters with or without a
+    /// colour.
+    #[test]
+    fn a_declarations_file_reads() {
+        let declared: Declarations = serde_json::from_str(
+            r#"{"from": "Game", "variables": [{"name": "quest.find", "default": {"Int": -1}}],
+                "characters": [{"name": "Lady"}, {"name": "Weld", "color": 5}]}"#,
+        )
+        .unwrap();
+        assert_eq!(declared.variables[0].default, Value::Int(-1));
+        assert_eq!(declared.characters[0].color, None);
+        assert_eq!(declared.characters[1].color, Some(5));
     }
 
     /// The point of the rename: a typo can be fixed without re-ticking every node, which
