@@ -1871,19 +1871,29 @@ impl Editor {
     /// Stepping through history can restore or drop whatever was selected, and it moves
     /// the document out from under the sidebar, so the fields always reload.
     fn after_history(&mut self, cx: &mut Context<Self>) {
+        // A flow an undo removed would leave the author on a canvas nothing lists. The view
+        // was aimed at that canvas, so it is fitted to the one they land on.
+        if !self.flow.is_empty() && !self.doc.all_flows().contains(&self.flow.as_str()) {
+            self.flow.clear();
+            self.fit_pending = true;
+        }
+        // Only what is still there, and still on this canvas: a step can move a node to
+        // another flow (undoing a move there, or a flow's rename), and one left selected
+        // where it is neither drawn nor clickable is one Delete and Tab would work unseen —
+        // what `show` and `show_flow` drop the selection to prevent.
         let live: Vec<NodeId> = self
             .selection
             .nodes()
             .iter()
             .copied()
-            .filter(|id| self.doc.node(*id).is_some())
+            .filter(|id| {
+                self.doc
+                    .node(*id)
+                    .is_some_and(|node| node.flow == self.flow)
+            })
             .collect();
         let selection = Selection::of(live);
         self.selection = selection.clone();
-        // A flow an undo removed would leave the author on a canvas nothing lists.
-        if !self.flow.is_empty() && !self.doc.all_flows().contains(&self.flow.as_str()) {
-            self.flow.clear();
-        }
         self.load_fields(selection, cx);
         cx.notify();
     }
