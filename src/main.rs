@@ -2619,12 +2619,17 @@ impl Editor {
         cx.notify();
         match result {
             Err(why) => self.set_status(format!("No line written: {why}"), cx),
-            // The line has to still say what it said when it was asked for: a person may
-            // have typed into it meanwhile, and a human line is never overwritten.
-            Ok(_) if self.doc.line_text(line) != Some(was.as_str()) => self.set_status(
+            // The line has to still be one the generator may write: a person may have
+            // typed into it meanwhile, or accepted it, and a human line is never overwritten.
+            Ok(_) if !self.doc.takes_placeholder(line, &was) => self.set_status(
                 "That line changed while it was being written, so it was left alone.".into(),
                 cx,
             ),
+            // The same words from the same seed: nothing to write, so no undo step that
+            // undoes nothing.
+            Ok((text, seed))
+                if self.doc.line_text(line) == Some(text.as_str())
+                    && self.doc.placeholder_of(line).map(|mark| mark.seed) == Some(seed) => {}
             Ok((text, seed)) => {
                 self.checkpoint();
                 self.doc.write_placeholder(line, &text, seed);

@@ -1592,6 +1592,18 @@ impl Doc {
         }
     }
 
+    /// Whether a line that came back from the generator may still be written: the line
+    /// says what it said when it was asked for (`was`), and is still one the generator may
+    /// write — empty, or a placeholder. The second half is the rule Fill starts by, asked
+    /// again on arrival: a placeholder accepted while its regeneration was out reads the
+    /// same and is a person's line now, and the text alone let the result overwrite it and
+    /// put the mark back.
+    #[cfg_attr(not(feature = "generate"), allow(dead_code))]
+    pub fn takes_placeholder(&self, line: Line, was: &str) -> bool {
+        self.line_text(line) == Some(was)
+            && (was.trim().is_empty() || self.placeholder_of(line).is_some())
+    }
+
     /// Writes a generated line and marks it, with the seed it was sampled from. False, and
     /// nothing written, when the line is gone. The view checkpoints first and decides
     /// whether a human line is in the way; this only writes.
@@ -5431,6 +5443,33 @@ mod tests {
         assert!(!doc.set_is_outside("shop"));
         assert_eq!(doc.rename_set("quest", "q"), 0);
         assert_eq!(doc.rename_set("shop", "s"), 1);
+    }
+
+    /// A result is written over an empty line or a placeholder that still reads as it did,
+    /// and over nothing else — not a line typed into, and not one accepted meanwhile.
+    #[test]
+    fn a_result_is_not_written_over_a_line_accepted_while_it_was_out() {
+        let mut doc = Doc::default();
+        let id = doc.add_node(0.0, 0.0);
+        let line = Line::Node(id);
+        assert!(doc.takes_placeholder(line, ""), "an empty line");
+
+        assert!(doc.write_placeholder(line, "A draft.", 7));
+        assert!(
+            doc.takes_placeholder(line, "A draft."),
+            "a placeholder, regenerated"
+        );
+        assert!(
+            !doc.takes_placeholder(line, ""),
+            "it no longer says what it said"
+        );
+
+        assert!(doc.accept_line(line));
+        assert_eq!(doc.line_text(line), Some("A draft."));
+        assert!(!doc.takes_placeholder(line, "A draft."), "kept by a person");
+
+        doc.remove_node(id);
+        assert!(!doc.takes_placeholder(line, "A draft."), "gone");
     }
 
     /// The file another tool writes: names and defaults, characters with or without a
