@@ -2188,6 +2188,9 @@ impl Editor {
         let path = self.doc.start_walk(at);
         self.follow(&path, window, cx);
         self.play = Some(path);
+        // A number being typed is dropped rather than held: `editing_target` hides it while
+        // this runs, and it would otherwise come back, unasked, when the play-through ends.
+        self.editing = None;
         cx.notify();
     }
 
@@ -2665,6 +2668,9 @@ impl Editor {
     /// already on changes nothing, so a stray click on its tab does not throw away your pan.
     /// `show` deliberately does not refit: it centres on one node, which is the point of it.
     fn show_flow(&mut self, flow: &str, cx: &mut Context<Self>) {
+        // Picking a canvas is asking to see it, so the map comes down as it does for
+        // `show` — even for the flow already current, which the map was covering.
+        self.flow_map = false;
         if self.flow != flow {
             self.flow = flow.to_string();
             self.fit_pending = true;
@@ -3800,6 +3806,12 @@ impl Editor {
     /// not a target any more, which is the filtering `renaming` gets and for the same reason:
     /// one place, rather than every site that could invalidate it.
     fn editing_target(&self) -> Option<&ValueTarget> {
+        // Not during a play-through, when the pane is live values and nothing in it edits:
+        // an editor opened before F5 stayed up over them, and its ✓ still wrote a default.
+        // Here, so the row that draws the editor and the ✓ that commits it both stand down.
+        if self.play.is_some() {
+            return None;
+        }
         // And still a number: retyped to a flag, the variable's row draws a checkbox with
         // no editor in it, and an editor left aimed at it would write a number onto a flag.
         let is_int = |name: &str| {
@@ -4334,8 +4346,11 @@ impl Editor {
                     .text_color(theme::text_muted())
                     .hover(|style| style.text_color(theme::text()))
                     .child(shown)
-                    // Only the search box changes, so no checkpoint.
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    // Only the search box changes, so no checkpoint. Through `on_find`, which
+                    // is what puts the find card in the tree: setting the query alone showed
+                    // nothing, and left it lying in wait for the next Ctrl+F.
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.on_find(&Find, window, cx);
                         let query = format!("tag:{to_find}");
                         this.search_input
                             .update(cx, |input, cx| input.set_content(&query, cx));
