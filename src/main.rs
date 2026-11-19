@@ -4800,6 +4800,8 @@ impl Editor {
 
         let current = *path.last().expect("a play-through is never empty");
         let node = self.doc.node(current);
+        // What the player may pick here, or `None` where nobody is standing to pick.
+        let offered = self.doc.offered(path);
 
         div()
             .flex()
@@ -4878,12 +4880,15 @@ impl Editor {
                         ))
                     }),
             )
+            // `Doc::offered`, not `choices`: where the walk ran out of graph the node it
+            // stopped on still has edges, and a row for one — the pin a failed check did not
+            // take — walked past the check when it was clicked.
             .children(
-                self.doc
-                    .choices(current)
-                    .into_iter()
+                offered
+                    .iter()
+                    .flatten()
                     .enumerate()
-                    .map(|(i, (to, label))| {
+                    .map(|(i, &(to, label, spent))| {
                         // A blank label is an unwritten choice, not a missing one.
                         let label = match label.trim() {
                             "" => "Continue".to_string(),
@@ -4894,7 +4899,7 @@ impl Editor {
                         // same place the player already diverges from the canvas by walking
                         // through nodes it does not show. No hover and no click, so nothing
                         // about the row offers something it will not do.
-                        if self.doc.spent(path, current, to) {
+                        if spent {
                             return div()
                                 .px_1()
                                 .font_family(theme::text_font())
@@ -4912,12 +4917,13 @@ impl Editor {
             )
             // `all` over an empty list is true, so a leaf node still ends here — and a hub
             // whose questions are all used up ends rather than stranding the player on a
-            // list of rows that no longer do anything.
+            // list of rows that no longer do anything. Only where there is a player to end
+            // it for: under "The flow stops here" or a deleted node it was a second, and
+            // contradictory, ending.
             .when(
-                self.doc
-                    .choices(current)
-                    .iter()
-                    .all(|&(to, _)| self.doc.spent(path, current, to)),
+                offered
+                    .as_ref()
+                    .is_some_and(|offered| offered.iter().all(|&(_, _, spent)| spent)),
                 |this| this.child(div().type_hint().child("End of conversation.")),
             )
             .child(

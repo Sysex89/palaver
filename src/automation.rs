@@ -266,16 +266,19 @@ fn run(
         }
 
         // `choose 0` — the first choice in the play panel, counting spent ones, as the
-        // panel lists them.
+        // panel lists them: `Doc::offered` is the list both read, so a script can pick
+        // nothing the panel does not show.
         "choose" => {
             let path = editor.play.as_ref().ok_or("not playing")?;
-            let current = *path.last().ok_or("empty play path")?;
             let index: usize = rest.parse().map_err(|_| "expected a choice number")?;
-            let choices = editor.doc.choices(current);
-            let &(to, _) = choices
+            let offered = editor
+                .doc
+                .offered(path)
+                .ok_or("nothing is offered: the flow stopped here")?;
+            let &(to, _, spent) = offered
                 .get(index)
-                .ok_or_else(|| format!("only {} choices", choices.len()))?;
-            if editor.doc.spent(path, current, to) {
+                .ok_or_else(|| format!("only {} choices", offered.len()))?;
+            if spent {
                 return Err("that choice is spent".into());
             }
             editor.play_advance(to, window, cx);

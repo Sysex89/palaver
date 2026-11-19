@@ -1234,6 +1234,34 @@ impl Doc {
         edge.once && self.pauses_play(edge.from)
     }
 
+    /// What a play-through at the end of `path` offers the player: each choice out of the
+    /// node it stands on — where it leads, its label, and whether it is a once-only one
+    /// already taken ([`Doc::spent`]). An empty list is a conversation that ends here.
+    ///
+    /// `None` is nobody there to choose. The walk only stops on a node the player does not
+    /// see when it has run out of graph — a condition with that pin unwired, a jump
+    /// pointing at nothing, a ring of plumbing — and the edges such a node does have are
+    /// not choices: listed as ones, a click on the true pin walked straight past the check
+    /// that had just failed. A node deleted mid-play is `None` too, although
+    /// [`Doc::pauses_play`] counts it as visible so that the walk halts on it.
+    ///
+    /// The one list the play panel and a script's `choose` both read, so they cannot
+    /// disagree about what may be picked. Not a filter on [`Doc::choices`], which stays the
+    /// graph as drawn: this is the player's side of it, as `spent` is.
+    pub fn offered(&self, path: &[NodeId]) -> Option<Vec<(NodeId, &str, bool)>> {
+        let &current = path.last()?;
+        self.node(current)?;
+        if !self.pauses_play(current) {
+            return None;
+        }
+        Some(
+            self.choices(current)
+                .into_iter()
+                .map(|(to, label)| (to, label, self.spent(path, current, to)))
+                .collect(),
+        )
+    }
+
     /// The top of every conversation: the nodes nothing links to, notes excepted. One per
     /// independent conversation the author has drawn, which is what the inspector's
     /// summary counts — and what [`Doc::problems`] walks from, so the two cannot disagree
@@ -5370,6 +5398,79 @@ mod tests {
             vec![gate],
             "it stops rather than taking the only edge it can see"
         );
+    }
+
+    /// The other half of that stop: the edge the condition does have is still in the graph,
+    /// and still not something the player can pick. Offered as a choice, the true pin let
+    /// a click walk past the check that had just failed.
+    #[test]
+    fn nothing_is_offered_where_the_walk_ran_out_of_graph() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let ask = spoken(&mut doc, 0.0, 0.0);
+        let gate = checks(&mut doc, "paid", true);
+        let thanks = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(ask, gate);
+        doc.add_edge(gate, thanks);
+
+        let mut path = doc.start_walk(ask);
+        assert_eq!(doc.offered(&path), Some(vec![(gate, "", false)]));
+
+        doc.advance(&mut path, gate);
+        assert_eq!(
+            path,
+            vec![ask, gate],
+            "unpaid, and the false pin is unwired"
+        );
+        assert_eq!(
+            doc.choices(gate),
+            vec![(thanks, "")],
+            "the graph keeps its edge"
+        );
+        assert_eq!(
+            doc.offered(&path),
+            None,
+            "but nobody stands there to take it"
+        );
+
+        // A jump pointing at nothing is the same stop by another road.
+        let nowhere = doc.add_node(0.0, 300.0);
+        doc.set_kind(nowhere, NodeKind::Jump);
+        assert_eq!(doc.offered(&doc.start_walk(nowhere)), None);
+    }
+
+    /// `None` is not the same as nothing to choose: a leaf is a conversation that ends,
+    /// and the panel says so; a node deleted under the play-through is nobody's turn.
+    #[test]
+    fn a_leaf_offers_an_empty_list_and_a_deleted_node_none() {
+        let mut doc = Doc::default();
+        let only = spoken(&mut doc, 0.0, 0.0);
+        let path = doc.start_walk(only);
+        assert_eq!(doc.offered(&path), Some(vec![]));
+
+        doc.remove_node(only);
+        assert!(doc.pauses_play(only), "a missing node still halts the walk");
+        assert_eq!(doc.offered(&path), None);
+        assert_eq!(doc.offered(&[]), None);
+    }
+
+    /// A spent once-only choice stays in the list, marked, so the panel can grey it out
+    /// where it was instead of the rows below it shifting up.
+    #[test]
+    fn an_offer_says_when_it_is_spent() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 0.0, 0.0);
+        let away = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(hub, away);
+        doc.edges.last_mut().unwrap().once = true;
+        doc.edges.last_mut().unwrap().label = "Ask".into();
+        doc.add_edge(away, hub);
+
+        let mut path = doc.start_walk(hub);
+        assert_eq!(doc.offered(&path), Some(vec![(away, "Ask", false)]));
+        doc.advance(&mut path, away);
+        doc.advance(&mut path, hub);
+        assert_eq!(doc.offered(&path), Some(vec![(away, "Ask", true)]));
     }
 
     #[test]
