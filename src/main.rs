@@ -617,6 +617,16 @@ impl Editor {
             .observe_window_appearance(|window, _| window.refresh())
             .detach();
 
+        // The focused field can leave the tree with the focus still on it: play replaces the
+        // inspector, an undo takes the node away, the kind picker drops the Text field, the
+        // palette is closed by a click on its backdrop. gpui then dispatches keys from the
+        // root, above the `"Editor"` context, and every shortcut is dead until the canvas is
+        // clicked — Escape included, so a play-through started from a field could not be
+        // stopped. The canvas is always drawn, so it takes the focus back. Here, once, and not
+        // in each handler that hides a field: none of them knows where the focus was.
+        cx.on_focus_lost(window, |this, window, _| window.focus(&this.focus_handle))
+            .detach();
+
         let speaker_input = cx.new(|cx| TextInput::new("Speaker", cx));
         let text_input = cx.new(|cx| TextInput::new("Line of dialog", cx));
         let alias_input = cx.new(|cx| TextInput::new("Name for the game to call", cx));
