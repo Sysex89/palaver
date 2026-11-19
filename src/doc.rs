@@ -3168,8 +3168,20 @@ impl Doc {
                     }
                 }
                 out += "\n";
+                // The hub whose label the heading already is. Any other hub — one a block
+                // ran on into, or one whose heading went to its alias — says its label in
+                // the block, since the player reads it above the choices and the heading
+                // was the only place it was ever written.
+                let headed = self
+                    .node(chain[0])
+                    .filter(|first| first.kind == NodeKind::Hub && first.alias.trim().is_empty())
+                    .map(|first| first.id);
                 for &id in &chain {
                     let Some(node) = self.node(id) else { continue };
+                    let said = node.text.trim();
+                    if node.kind == NodeKind::Hub && Some(id) != headed && !said.is_empty() {
+                        out += &format!("\n{}\n", said.lines().collect::<Vec<_>>().join("  \n"));
+                    }
                     out += &script_line(node);
                 }
                 let Some(last) = chain.last().and_then(|&id| self.node(id)) else {
@@ -3190,17 +3202,17 @@ impl Doc {
                         }
                     }
                     // A once-only choice is listed even alone, so its marker is written.
-                    (_, [edge]) if edge.label.trim().is_empty() && !edge.once => {
+                    (_, [edge]) if self.choice_label(edge).is_empty() && !self.is_once(edge) => {
                         out += &format!("\n→ {}\n", reference(last, edge.to));
                     }
                     (_, exits) => {
                         out += "\n";
                         for edge in exits {
-                            let label = match edge.label.trim() {
+                            let label = match self.choice_label(edge) {
                                 "" => "*(continue)*",
                                 label => label,
                             };
-                            let once = if edge.once { "(once) " } else { "" };
+                            let once = if self.is_once(edge) { "(once) " } else { "" };
                             let mark = match self.is_placeholder_choice(edge) {
                                 true => PLACEHOLDER_SCRIPT,
                                 false => "",
@@ -3214,6 +3226,17 @@ impl Doc {
             out += "\n";
         }
         out
+    }
+
+    /// An edge's label as a choice the player is given, trimmed: empty where the player does
+    /// not choose. A label left on an edge when its node became an instruction is hidden
+    /// everywhere else, and written into the script it broke the block to list a choice
+    /// nobody is offered.
+    fn choice_label<'a>(&self, edge: &'a Edge) -> &'a str {
+        match self.pauses_play(edge.from) {
+            true => edge.label.trim(),
+            false => "",
+        }
     }
 
     /// The blocks [`Doc::to_screenplay`] writes, grouped by flow in [`Doc::all_flows`] order,
@@ -3232,8 +3255,11 @@ impl Doc {
             }
             let exits: Vec<&Edge> = self.edges.iter().filter(|e| e.from == node.id).collect();
             match exits.as_slice() {
+                // Unlabelled as the player meets it: a label left on an edge out of an
+                // instruction is no choice, so it does not end the block either.
                 [edge]
-                    if edge.label.trim().is_empty()
+                    if self.choice_label(edge).is_empty()
+                        && !self.is_once(edge)
                         && flow_of(edge.to) == Some(node.flow.as_str())
                         && incoming(edge.to) == 1 =>
                 {
@@ -6860,6 +6886,67 @@ mod tests {
 
     /// A reference to a jump is a reference to what it lands on, and the jump itself
     /// never becomes a block that says nothing but where to turn.
+    /// A hub a block runs on into has no heading of its own, and the heading was the only
+    /// place its label was written — so the line the player reads above the choices was
+    /// missing from the script while the translation export carried it.
+    #[test]
+    fn screenplay_says_a_hubs_label_wherever_the_hub_falls() {
+        let mut doc = Doc::default();
+        let hello = said(&mut doc, 0.0, "Hello");
+        let hub = said(&mut doc, 0.0, "Anything else?");
+        doc.set_kind(hub, NodeKind::Hub);
+        let yes = said(&mut doc, 0.0, "Yes line");
+        let no = said(&mut doc, 0.0, "No line");
+        doc.add_edge(hello, hub);
+        doc.add_edge(hub, yes);
+        doc.add_edge(hub, no);
+        doc.edges[1].label = "yes".into();
+        doc.edges[2].label = "no".into();
+
+        let script = doc.to_screenplay();
+        assert_eq!(script.matches("Anything else?").count(), 1, "{script}");
+        assert!(
+            script.contains("Hello\n\nAnything else?\n\n- yes"),
+            "{script}"
+        );
+
+        // Heading its own block it is said once, in the heading; with an alias taking
+        // the heading, once in the block.
+        doc.remove_edge(0);
+        let script = doc.to_screenplay();
+        assert_eq!(script.matches("Anything else?").count(), 1, "{script}");
+        assert!(script.contains("· Anything else?"), "{script}");
+        doc.node_mut(hub).unwrap().alias = "menu".into();
+        let script = doc.to_screenplay();
+        assert!(script.contains("· menu\n\nAnything else?\n"), "{script}");
+    }
+
+    /// A label and a once mark left on an edge when its node stopped being a line are
+    /// hidden on the canvas and in the translation export; the script printed them as a
+    /// choice and broke the block to do it.
+    #[test]
+    fn screenplay_ignores_a_choice_left_on_an_edge_out_of_plumbing() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let pay = said(&mut doc, 0.0, "A line");
+        let after = said(&mut doc, 0.0, "B line");
+        doc.add_edge(pay, after);
+        doc.edges[0].label = "Ask".into();
+        doc.edges[0].once = true;
+        doc.set_kind(pay, NodeKind::Instruction);
+        doc.set_effect(pay, "paid", Some(Value::Bool(true)), SetOp::Set);
+
+        let script = doc.to_screenplay();
+        assert!(
+            !script.contains("Ask") && !script.contains("once"),
+            "{script}"
+        );
+        assert!(
+            script.contains("*[paid = true]*\n\nB line"),
+            "one block: {script}"
+        );
+    }
+
     #[test]
     fn screenplay_points_through_jumps() {
         let script = Doc::tavern().to_screenplay();
