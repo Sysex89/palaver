@@ -984,6 +984,11 @@ impl Editor {
     /// copy goes too — this is the only place a backup is dropped on a document swap.
     fn replace_doc(&mut self, doc: Doc, path: Option<PathBuf>, cx: &mut Context<Self>) {
         self.clear_backup();
+        // What another tool declared is for the session, so it follows into whichever
+        // document is opened next; left behind, every line using one of its names turned
+        // into an unknown-variable error.
+        let mut doc = doc;
+        doc.inherit_outside(&self.doc);
         self.doc = doc;
         self.view = View::default();
         self.fit_pending = true;
@@ -1227,6 +1232,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let Some(file) = request.file.clone() else {
+            // No file to open, but names to declare are still names for this session.
+            if let Some(path) = &request.declarations {
+                self.declare_from(path, cx);
+            }
             return;
         };
         // The recovery prompt does not hold the mouse on Linux, so the document may have
@@ -3515,8 +3524,12 @@ impl Editor {
                                         )
                                         // `(ungrouped)` gets none: it is not a set, so
                                         // there is no name to rewrite.
+                                        // Nor does a set holding a name another tool
+                                        // declared: it is that tool's to name.
                                         .when_some(
-                                            header.filter(|_| playing.is_none()),
+                                            header.filter(|name| {
+                                                playing.is_none() && !self.doc.set_is_outside(name)
+                                            }),
                                             |this, name| {
                                                 this.child(self.set_rename_button(&name, cx))
                                             },
@@ -3626,7 +3639,13 @@ impl Editor {
                                     _ => true,
                                 } && match (pane, renaming_set) {
                                     (SidePane::Tags, _) => true,
-                                    (_, true) => this.doc.set_name_free(&name),
+                                    // The set's old name too: one holding an outside name is
+                                    // not renamed, and must not cost a checkpoint to find out.
+                                    (_, true) => {
+                                        this.doc.set_name_free(&name)
+                                            && !matches!(&renaming, Some(Rename::Set(old))
+                                                if this.doc.set_is_outside(old))
+                                    }
                                     (SidePane::Cast, _) => this.doc.character_name_free(&name),
                                     (SidePane::Variables, _) => {
                                         this.doc.variable_name_free(&name)

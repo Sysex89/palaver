@@ -2178,6 +2178,15 @@ impl Doc {
         !name.is_empty() && !name.contains('.') && !self.all_sets().contains(&name)
     }
 
+    /// Whether a set holds a name declared from outside, which makes it that tool's to
+    /// name: [`Doc::rename_set`] refuses it. Public so the view can leave the rename off
+    /// such a set instead of checkpointing for a rename that then moves nothing.
+    pub fn set_is_outside(&self, set: &str) -> bool {
+        self.variables
+            .iter()
+            .any(|v| split_set(&v.name).0 == Some(set) && self.is_outside_variable(&v.name))
+    }
+
     /// Renames the set every dotted name in it carries, and every effect and check naming
     /// one, returning how many *variables* moved. The fourth find-and-replace in this file
     /// after [`Doc::rename_variable`], [`Doc::rename_character`] and [`Doc::rename_flow`];
@@ -2192,12 +2201,7 @@ impl Doc {
         if from.is_empty() || to.is_empty() || to.contains('.') {
             return 0;
         }
-        // A set holding a name declared from outside is that tool's to name.
-        if self
-            .variables
-            .iter()
-            .any(|v| split_set(&v.name).0 == Some(from) && self.is_outside_variable(&v.name))
-        {
+        if self.set_is_outside(from) {
             return 0;
         }
 
@@ -2771,12 +2775,28 @@ impl Doc {
         changed
     }
 
+    /// The document's own state. What another tool declared is left out, as it is from a
+    /// save: it is not the document's to restore, and a snapshot that held it brought back
+    /// a name the tool had since dropped as a declaration of the document's own — unlocked,
+    /// and written into the file.
     fn snapshot(&self) -> Snapshot {
+        let own_variable = |v: &&Variable| !self.outside.merged_variables.contains(&v.name);
+        let own_character = |c: &&Character| !self.outside.merged_characters.contains(&c.name);
         Snapshot {
             nodes: self.nodes.clone(),
             edges: self.edges.clone(),
-            variables: self.variables.clone(),
-            characters: self.characters.clone(),
+            variables: self
+                .variables
+                .iter()
+                .filter(own_variable)
+                .cloned()
+                .collect(),
+            characters: self
+                .characters
+                .iter()
+                .filter(own_character)
+                .cloned()
+                .collect(),
             flows: self.flows.clone(),
             premise: self.premise.clone(),
         }
@@ -2797,7 +2817,11 @@ impl Doc {
         self.characters = characters;
         self.flows = flows;
         self.premise = premise;
-        // A snapshot from before the declarations came lacks them.
+        // A snapshot holds none of the outside names, so nothing in the lists it restored is
+        // a merged one — least of all a declaration of the document's own that shares a
+        // name with one, which the merge would otherwise take out as its own leftover.
+        self.outside.merged_variables.clear();
+        self.outside.merged_characters.clear();
         self.merge_outside();
     }
 
@@ -2816,6 +2840,16 @@ impl Doc {
         self.outside.variables = variables;
         self.outside.characters = characters;
         self.merge_outside();
+    }
+
+    /// Takes over what another tool declared to the document this one replaces: the names
+    /// are for the session, not for the file that happened to be open when they came.
+    pub fn inherit_outside(&mut self, from: &Doc) {
+        self.set_outside(
+            &from.outside.from,
+            from.outside.variables.clone(),
+            from.outside.characters.clone(),
+        );
     }
 
     /// Who declared the outside names, for the panes; empty when nobody did.
@@ -5320,6 +5354,83 @@ mod tests {
         assert!(doc.variable("quest.find").is_none());
         assert!(doc.variable("quest.other").is_some());
         assert!(doc.character("Lady").is_none());
+    }
+
+    /// The tool declares again with a name dropped, and an undo goes back past that: the
+    /// dropped name must not come back as the document's own, unlocked and saved.
+    #[test]
+    fn an_undo_does_not_bring_back_a_name_the_tool_dropped() {
+        let mut doc = Doc::default();
+        let one = |name: &str| {
+            vec![Variable {
+                name: name.into(),
+                default: Value::Int(1),
+            }]
+        };
+        doc.set_outside("Game", one("gold"), vec![]);
+        doc.checkpoint();
+        doc.add_node(0.0, 0.0);
+        doc.set_outside("Game", one("silver"), vec![]);
+        assert!(doc.undo());
+
+        assert!(doc.variable("gold").is_none());
+        assert!(doc.is_outside_variable("silver"));
+        assert!(!doc.to_json().contains("gold") && !doc.to_json().contains("silver"));
+    }
+
+    /// The document declares a name the tool also declares, and its own wins. Undo past
+    /// the declaration and redo it: its own is still its own, with its own type, and still
+    /// written.
+    #[test]
+    fn a_redo_keeps_the_documents_own_declaration_over_the_tools() {
+        let mut doc = Doc::default();
+        doc.checkpoint();
+        doc.add_variable("gold");
+        doc.set_outside(
+            "Game",
+            vec![Variable {
+                name: "gold".into(),
+                default: Value::Int(5),
+            }],
+            vec![],
+        );
+        assert!(doc.undo());
+        assert!(
+            doc.is_outside_variable("gold"),
+            "the tool's, while it has no own"
+        );
+        assert!(doc.redo());
+
+        assert!(!doc.is_outside_variable("gold"));
+        assert_eq!(doc.variable("gold").unwrap().default, Value::Bool(false));
+        assert_eq!(doc.variables.len(), 1);
+        assert!(doc.to_json().contains("gold"));
+    }
+
+    /// A document that replaces another in the window takes the session's names with it.
+    #[test]
+    fn a_new_document_inherits_what_the_tool_declared() {
+        let mut old = Doc::default();
+        outside(&mut old);
+        let mut new = Doc::default();
+        new.inherit_outside(&old);
+        assert!(new.is_outside_variable("quest.find"));
+        assert!(new.is_outside_character("Lady"));
+        assert_eq!(new.outside_from(), "Game");
+        assert!(!new.is_dirty());
+    }
+
+    /// The guard the view asks before it checkpoints agrees with the rename it guards.
+    #[test]
+    fn a_set_holding_an_outside_name_says_so() {
+        let mut doc = Doc::default();
+        doc.add_variable("quest.mine");
+        doc.add_variable("shop.paid");
+        outside(&mut doc);
+        assert!(doc.set_is_outside("quest"));
+        assert!(!doc.set_is_outside("shop"));
+        assert_eq!(doc.rename_set("quest", "q"), 0);
+        assert_eq!(doc.rename_set("shop", "s"), 1);
     }
 
     /// The file another tool writes: names and defaults, characters with or without a
