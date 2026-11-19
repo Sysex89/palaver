@@ -1973,9 +1973,12 @@ impl Doc {
         if !self.can_add_edge(from, to) {
             return false;
         }
-        // The first edge out of a condition is its true branch: the happy path is what gets
-        // drawn first, and the edge inspector flips it either way.
-        let branch = self.is_condition(from) && !self.edges.iter().any(|e| e.from == from);
+        // An edge out of a condition takes the true pin while that pin is free: the happy
+        // path is what gets drawn first, and the edge inspector flips it either way. Asked of
+        // the pin and not of "is this the first edge", or a true wire deleted and drawn again
+        // came back false, beside the false one already there, with the true pin unwired.
+        let branch =
+            self.is_condition(from) && !self.edges.iter().any(|e| e.from == from && e.branch);
         self.edges.push(Edge {
             from,
             to,
@@ -2643,6 +2646,14 @@ impl Doc {
                 let mut kept = false;
                 self.edges
                     .retain(|e| e.from != id || !std::mem::replace(&mut kept, true));
+            }
+            // The edges it already had were drawn as choices, every one of them `false`, so
+            // the first becomes the true pin as it would have had it been drawn from a
+            // condition. One it kept from an earlier turn as a condition is left alone.
+            NodeKind::Condition if !self.edges.iter().any(|e| e.from == id && e.branch) => {
+                if let Some(first) = self.edges.iter_mut().find(|e| e.from == id) {
+                    first.branch = true;
+                }
             }
             _ => {}
         }
@@ -5632,6 +5643,57 @@ mod tests {
             Some(false),
             "meaningless off any other kind, so it stays false"
         );
+    }
+
+    /// The repair an author reaches for: delete the wrong true wire, draw the right one.
+    /// The new edge takes the pin that is free, not `false` for being second.
+    #[test]
+    fn a_redrawn_edge_takes_the_true_pin_when_it_is_free() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let gate = checks(&mut doc, "paid", true);
+        let yes = spoken(&mut doc, 0.0, 0.0);
+        let no = spoken(&mut doc, 0.0, 0.0);
+        let better = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, yes);
+        doc.add_edge(gate, no);
+
+        doc.remove_edge(0);
+        doc.add_edge(gate, better);
+        let pins: Vec<bool> = doc.edges.iter().map(|e| e.branch).collect();
+        assert_eq!(pins, vec![false, true], "one of each again");
+        assert!(
+            !doc.problems()
+                .iter()
+                .any(|p| matches!(p, Problem::UnwiredBranch(..)))
+        );
+
+        // With the true pin taken, a third edge is false as before.
+        let extra = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(gate, extra);
+        assert!(!doc.edges.last().unwrap().branch);
+    }
+
+    /// A node made into a condition brings its edges with it, all drawn as choices. The
+    /// first is its true pin; a pin it kept from an earlier turn as a condition stays put.
+    #[test]
+    fn a_node_made_a_condition_gets_a_true_pin() {
+        let mut doc = Doc::default();
+        let node = spoken(&mut doc, 0.0, 0.0);
+        let one = spoken(&mut doc, 0.0, 0.0);
+        let two = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(node, one);
+        doc.add_edge(node, two);
+        doc.set_kind(node, NodeKind::Condition);
+        let pins = |doc: &Doc| doc.edges.iter().map(|e| e.branch).collect::<Vec<_>>();
+        assert_eq!(pins(&doc), vec![true, false]);
+
+        // Flipped by the author, turned into a hub and back: their choice is kept.
+        doc.edges[0].branch = false;
+        doc.edges[1].branch = true;
+        doc.set_kind(node, NodeKind::Hub);
+        doc.set_kind(node, NodeKind::Condition);
+        assert_eq!(pins(&doc), vec![false, true]);
     }
 
     #[test]
