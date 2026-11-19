@@ -1,9 +1,10 @@
 //! Single-line text field, vendored from gpui 0.2.2's `examples/input.rs`.
 //!
 //! Upstream code: keep edits minimal so it can be re-synced against a newer gpui.
-//! Local changes: made public, added `new`/`set_content`/`set_placeholder`/`bind_keys`, ctrl-based
-//! (rather than cmd-based) keybindings, dark styling from `crate::theme` with an accent border
-//! while focused, example harness removed. The text and the cursor are `theme::text()`, set here
+//! Local changes: made public, added `new`/`set_content`/`move_to_end`/`set_placeholder`/
+//! `bind_keys`, ctrl-based (rather than cmd-based) keybindings, dark styling from `crate::theme`
+//! with an accent border while focused, example harness removed. The text and the cursor are
+//! `theme::text()`, set here
 //! rather than inherited: upstream inherits the colour and paints the cursor `gpui::blue()`,
 //! which was invisible black-on-dark in any field whose ancestors set no text colour — every
 //! overlay, since they are deferred and sit under nothing that does.
@@ -316,6 +317,13 @@ impl TextInput {
         self.reset();
         self.content = content.to_string().into();
         cx.notify();
+    }
+
+    /// Puts the cursor after the last character. For a field given the focus from outside
+    /// rather than by a click in it: `set_content` leaves the cursor before the first
+    /// character, where typing would go in ahead of the line it was meant to carry on.
+    pub fn move_to_end(&mut self, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
     }
 
     /// The greyed-out hint shown while the field is empty. A setter because one field in the

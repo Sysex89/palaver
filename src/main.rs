@@ -1698,11 +1698,23 @@ impl Editor {
                 grab,
                 moved: false,
             });
-            // Only where the inspector draws the Text field: focus on a field that is not
-            // rendered lands nowhere, and every shortcut is dead until the canvas is
-            // clicked again.
-            if ev.click_count == 2 && has_text_field(kind) {
+            // Only where the inspector draws the Text field — a kind that has one, the node
+            // the whole selection, and no play-through in the sidebar: focus on a field that
+            // is not rendered lands nowhere.
+            if ev.click_count == 2
+                && has_text_field(kind)
+                && self.selection.only_node() == Some(id)
+                && self.play.is_none()
+            {
+                // At the end of the line, to carry on from: loading the fields left the
+                // cursor before the first character, and typing went in ahead of the text.
+                self.text_input
+                    .update(cx, |input, cx| input.move_to_end(cx));
                 window.focus(&self.text_input.read(cx).focus_handle(cx));
+                // The canvas pane tracks focus, so gpui focuses it on every press inside
+                // it — from a listener that runs *after* this one — and the cursor never
+                // reached the field. This is what that listener looks for.
+                window.prevent_default();
             }
         } else if let Some(index) = self.doc.edge_at(&self.flow, x, y) {
             self.select(Selection::Edge(index), cx);
@@ -1714,7 +1726,12 @@ impl Editor {
             let id = self.doc.add_node_on(&self.flow, x, y);
             self.select(Selection::Nodes(vec![id]), cx);
             self.drag = None;
-            window.focus(&self.speaker_input.read(cx).focus_handle(cx));
+            // Not while playing, when the sidebar is the player and draws no Speaker field.
+            if self.play.is_none() {
+                window.focus(&self.speaker_input.read(cx).focus_handle(cx));
+                // For the reason the Text field's double-click gives above.
+                window.prevent_default();
+            }
         } else {
             // Shift keeps the current set so the band can extend it; a plain drag replaces it.
             if !ev.modifiers.shift {
