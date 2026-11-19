@@ -1336,7 +1336,10 @@ impl Editor {
     // ponytail: one undo checkpoint per editing session, not per keystroke. On `doc`
     // directly, since this *is* the typing session the wrapper above ends.
     fn checkpoint_once(&mut self) {
-        if !self.text_dirty {
+        // A clean document has nothing for this edit to coalesce into: the session's step was
+        // saved, or left with the document it belonged to. Skipping would leave the edit
+        // unsaved, and the next Ctrl+Z stepping back past the save.
+        if !self.text_dirty || !self.doc.is_dirty() {
             self.doc.checkpoint();
             self.text_dirty = true;
         }
