@@ -93,6 +93,9 @@ pub fn run_after_save(command: &str, file: &Path) -> Outcome {
         shell.arg("/C").arg(command);
         shell
     };
+    // Absolute before the folder changes under it: `sub/talk.dln`, read from inside `sub`,
+    // names `sub/sub/talk.dln`. Not canonicalized — a symlink stays the name it was given.
+    let file = &std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf());
     if let Some(folder) = file
         .parent()
         .filter(|folder| !folder.as_os_str().is_empty())
@@ -298,6 +301,33 @@ mod tests {
                 detail: "exit 3: no flow named x".into()
             }
         );
+    }
+
+    /// A path as a person types it at a prompt: relative, in a subfolder. The command runs
+    /// in that subfolder, so the name it is handed has to still find the file from there.
+    #[cfg(unix)]
+    #[test]
+    fn an_after_save_command_is_handed_a_path_that_finds_the_file() {
+        let folder = std::env::temp_dir().join(format!("palaver-rel-{}", std::process::id()));
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub/talk.dln"), "{}").unwrap();
+        let relative = pathdiff(&folder.join("sub/talk.dln"));
+        assert!(relative.is_relative());
+
+        let done = run_after_save(
+            "test -e \"$PALAVER_FILE\" && case \"$PALAVER_FILE\" in /*) ;; *) exit 1 ;; esac",
+            &relative,
+        );
+        assert!(done.ok, "{done:?}");
+    }
+
+    /// `target` as a path relative to the working directory, without changing it: tests
+    /// share one process, and its working directory with it.
+    #[cfg(unix)]
+    fn pathdiff(target: &Path) -> PathBuf {
+        let here = std::env::current_dir().unwrap();
+        let up: PathBuf = here.components().skip(1).map(|_| "..").collect();
+        up.join(target.strip_prefix("/").unwrap())
     }
 
     #[cfg(unix)]
