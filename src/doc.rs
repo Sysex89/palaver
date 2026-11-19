@@ -2098,20 +2098,31 @@ impl Doc {
         }
     }
 
+    /// The two ends of an edge the canvas for `flow` draws as a wire, or `None` for one it
+    /// does not: an end that is gone, an end standing on another canvas, or an edge leaving
+    /// a jump, whose box names its target instead of running a line to it.
+    ///
+    /// The one test a wire is painted, labelled and clicked by — `edge_lines`, `edge_labels`
+    /// and [`Doc::edge_at`] all ask here — so a line is never hit where it is not drawn.
+    /// While each kept its own copy, the hit test had the first two reasons and not the
+    /// third: a click on empty canvas along a jump's would-be wire selected an edge nobody
+    /// could see, Delete then took the jump's target, and a real wire crossing it could not
+    /// be clicked at the crossing.
+    pub fn wire_ends(&self, flow: &str, edge: &Edge) -> Option<(&Node, &Node)> {
+        let (from, to) = (self.node(edge.from)?, self.node(edge.to)?);
+        (from.kind != NodeKind::Jump && from.flow == flow && to.flow == flow).then_some((from, to))
+    }
+
     /// Index of the first edge of one flow whose wire passes near the point — the route
-    /// [`route`] draws, not a straight line between the ports. An edge is in
-    /// a flow only when *both* its ends are — the same test the canvas draws it by, so the
-    /// author can never click a line that is not there. The index is still into the whole
-    /// `edges` vec, which is what keeps `Selection::Edge` a bare index.
+    /// [`route`] draws, not a straight line between the ports — among the edges the canvas
+    /// draws there ([`Doc::wire_ends`]). The index is still into the whole `edges` vec, which
+    /// is what keeps `Selection::Edge` a bare index.
     pub fn edge_at(&self, flow: &str, x: f32, y: f32) -> Option<usize> {
         self.edges.iter().position(|e| {
-            let (Some(from), Some(to)) = (self.node(e.from), self.node(e.to)) else {
-                return false;
-            };
-            if from.flow != flow || to.flow != flow {
-                return false;
-            }
-            distance_to_polyline((x, y), &route(out_port(from), in_port(to)).points) <= EDGE_HIT_TOL
+            self.wire_ends(flow, e).is_some_and(|(from, to)| {
+                let wire = route(out_port(from), in_port(to));
+                distance_to_polyline((x, y), &wire.points) <= EDGE_HIT_TOL
+            })
         })
     }
 
@@ -6228,6 +6239,74 @@ mod tests {
         // Both ends on one canvas and it is clickable again.
         doc.node_mut(to).unwrap().flow.clear();
         assert_eq!(doc.edge_at("", mid.0, mid.1), Some(0));
+    }
+
+    /// A jump's edge is real — the walk takes it — and not a wire: the box names the
+    /// target. So a click along where the wire would run finds nothing, and one where a
+    /// drawn wire crosses it finds the drawn one, whichever is first in the file.
+    #[test]
+    fn edge_at_skips_an_edge_leaving_a_jump() {
+        let mut doc = Doc::default();
+        let jump = doc.add_node(0.0, 200.0);
+        let target = doc.add_node(600.0, 200.0);
+        doc.set_kind(jump, NodeKind::Jump);
+        assert!(doc.add_edge(jump, target));
+        let (x, y) = out_port(doc.node(jump).unwrap());
+        assert_eq!(
+            doc.edge_at("", x + 200.0, y),
+            None,
+            "nothing is drawn there"
+        );
+
+        // A wire that is drawn, crossing the jump's on its way down.
+        let above = doc.add_node(0.0, 0.0);
+        let below = doc.add_node(500.0, 400.0);
+        assert!(doc.add_edge(above, below));
+        let wire = route(
+            out_port(doc.node(above).unwrap()),
+            in_port(doc.node(below).unwrap()),
+        );
+        let trunk_x = wire.points[1].0;
+        assert_eq!(
+            doc.edge_at("", trunk_x, y),
+            Some(1),
+            "not the jump's, though it is first"
+        );
+
+        // The same edge out of a line of dialogue is a wire like any other.
+        doc.set_kind(jump, NodeKind::Speech);
+        assert_eq!(doc.edge_at("", x + 200.0, y), Some(0));
+    }
+
+    /// `wire_ends` is what `edge_lines` and `edge_labels` draw by, so this is the rule that a
+    /// line is never hit where it is not drawn, checked along every edge of the sample: a
+    /// drawn one is hit somewhere along its route, and whatever is hit is drawn.
+    #[test]
+    fn only_a_drawn_wire_is_ever_hit() {
+        for doc in [Doc::sample(), Doc::tavern()] {
+            let mut undrawn = 0;
+            for edge in &doc.edges {
+                let (from, to) = (doc.node(edge.from).unwrap(), doc.node(edge.to).unwrap());
+                let flow = from.flow.as_str();
+                let drawn = doc.wire_ends(flow, edge).is_some();
+                undrawn += usize::from(!drawn);
+                let wire = route(out_port(from), in_port(to));
+                for seg in wire.points.windows(2) {
+                    for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                        let p = (
+                            seg[0].0 + (seg[1].0 - seg[0].0) * t,
+                            seg[0].1 + (seg[1].1 - seg[0].1) * t,
+                        );
+                        let hit = doc.edge_at(flow, p.0, p.1);
+                        if let Some(index) = hit {
+                            assert!(doc.wire_ends(flow, &doc.edges[index]).is_some());
+                        }
+                        assert!(!drawn || hit.is_some(), "{p:?} on a drawn wire");
+                    }
+                }
+            }
+            assert!(undrawn > 0, "the sample has a jump to try this on");
+        }
     }
 
     /// The third find-and-replace in this file, after a variable's and a character's.

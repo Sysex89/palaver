@@ -1566,16 +1566,11 @@ impl Editor {
             .edges
             .iter()
             .enumerate()
-            .filter(|(_, e)| !self.doc.is_jump(e.from))
             .filter_map(|(index, e)| {
-                let from = self.doc.node(e.from)?;
-                let to = self.doc.node(e.to)?;
-                // An edge belongs to the canvas both its ends stand on — the same test
-                // `Doc::edge_at` clicks it by, so a line is never drawn where it cannot be
-                // hit, nor hit where it is not drawn.
-                if from.flow != self.flow || to.flow != self.flow {
-                    return None;
-                }
+                // The one test for "this edge is a wire on this canvas" — both ends on it,
+                // and not leaving a jump — shared with the label and with `Doc::edge_at`, so
+                // a line is never drawn where it cannot be hit, nor hit where it is not drawn.
+                let (from, to) = self.doc.wire_ends(&self.flow, e)?;
                 // The trail is read off the play path, the way `Doc::spent` is: nothing is
                 // stored beside it. It is the weight of the line that says "walked", so a
                 // condition's pin keeps its own colour — the trail hue is the true pin's.
@@ -1760,7 +1755,14 @@ impl Editor {
                 {
                     self.checkpoint();
                     self.doc.link(from, to);
-                    self.select(Selection::Edge(self.doc.edges.len() - 1), cx);
+                    // A jump's edge is not a wire — its box names the target — so selecting
+                    // it showed nothing selected, and the next Delete took the target just
+                    // given. The jump is what changed on screen, so the jump is selected.
+                    let made = match self.doc.is_jump(from) {
+                        true => Selection::Nodes(vec![from]),
+                        false => Selection::Edge(self.doc.edges.len() - 1),
+                    };
+                    self.select(made, cx);
                 }
             }
             Some(Drag::Marquee { start, cursor }) => {
@@ -3004,10 +3006,7 @@ impl Editor {
             // A condition's edges always carry a label — which pin they leave by — even
             // though the player never chooses one, so the empty-label skip lets them past.
             .filter(|edge| {
-                !self.doc.is_jump(edge.from)
-                    && (!edge.label.is_empty()
-                        || self.doc.is_condition(edge.from)
-                        || self.doc.is_once(edge))
+                !edge.label.is_empty() || self.doc.is_condition(edge.from) || self.doc.is_once(edge)
             })
             .filter_map(|edge| {
                 let is_pin = self.doc.is_condition(edge.from);
@@ -3033,12 +3032,9 @@ impl Editor {
                 } else {
                     (edge.label.clone(), theme::text_muted())
                 };
-                let (from_node, to_node) = (self.doc.node(edge.from)?, self.doc.node(edge.to)?);
-                // Skipped for the reason `edge_lines` skips it, and through the same test so
-                // the two cannot drift.
-                if from_node.flow != self.flow || to_node.flow != self.flow {
-                    return None;
-                }
+                // Labelled only where `edge_lines` draws the wire, and by the same test, so
+                // the two cannot drift: a jump's edge and one crossing canvases have neither.
+                let (from_node, to_node) = self.doc.wire_ends(&self.flow, edge)?;
                 // On the run the wire has, at the width that run has: the same route the
                 // canvas draws, so the label can never be centred on a wire that is not there.
                 let wire = route(out_port(from_node), in_port(to_node));
