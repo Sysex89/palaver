@@ -1180,25 +1180,43 @@ impl Problem {
 }
 
 impl Doc {
-    /// Where the conversation containing `from` begins: incoming edges walked back until a
-    /// node nothing links to. Returns `from` itself when it is already a top, or when the
-    /// walk meets a cycle. A start is relative to the node you are standing on rather than a
-    /// property of the document, which is what lets one document hold several independent
-    /// dialogues.
+    /// Where the conversation containing `from` begins: incoming edges walked back to a
+    /// node nothing links to. Returns `from` itself when it is already a top, or when there
+    /// is none to find — a loop with no way in. A start is relative to the node you are
+    /// standing on rather than a property of the document, which is what lets one document
+    /// hold several independent dialogues.
+    ///
+    /// Every way back is tried, first-drawn edge first, and a node already passed is stepped
+    /// around rather than ending the search. A hub's loop back to itself is usually drawn
+    /// before the greeting later put in front of it, and following only the first edge in
+    /// walked into that loop and called the hub the start.
     //
-    // ponytail: follows the first incoming edge in document order, so a node two branches
-    // rejoin at walks back through whichever was drawn first. Both lead to the same
-    // conversation; revisit if that stops being true.
+    // ponytail: depth-first, so a node two tops lead to answers with the one its first-drawn
+    // edges reach. Both lead to the same conversation; revisit if that stops being true.
+    // One scan of the edges per node passed, which is `node`'s ceiling too.
     pub fn start_of(&self, from: NodeId) -> NodeId {
-        let mut current = from;
-        let mut seen = HashSet::from([current]);
-        while let Some(edge) = self.edges.iter().find(|e| e.to == current) {
-            if !seen.insert(edge.from) || self.node(edge.from).is_none() {
-                break;
+        let mut seen = HashSet::new();
+        let mut ways = vec![from];
+        while let Some(current) = ways.pop() {
+            if !seen.insert(current) {
+                continue;
             }
-            current = edge.from;
+            // An edge out of a node that is gone is no way back.
+            let mut back = self
+                .edges
+                .iter()
+                .filter(|e| e.to == current && self.node(e.from).is_some())
+                .map(|e| e.from)
+                .peekable();
+            if back.peek().is_none() {
+                return current;
+            }
+            // Reversed onto the stack, so the first-drawn edge is the next one walked.
+            let at = ways.len();
+            ways.extend(back);
+            ways[at..].reverse();
         }
-        current
+        from
     }
 
     /// The choices offered at a node: where each one leads and how it is labelled, in
@@ -4110,10 +4128,98 @@ mod tests {
         doc.add_edge(a, b);
         doc.add_edge(b, a);
 
-        assert!(
-            [a, b].contains(&doc.start_of(b)),
-            "a cycle has no top to find"
-        );
+        // A loop with no way in has no top to find, so each node is its own start — not
+        // whichever one the walk happened to be standing on when it came back round.
+        assert_eq!(doc.start_of(a), a);
+        assert_eq!(doc.start_of(b), b);
+    }
+
+    /// The order an author really draws in: the hub and its loop first, the greeting put in
+    /// front of it afterwards. The loop's edge into the hub is then the first one in the
+    /// file, and following only that one called the hub the start.
+    #[test]
+    fn start_of_steps_around_a_loop_to_the_top_behind_it() {
+        let mut doc = Doc::default();
+        let hub = spoken(&mut doc, 300.0, 0.0);
+        let question = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(hub, question);
+        doc.add_edge(question, hub);
+        let greeting = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(greeting, hub);
+
+        assert_eq!(doc.roots(), vec![greeting]);
+        assert_eq!(doc.start_of(question), greeting);
+        assert_eq!(doc.start_of(hub), greeting);
+        assert_eq!(doc.start_of(greeting), greeting);
+    }
+
+    /// The way in can be further round the loop than the first step back, so a dead end in
+    /// it is backed out of rather than taken for an answer.
+    #[test]
+    fn start_of_backs_out_of_a_loop_it_walked_into() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        let c = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(a, b);
+        doc.add_edge(b, c);
+        doc.add_edge(c, a);
+        let top = spoken(&mut doc, 0.0, 300.0);
+        doc.add_edge(top, b);
+
+        for inside in [a, b, c] {
+            assert_eq!(doc.start_of(inside), top);
+        }
+    }
+
+    /// Where two tops lead to one node it is still the first-drawn way back that is taken,
+    /// as it was when that was the only way tried.
+    #[test]
+    fn start_of_takes_the_first_drawn_way_back_where_two_tops_meet() {
+        let mut doc = Doc::default();
+        let x = spoken(&mut doc, 0.0, 0.0);
+        let y = spoken(&mut doc, 0.0, 300.0);
+        let shared = spoken(&mut doc, 300.0, 0.0);
+        let after = spoken(&mut doc, 600.0, 0.0);
+        doc.add_edge(y, shared);
+        doc.add_edge(x, shared);
+        doc.add_edge(shared, after);
+
+        assert_eq!(doc.start_of(after), y, "drawn first");
+        assert_eq!(doc.start_of(shared), y);
+    }
+
+    /// An edge whose source is gone is not a way back: with nothing else leading in, the
+    /// node it points at is a top, and with something else, that is the way.
+    #[test]
+    fn start_of_ignores_an_edge_from_a_node_that_is_gone() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 300.0, 0.0);
+        let gone = spoken(&mut doc, 0.0, 300.0);
+        doc.add_edge(gone, a);
+        doc.nodes.retain(|n| n.id != gone);
+        assert!(doc.problems().contains(&Problem::DanglingEdge(0)));
+        assert_eq!(doc.start_of(a), a);
+
+        let top = spoken(&mut doc, 0.0, 0.0);
+        doc.add_edge(top, a);
+        assert_eq!(doc.start_of(a), top);
+    }
+
+    /// The rule the others are cases of: wherever in the sample you stand, F5 begins at a
+    /// node `roots` calls a start. A note stands in no conversation and is its own.
+    #[test]
+    fn start_of_is_a_root_from_every_node_of_the_sample() {
+        for doc in [Doc::sample(), Doc::tavern()] {
+            let roots = doc.roots();
+            for node in &doc.nodes {
+                let start = doc.start_of(node.id);
+                match node.kind {
+                    NodeKind::Note => assert_eq!(start, node.id),
+                    _ => assert!(roots.contains(&start), "{:?} starts off a root", node.text),
+                }
+            }
+        }
     }
 
     #[test]
