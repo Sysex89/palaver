@@ -146,11 +146,23 @@ def main():
             app.wait(timeout=5)
         except Exception:
             pass
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)  # frames of a run that did not finish
+        raise
     finally:
         if app and app.poll() is None:
             app.kill()
         sway.terminate()
 
+    try:
+        encode(frames, stamps, work, out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def encode(frames, stamps, work, out):
+    """Encodes into the work directory and moves both files into place only once both exist,
+    so a failed encode leaves the recording that was there, and never an mp4 without its gif."""
     shots = sorted(frames.glob("*.png"))
     if len(shots) < 30:
         sys.exit(f"only {len(shots)} frames were captured")
@@ -161,12 +173,13 @@ def main():
     quiet = ["ffmpeg", "-v", "error", "-y"]
     subprocess.run(quiet + src + ["-vf", "scale=1280:-2,format=yuv420p", "-r", "30",
                                    "-c:v", "libx264", "-crf", "20", "-preset", "slow",
-                                   "-movflags", "+faststart", str(out) + ".mp4"], check=True)
+                                   "-movflags", "+faststart", str(work / "out.mp4")], check=True)
     subprocess.run(quiet + src + ["-vf", "fps=12,scale=800:-1:flags=lanczos,split[a][b];"
                                    "[a]palettegen=max_colors=128:stats_mode=diff[p];"
                                    "[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle",
-                                   str(out) + ".gif"], check=True)
-    shutil.rmtree(work, ignore_errors=True)
+                                   str(work / "out.gif")], check=True)
+    shutil.move(str(work / "out.mp4"), str(out) + ".mp4")
+    shutil.move(str(work / "out.gif"), str(out) + ".gif")
     print(f"{n} frames at {fps:.1f} fps -> {out}.mp4, {out}.gif")
 
 

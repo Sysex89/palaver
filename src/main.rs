@@ -818,7 +818,8 @@ impl Editor {
             PromptLevel::Warning,
             "Recover unsaved work?",
             Some(&format!(
-                "{} was not saved before the last session ended.",
+                // Short: gpui's prompt clips a detail line wider than its card.
+                "{} was not saved last time.",
                 document_name(backup.path.as_deref())
             )),
             &["Recover", "Discard"],
@@ -1306,7 +1307,8 @@ impl Editor {
             return Some(id);
         }
         if let Some(name) = flow {
-            if self.doc.flows.iter().any(|known| known == name) {
+            // Every canvas a node stands on, not only the declared ones.
+            if self.doc.all_flows().contains(&name) {
                 self.show_flow(name, cx);
             } else {
                 self.set_status(format!("No flow {name} in this file"), cx);
@@ -1315,9 +1317,6 @@ impl Editor {
         None
     }
 
-    /// Takes the places later launches for `file` hand over, while this window still has
-    /// that file open; a launch handed a refusal opens the file itself.
-    #[cfg(unix)]
     /// Reads a declarations file (`link.rs`) into the open document: names another tool
     /// gives this session, which the panes show locked and no save writes. A character the
     /// file gives no colour gets the next of the cast's. A file that does not read is said in
@@ -1344,6 +1343,9 @@ impl Editor {
         }
     }
 
+    /// Takes the places later launches for `file` hand over, while this window still has
+    /// that file open; a launch handed a refusal opens the file itself.
+    #[cfg(unix)]
     fn take_handovers(&mut self, file: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let Some(inbox) = link::listen(&file) else {
             return;
@@ -1845,6 +1847,9 @@ impl Editor {
         if self.selection == Selection::None || self.flow_map {
             return;
         }
+        // A drag in progress is over: it would go on moving, or linking from, what is
+        // about to be gone, and checkpoint again for a move that moves nothing.
+        self.drag = None;
         // One checkpoint for the whole set, so a group deletion is a single undo step.
         self.checkpoint();
         match self.selection.clone() {
@@ -1857,12 +1862,16 @@ impl Editor {
     }
 
     fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        // A drag in progress ends with the step: carried on, its moves would be written
+        // with no checkpoint of their own, and be lost with the next undo.
+        self.drag = None;
         if self.doc.undo() {
             self.after_history(cx);
         }
     }
 
     fn on_redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        self.drag = None;
         if self.doc.redo() {
             self.after_history(cx);
         }
@@ -1937,6 +1946,8 @@ impl Editor {
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         self.close_palette(cx);
         self.prefs_open = false;
+        // The sheet is modal and has a scrim: find opened under it could not be seen.
+        self.help_open = false;
         self.searching = true;
         window.focus(&self.search_input.read(cx).focus_handle(cx));
         cx.notify();
@@ -1945,14 +1956,17 @@ impl Editor {
     fn on_toggle_problems(&mut self, _: &ToggleProblems, _: &mut Window, cx: &mut Context<Self>) {
         self.close_palette(cx);
         self.prefs_open = false;
+        self.help_open = false;
         self.problems_open = !self.problems_open;
         cx.notify();
     }
 
     fn on_show_help(&mut self, _: &ShowHelp, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_palette(cx);
-        self.prefs_open = false;
-        self.help_open = !self.help_open;
+        // Modal, like Preferences: whatever else is up comes down first, so nothing is
+        // left open under its scrim for one Escape to close along with it.
+        let was_open = self.help_open;
+        self.dismiss_overlays(cx);
+        self.help_open = !was_open;
         cx.notify();
     }
 
@@ -2167,6 +2181,10 @@ impl Editor {
     /// Escape. Closes an overlay if one is open and only otherwise stops the play-through,
     /// so Escape peels back one layer at a time instead of doing both at once.
     fn on_stop_play(&mut self, _: &StopPlay, _: &mut Window, cx: &mut Context<Self>) {
+        // An open menu is the topmost layer of all.
+        if self.open_menu.take().is_some() {
+            return cx.notify();
+        }
         if self.dismiss_overlays(cx) {
             return;
         }
@@ -3914,6 +3932,22 @@ impl Editor {
                             return;
                         };
                         let value = Value::Int(n);
+                        // The number it already holds is no edit: no undo step for it.
+                        let now = match &target {
+                            ValueTarget::Default(name) => {
+                                this.doc.variable(name).map(|variable| variable.default)
+                            }
+                            ValueTarget::Effect(id, name) => {
+                                this.doc.effect_of(*id, name).map(|effect| effect.value)
+                            }
+                            ValueTarget::Check(id, name) => {
+                                this.doc.condition_of(*id, name).map(|check| check.want)
+                            }
+                        };
+                        if now == Some(value) {
+                            this.editing = None;
+                            return cx.notify();
+                        }
                         this.checkpoint();
                         match &target {
                             ValueTarget::Default(name) => this.doc.set_default(name, value),
@@ -4603,7 +4637,7 @@ impl Editor {
         // A cast row counts lines, the number the Cast foot adds up; a speaker on a blank
         // node still shows up in the list, since that node does name them.
         let count = match target {
-            Ref::Character(name) => self.doc.stats(|node| node.speaker == *name).lines,
+            Ref::Character(name) => self.doc.stats(|node| node.speaker.trim() == name).lines,
             _ => nodes.len(),
         };
         let open = self.used_by.as_ref() == Some(target);

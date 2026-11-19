@@ -1908,7 +1908,7 @@ impl Doc {
                         .tags
                         .iter()
                         .any(|t| t.to_lowercase().starts_with(tag.as_str())),
-                    Filter::End => n.end,
+                    Filter::End => n.is_ending(),
                     Filter::Aliased => !n.alias.trim().is_empty(),
                     Filter::Start => {
                         n.kind != NodeKind::Note && !self.edges.iter().any(|e| e.to == n.id)
@@ -2027,8 +2027,11 @@ impl Doc {
     // occupied row; index nodes by cell if a document ever has thousands in one column.
     pub fn free_spot(&self, flow: &str, x: f32, y: f32) -> (f32, f32) {
         let mut y = y;
-        // Bounded, so a pathological document cannot hang the editor on a menu click.
-        for _ in 0..self.nodes.len() + 1 {
+        // Bounded, so a pathological document cannot hang the editor on a menu click. Two
+        // slides a node, not one: a node is in the way across a span two rows tall, so one
+        // off the row grid can still be in the way after the first slide past it — and with
+        // one slide each the count ran out on top of the last node.
+        for _ in 0..2 * self.nodes.len() + 1 {
             let covered = self
                 .nodes_in(flow)
                 .any(|n| (n.x - x).abs() < NODE_W && (n.y - y).abs() < NODE_H + GAP_Y);
@@ -2929,8 +2932,26 @@ impl Doc {
     }
 
     // ponytail: file IO runs on the foreground executor; fine for documents this size.
+    //
+    // Written beside the file and renamed over it, as the crash copy is: a plain write
+    // truncates the author's only copy first, and a kill or a full disk half-way leaves
+    // neither the old document nor the new. Through a symlink, to the file it names; the
+    // file's own permissions are kept.
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_json()).map_err(|e| e.to_string())?;
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(".tmp");
+        let temp = target.with_file_name(name);
+        let written = std::fs::write(&temp, self.to_json())
+            .and_then(|()| match std::fs::metadata(&target) {
+                Ok(old) => std::fs::set_permissions(&temp, old.permissions()),
+                Err(_) => Ok(()),
+            })
+            .and_then(|()| std::fs::rename(&temp, &target));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
         self.dirty = false;
         Ok(())
     }
@@ -2975,7 +2996,7 @@ impl Doc {
             let chosen = self
                 .node(edge.from)
                 .is_some_and(|n| n.player_text().is_some());
-            if chosen && !edge.label.is_empty() {
+            if chosen && !edge.label.trim().is_empty() {
                 if self.is_placeholder_choice(edge) {
                     out += PLACEHOLDER_FTL;
                 }
@@ -3015,8 +3036,11 @@ impl Doc {
         }
         let mut out = format!("{key} =\n");
         for line in escaped.lines() {
+            // And a line that opens with a space: a block value loses the indent its lines
+            // share, so where every line has one, every line would lose it.
             let shield = match line.trim_start().chars().next() {
                 Some('[' | '*' | '.') => SHIELD,
+                _ if line.starts_with(' ') => SHIELD,
                 _ => "",
             };
             out += &format!("    {shield}{line}\n");
@@ -4788,6 +4812,74 @@ mod tests {
         let row = NODE_H + GAP_Y;
         assert_eq!(doc.free_spot("", 100.0, 100.0), (100.0, 100.0 + row));
         assert_eq!(doc.free_spot("", 150.0, 140.0), (150.0, 140.0 + row));
+    }
+
+    /// Nodes that are not a whole row apart: one row down from the first is still inside
+    /// the second, and the slide used to stop there.
+    #[test]
+    fn free_spot_clears_nodes_that_are_off_the_row_grid() {
+        let mut doc = Doc::default();
+        doc.add_node(0.0, 0.0);
+        doc.add_node(0.0, 240.0);
+        for start in [-60.0, 0.0, 70.0, 200.0] {
+            let (x, y) = doc.free_spot("", 0.0, start);
+            let covered = doc
+                .nodes
+                .iter()
+                .any(|n| (n.x - x).abs() < NODE_W && (n.y - y).abs() < NODE_H + GAP_Y);
+            assert!(!covered, "from {start} it stopped at {y}");
+        }
+    }
+
+    /// `is:end` asks the kind, as the canvas border and `DeadEnd` do: a flag left on a
+    /// node that became a hub is not an ending.
+    #[test]
+    fn is_end_ignores_a_flag_the_kind_does_not_show() {
+        let mut doc = Doc::default();
+        let node = spoken(&mut doc, 0.0, 0.0);
+        doc.node_mut(node).unwrap().end = true;
+        assert_eq!(doc.query("is:end"), vec![node]);
+        doc.set_kind(node, NodeKind::Hub);
+        assert!(doc.query("is:end").is_empty());
+    }
+
+    /// A label of nothing but blanks is no choice to translate, and a block whose every
+    /// line opens with a space keeps it.
+    #[test]
+    fn ftl_skips_a_blank_label_and_keeps_a_blocks_leading_spaces() {
+        let mut doc = Doc::default();
+        let a = spoken(&mut doc, 0.0, 0.0);
+        let b = spoken(&mut doc, 300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.edges[0].label = "   ".into();
+        assert!(!doc.to_ftl().contains("edge-"));
+
+        assert_eq!(
+            Doc::ftl_entry("k", " a\n b"),
+            "k =\n    {\"\"} a\n    {\"\"} b\n"
+        );
+    }
+
+    /// A save replaces the file whole and leaves nothing beside it.
+    #[test]
+    fn a_save_leaves_no_temp_file_and_keeps_the_old_one_on_failure() {
+        let dir = std::env::temp_dir().join(format!("palaver-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("talk.dln");
+        let mut doc = Doc::sample();
+        doc.checkpoint();
+        doc.save(&path).unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doc.to_json());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no .tmp left behind"
+        );
+
+        doc.checkpoint();
+        assert!(doc.save(&dir.join("missing/talk.dln")).is_err());
+        assert!(doc.is_dirty(), "a failed save is not a save");
     }
 
     #[test]

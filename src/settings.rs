@@ -106,18 +106,36 @@ impl TextFont {
     }
 }
 
+/// Reads one setting, or its default when the value is one this build does not know — a
+/// typeface a newer build added, a number where a name belongs. Without it one such value
+/// failed the whole file, every other preference went back to its default with it, and the
+/// next save wrote those defaults over the file.
+fn known_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 /// Everything the Preferences card sets. `#[serde(default)]` on each field, so a file
 /// written by an older build (before a setting existed) or a newer one (after one was
-/// removed) still loads, keeping what it can read.
+/// removed) still loads, keeping what it can read — field by field, through
+/// [`known_or_default`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(deserialize_with = "known_or_default")]
     pub theme: ThemePref,
+    #[serde(deserialize_with = "known_or_default")]
     pub ui_font: UiFont,
+    #[serde(deserialize_with = "known_or_default")]
     pub text_font: TextFont,
     /// Placeholder lines from a local model. Off until the author turns it on: while off,
     /// the Generate menu is hidden and no model is looked for or loaded. About this machine
     /// and this author, not the document, so opening someone's file never starts a model.
+    #[serde(deserialize_with = "known_or_default")]
     pub generate: bool,
 }
 
@@ -223,9 +241,15 @@ mod tests {
         let extra = Settings::from_json(r#"{ "theme": "light", "something_new": 3 }"#).unwrap();
         assert_eq!(extra.theme, ThemePref::Light);
 
-        // An unknown variant is a parse failure for the whole file, which is the defaults:
-        // better than guessing which of the three fonts was meant.
-        assert_eq!(Settings::from_json(r#"{ "ui_font": "comic_sans" }"#), None);
+        // An unknown value costs that one setting its choice and no other: the font goes
+        // back to the default rather than guessing which was meant, the rest are kept.
+        let newer = Settings::from_json(
+            r#"{ "theme": "light", "ui_font": "comic_sans", "generate": "yes" }"#,
+        )
+        .unwrap();
+        assert_eq!(newer.theme, ThemePref::Light);
+        assert_eq!(newer.ui_font, UiFont::default());
+        assert!(!newer.generate);
     }
 
     #[test]

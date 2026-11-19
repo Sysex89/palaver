@@ -19,7 +19,10 @@ NODE_W, NODE_H = 200, 90
 
 tmp = Path(tempfile.mkdtemp(prefix="palaver-wires-"))
 sockp = tmp / "palaver-automation.sock"
-app = subprocess.Popen([str(BIN)], env=dict(os.environ, TMPDIR=str(tmp)), stderr=subprocess.DEVNULL)
+# A private config home as well: with the person's own preferences the canvas can be the light
+# palette's, and the dark one's colour — which is how the window is found — is nowhere on it.
+app = subprocess.Popen([str(BIN)], env=dict(os.environ, TMPDIR=str(tmp), XDG_CONFIG_HOME=str(tmp / "config")),
+                       stderr=subprocess.DEVNULL)
 
 def connect():
     for _ in range(150):
@@ -75,6 +78,11 @@ try:
         if b-a > bottom-top: top,bottom=a,b
     scale = (right-left+1) / (WIN[0]-VARS_W-SIDEBAR_W)
     print(f"capture {W}x{H}, canvas px x{left}..{right} y{top}..{bottom}, scale {scale:.3f}, zoom {zoom}, pan {pan}")
+    # Nothing below may click until the canvas is known to be where it was looked for. With no
+    # canvas-coloured run found these are all zero, and every click that follows would land near
+    # the corner of whatever window is in front, with Ctrl+, sent after it.
+    if not (0.5 <= scale <= 4.0 and bottom - top > 200 * scale):
+        sys.exit(f"the editor's canvas was not found on screen (x{left}..{right} y{top}..{bottom}): nothing clicked")
 
     ui = UInput({e.EV_KEY:[e.BTN_LEFT], e.EV_ABS:[(e.ABS_X,AbsInfo(0,0,W-1,0,0,0)),(e.ABS_Y,AbsInfo(0,0,H-1,0,0,0))]}, name="palaver-prefs0")
     time.sleep(0.4)

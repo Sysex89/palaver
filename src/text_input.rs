@@ -2,7 +2,7 @@
 //!
 //! Upstream code: keep edits minimal so it can be re-synced against a newer gpui.
 //! Local changes: made public, added `new`/`set_content`/`move_to_end`/`set_placeholder`/
-//! `bind_keys`, ctrl-based (rather than cmd-based) keybindings, dark styling from `crate::theme`
+//! `bind_keys`, ctrl-based (rather than cmd-based) keybindings, paste flattening `\r` as well as `\n`, dark styling from `crate::theme`
 //! with an accent border while focused, example harness removed. The text and the cursor are
 //! `theme::text()`, set here
 //! rather than inherited: upstream inherits the colour and paints the cursor `gpui::blue()`,
@@ -162,7 +162,10 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
+            // Every line break, not only `\n`: text copied from a CRLF source left a lone
+            // carriage return in a field that holds one line.
+            let line = text.replace("\r\n", " ").replace(['\n', '\r'], " ");
+            self.replace_text_in_range(None, &line, window, cx);
         }
     }
 
