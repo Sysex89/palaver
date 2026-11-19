@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use gpui::{Context, Focusable, Window, px, size};
 
-use crate::doc::{Doc, NodeKind, clear_backup};
+use crate::doc::{Doc, NodeKind};
 use crate::settings::{TextFont, ThemePref, UiFont};
 use crate::{
     Editor, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection, SidePane, node_number,
@@ -304,7 +304,7 @@ fn run(
             if editor.doc.is_dirty() && rest != "discard" {
                 return Err("document has unsaved changes; use `quit discard`".into());
             }
-            clear_backup();
+            editor.clear_backup();
             cx.quit();
             Ok(String::new())
         }

@@ -13,9 +13,9 @@ mod text_input;
 mod theme;
 
 use doc::{
-    Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Line, MAP_H, MAP_W, Mention,
-    NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref, SCRIPT_EXT,
-    SetOp, Severity, Use, Value, VarState, View, WIRE_STUB, box_exit, clean_tag, clear_backup,
+    Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Line, MAP_H, MAP_W,
+    Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref,
+    SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, WIRE_STUB, box_exit, clean_tag,
     in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup, route, snippet,
     split_set, with_default_extension,
 };
@@ -453,6 +453,11 @@ struct Editor {
     /// Set after a backup fails, so a read-only temp directory reports once rather than
     /// every tick for the rest of the session.
     autosave_off: bool,
+    /// The crash copy a previous run left is on offer and its prompt is unanswered. While
+    /// it is, the copy is neither deleted nor written over: `autosave` stands down and so
+    /// does every clear, all of which go through `Editor::clear_backup` — and no other
+    /// prompt goes up (`Editor::ask`), since one would take the offer's place.
+    recovery_pending: bool,
     /// The play-through walked so far, last entry first — `None` when not playing. One vec
     /// carries the current node, Back and Restart.
     play: Option<Vec<NodeId>>,
@@ -707,6 +712,7 @@ impl Editor {
             open_menu: None,
             closing: false,
             autosave_off: false,
+            recovery_pending: false,
             play: None,
             pane: SidePane::default(),
             used_by: None,
@@ -723,6 +729,11 @@ impl Editor {
     /// Writes a crash copy, when there is something to lose and it is safe to take one.
     /// Silent on success — the point of an autosave is that nobody notices it.
     fn autosave(&mut self, cx: &mut Context<Self>) {
+        // There is one crash copy, so a backup taken while a previous run's is on offer
+        // would write over the very work the prompt is asking about.
+        if self.recovery_pending {
+            return;
+        }
         if self.autosave_off || !self.doc.is_dirty() || self.drag.is_some() {
             return;
         }
@@ -732,15 +743,67 @@ impl Editor {
         }
     }
 
+    /// Deletes the crash copy — unless a previous run's is still on offer, which only the
+    /// prompt's Discard may delete. Every clear in the editor comes through here, because
+    /// the prompt does not hold the mouse on Linux: a save, a New or a close can all happen
+    /// underneath it.
+    fn clear_backup(&self) {
+        if !self.recovery_pending {
+            doc::clear_backup();
+        }
+    }
+
+    /// Puts up a prompt and resolves to the index of the answer — unless the recovery offer
+    /// is up, when nothing is asked and the status bar says why. gpui keeps one prompt per
+    /// window, so a second would take the offer's place and drop its answer unread, and the
+    /// crash copy would go to whatever cleared it next without the author ever choosing.
+    /// Every prompt but the offer's own comes through here.
+    fn ask(
+        &mut self,
+        message: &str,
+        detail: &str,
+        answers: &[&str],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl Future<Output = Option<usize>> + use<>> {
+        if self.recovery_pending {
+            self.set_status("The recovery prompt is waiting for an answer".into(), cx);
+            return None;
+        }
+        let answer = window.prompt(PromptLevel::Warning, message, Some(detail), answers, cx);
+        Some(async move { answer.await.ok() })
+    }
+
     fn file_name(&self) -> String {
         document_name(self.path.as_deref())
     }
 
-    /// Offers back a crash copy left by a previous run. Called once, at startup.
-    fn offer_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(backup) = read_backup() else {
-            return;
-        };
+    /// Offers back a crash copy left by a previous run, then does what the command line
+    /// asked. Called once, at startup. With a copy on offer the request waits for the
+    /// answer, since opening a file means `replace_doc`, and a swap deletes the crash copy.
+    fn offer_recovery(
+        &mut self,
+        mut request: link::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.after_save = request.after_save.take();
+        match read_backup() {
+            Some(backup) => self.prompt_recovery(backup, request, window, cx),
+            None => self.open_requested(request, window, cx),
+        }
+    }
+
+    /// Puts the offer up and holds the crash copy until it is answered: at startup, and
+    /// again after a Recover that could not be carried out, so the offer stands until the
+    /// author has actually chosen. The backup and the request ride along to the answer.
+    fn prompt_recovery(
+        &mut self,
+        backup: Backup,
+        request: link::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let answer = window.prompt(
             PromptLevel::Warning,
             "Recover unsaved work?",
@@ -751,54 +814,117 @@ impl Editor {
             &["Recover", "Discard"],
             cx,
         );
+        self.recovery_pending = true;
 
-        cx.spawn(async move |this, cx| {
-            match answer.await {
-                Ok(0) => {
-                    this.update(cx, |this, cx| {
-                        // The prompt does not hold the mouse on Linux, so the document may
-                        // have been edited while it was up. Recovering over it would discard
-                        // those edits without asking, which is the one thing `confirm_discard`
-                        // exists to prevent.
-                        if this.doc.is_dirty() {
-                            return;
-                        }
-                        let path = backup.path;
-                        this.replace_doc(backup.doc, path, cx);
-                        // Recovered work is still unsaved work, and `checkpoint` is the only
-                        // thing that says so. The price is a first undo that restores the
-                        // state it was already in.
-                        this.checkpoint();
-                    })
-                    .ok();
-                }
-                // Only an explicit Discard deletes it — a prompt that was cancelled resolves
-                // to `Err`, and must not take the user's only copy with it.
-                Ok(_) => clear_backup(),
-                Err(_) => {}
-            }
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await.ok();
+            this.update_in(cx, |this, window, cx| {
+                this.answer_recovery(answer, backup, request, window, cx)
+            })
+            .ok();
         })
         .detach();
     }
 
-    /// Asks before unsaved edits are thrown away. Resolves to true on "Discard".
+    /// Acts on the recovery prompt's answer, then on the request it held back. The hold is
+    /// lifted only once all of that is done, so neither installing the recovered work nor
+    /// opening the named file — both through `replace_doc` — deletes the copy on the way:
+    /// Discard does, and is the one clear the hold does not stop.
+    ///
+    /// `None` is a prompt gone without a choice, which gpui reports when the prompt's view is
+    /// dropped unanswered. With `ask` keeping every other prompt down, that is only the window
+    /// going away — and then the editor is gone too and none of this runs. Should it ever run,
+    /// nothing is chosen for the author: the copy stays where it is for the next launch to
+    /// offer, nothing is opened, and only the hold is lifted, so autosave is not stood down
+    /// for good. Putting the offer back up instead was rejected: that answer had no click
+    /// behind it, and a prompt that cannot be shown would come straight back as `None`.
+    fn answer_recovery(
+        &mut self,
+        answer: Option<usize>,
+        backup: Backup,
+        request: link::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match answer {
+            // The prompt does not hold the mouse on Linux, so the document may have been
+            // edited while it was up. Recovering over it would discard those edits without
+            // asking, which is the one thing `confirm_discard` exists to prevent — so the
+            // offer goes back up, hold and all, to be answered once they are saved.
+            Some(0) if self.doc.is_dirty() => {
+                self.set_status(
+                    "Not recovered: save this document's edits first, or Discard".into(),
+                    cx,
+                );
+                return self.prompt_recovery(backup, request, window, cx);
+            }
+            Some(0) => self.recover(backup, request, window, cx),
+            Some(_) => {
+                doc::clear_backup();
+                self.open_requested(request, window, cx);
+            }
+            None => {}
+        }
+        self.recovery_pending = false;
+    }
+
+    /// Installs the crash copy's document with the file it came from. When that is the file
+    /// the command line named — a tool relaunching the file that crashed — the rest of the
+    /// request is carried out on it rather than on the file from disk; any other named file
+    /// is not opened, since that would throw the recovered work away without asking.
+    fn recover(
+        &mut self,
+        backup: Backup,
+        request: link::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let canonical = |path: &PathBuf| path.canonicalize().ok();
+        let origin = backup.path.as_ref().and_then(canonical);
+        let same = origin.is_some() && request.file.as_ref().and_then(canonical) == origin;
+        let recovered = document_name(backup.path.as_deref());
+        self.replace_doc(backup.doc, backup.path, cx);
+        // Recovered work is still unsaved work, and `checkpoint` is the only thing that says
+        // so. The price is a first undo that restores the state it was already in.
+        self.checkpoint();
+        match &request.file {
+            Some(_) if same => self.finish_request(request, window, cx),
+            Some(file) => {
+                let status = format!(
+                    "Recovered {recovered} · {} not opened over it",
+                    document_name(Some(file))
+                );
+                self.set_status(status, cx);
+            }
+            None => {}
+        }
+    }
+
+    /// Asks before unsaved edits are thrown away. Resolves to true on "Discard", and to false
+    /// without asking while the recovery offer is up (`ask`).
     ///
     // ponytail: two buttons, not Save/Discard/Cancel. A Save button would have to chain
     // into the Save As dialog when there is no path yet — a second async prompt inside
     // this one. Add it if discarding by accident turns out to bite.
     fn confirm_discard(
-        &self,
+        &mut self,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> impl Future<Output = bool> + use<> {
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let detail = format!("{} has unsaved edits.", self.file_name());
+        let answer = self.ask(
             "Discard unsaved changes?",
-            Some(&format!("{} has unsaved edits.", self.file_name())),
+            &detail,
             &["Discard", "Cancel"],
+            window,
             cx,
         );
-        async move { answer.await == Ok(0) }
+        async move {
+            match answer {
+                Some(answer) => answer.await == Some(0),
+                None => false,
+            }
+        }
     }
 
     fn on_new(&mut self, _: &New, window: &mut Window, cx: &mut Context<Self>) {
@@ -830,7 +956,7 @@ impl Editor {
                     .update(cx, |this, window, _| {
                         this.closing = true;
                         // Discarding on purpose is not something to offer back next launch.
-                        clear_backup();
+                        this.clear_backup();
                         window.remove_window();
                     })
                     .ok();
@@ -847,7 +973,7 @@ impl Editor {
     /// Installs a different document. The one on screen is gone after this, so its crash
     /// copy goes too — this is the only place a backup is dropped on a document swap.
     fn replace_doc(&mut self, doc: Doc, path: Option<PathBuf>, cx: &mut Context<Self>) {
-        clear_backup();
+        self.clear_backup();
         self.doc = doc;
         self.view = View::default();
         self.fit_pending = true;
@@ -935,18 +1061,21 @@ impl Editor {
         if placeholders == 0 {
             return self.export_dialog(ext, write, cx);
         }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &match placeholders {
-                1 => "1 line is still a placeholder.".to_string(),
-                n => format!("{n} lines are still placeholders."),
-            },
-            Some("They are marked in the file."),
+        let message = match placeholders {
+            1 => "1 line is still a placeholder.".to_string(),
+            n => format!("{n} lines are still placeholders."),
+        };
+        let Some(answer) = self.ask(
+            &message,
+            "They are marked in the file.",
             &["Export anyway", "Cancel"],
+            window,
             cx,
-        );
+        ) else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
-            if answer.await == Ok(0) {
+            if answer.await == Some(0) {
                 this.update(cx, |this, cx| this.export_dialog(ext, write, cx))
                     .ok();
             }
@@ -1048,7 +1177,7 @@ impl Editor {
         match self.doc.save(&path) {
             Ok(()) => {
                 // The work is on disk under its own name now; the crash copy is redundant.
-                clear_backup();
+                self.clear_backup();
                 self.path = Some(path.clone());
                 let status = format!("Saved {}", self.file_name());
                 self.set_status(status, cx);
@@ -1078,27 +1207,46 @@ impl Editor {
         .detach();
     }
 
-    /// What the command line asked for, once the window is up: the file opened (through
-    /// [`Editor::replace_doc`], as every open is), the place gone to, the after-save
-    /// command kept, and, on Unix, the window made the one later launches for this file
-    /// hand their place to (`link.rs`).
+    /// What the command line asked for, once the window is up and any recovery offer is
+    /// answered: the file opened (through [`Editor::replace_doc`], as every open is), then
+    /// the rest of the request.
     fn open_requested(
         &mut self,
         request: link::Request,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.after_save = request.after_save;
-        let Some(file) = request.file else {
+        let Some(file) = request.file.clone() else {
             return;
         };
+        // The recovery prompt does not hold the mouse on Linux, so the document may have
+        // been edited before this ran — and opening over it would discard that unasked.
+        if self.doc.is_dirty() {
+            let status = format!(
+                "{} not opened: this document has unsaved edits",
+                document_name(Some(&file))
+            );
+            return self.set_status(status, cx);
+        }
         match Doc::load(&file) {
-            Ok(doc) => self.replace_doc(doc, Some(file.clone()), cx),
+            Ok(doc) => self.replace_doc(doc, Some(file), cx),
             Err(error) => {
                 self.set_status(format!("Open failed: {error}"), cx);
                 return;
             }
         }
+        self.finish_request(request, window, cx);
+    }
+
+    /// The rest of the request, once the file it names is the document on screen — opened
+    /// from disk, or recovered from its crash copy: the place gone to and, on Unix, the
+    /// window made the one later launches for this file hand their place to (`link.rs`).
+    fn finish_request(
+        &mut self,
+        request: link::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(path) = &request.declarations {
             self.declare_from(path, cx);
         }
@@ -1112,7 +1260,9 @@ impl Editor {
             }));
         }
         #[cfg(unix)]
-        self.take_handovers(file, window, cx);
+        if let Some(file) = request.file {
+            self.take_handovers(file, window, cx);
+        }
     }
 
     /// Shows a flow, or selects a node and brings it into view, by the names another tool
@@ -7040,15 +7190,12 @@ fn main() {
             })
             .unwrap();
 
-        // Anything a previous run left behind is offered back before the first frame.
-        handle
-            .update(cx, |this, window, cx| this.offer_recovery(window, cx))
-            .unwrap();
-
-        // Then the command line's file, place and after-save command.
+        // Anything a previous run left behind is offered back before the first frame, and
+        // the command line's file, place and after-save command follow — at once when there
+        // is nothing to offer, otherwise once the offer is answered.
         handle
             .update(cx, |this, window, cx| {
-                this.open_requested(request, window, cx)
+                this.offer_recovery(request, window, cx)
             })
             .unwrap();
 
