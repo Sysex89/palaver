@@ -14,11 +14,12 @@
 //! read on a thread of its own, and commands reach the editor through a channel drained on
 //! the foreground by a timer — the same shape as the autosave timer in `Editor::new`.
 //!
-//! **Isolation is the launcher's job**, and the reason is `temp_dir()`: the crash copy lives
-//! there, and `replace_doc` deletes it. An automated instance sharing the real temp
-//! directory would delete a real crash copy the first time it opened a file. The script
-//! therefore sets `TMPDIR` to a private directory, which moves the socket and the recovery
-//! file together. Autosave is also switched off here, so a long run cannot write over one.
+//! **Isolation is the launcher's job**, and the reason is `temp_dir()`: the crash copies
+//! live there, and a launch offers whichever one a dead session left. An automated instance
+//! sharing the real temp directory would put up a real crash copy's recovery prompt, and a
+//! script answering it could discard real work. The script therefore sets `TMPDIR` to a
+//! private directory, which moves the socket and the crash copies together. Autosave is also
+//! switched off here, so a run leaves no copy of its own behind.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -139,6 +140,10 @@ fn run(
                 return Err("document has unsaved changes".into());
             }
             let path = PathBuf::from(rest);
+            // File → Open's refusal: a file another window has stays that window's.
+            if editor.open_elsewhere(&path) {
+                return Err("file is open in another window".into());
+            }
             let doc = Doc::load(&path)?;
             editor.replace_doc(doc, Some(path), cx);
             Ok(String::new())
@@ -371,6 +376,8 @@ fn run(
                 return Err("document has unsaved changes; use `quit discard`".into());
             }
             editor.clear_backup();
+            // `cx.quit` skips the window-closed hook that lets go of the session's lock.
+            crate::doc::end_session();
             cx.quit();
             Ok(String::new())
         }

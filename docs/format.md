@@ -385,7 +385,8 @@ palaver talk.dln --after-save 'palaver "$PALAVER_FILE" --export-ftl strings.ftl'
 ```
 
 The last line opens the editor with a command to run after every save, in the file's folder,
-so each save regenerates `strings.ftl` beside it. A failed export exits with status 1.
+so each save regenerates `strings.ftl` beside it. A failed export exits with status 1, and so
+does asking for two exports that name the same file, before either is written.
 
 ## What the editor checks
 

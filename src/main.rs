@@ -14,10 +14,10 @@ mod theme;
 
 use doc::{
     Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
-    MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R,
-    Problem, RECORDING_EXT, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step, Use, Value,
-    VarState, View, WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell, map_hit,
-    node_center, out_port, read_backup, route, snippet, split_set, with_default_extension,
+    MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, Orphan,
+    PORT_R, Problem, RECORDING_EXT, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step, Use,
+    Value, VarState, View, WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell, map_hit,
+    node_center, out_port, route, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
@@ -434,10 +434,13 @@ struct Editor {
     edited: Selection,
     /// Whether this editing session already pushed an undo checkpoint.
     text_dirty: bool,
-    /// Where the document was last saved or loaded from.
+    /// Where the document was last saved or loaded from — always absolute (`set_path`).
     path: Option<PathBuf>,
+    #[cfg(unix)]
+    handovers: link::Handovers,
     /// The command line's `--after-save`: run after every successful save (`link.rs`).
     after_save: Option<String>,
+    after_save_queue: link::AfterSaveQueue,
     /// Outcome of the last save or load, shown in the status bar until it clears itself.
     status: Option<String>,
     /// Bumped by every `set_status`, so a message's expiry timer can tell it is still the
@@ -474,13 +477,14 @@ struct Editor {
     open_menu: Option<&'static str>,
     /// Set once discarding has been confirmed, so the close hook stops asking.
     closing: bool,
-    /// Set after a backup fails, so a read-only temp directory reports once rather than
-    /// every tick for the rest of the session.
+    /// No crash copies at all. Set by automation, never cleared.
     autosave_off: bool,
-    /// The crash copy a previous run left is on offer and its prompt is unanswered. While
-    /// it is, the copy is neither deleted nor written over: `autosave` stands down and so
-    /// does every clear, all of which go through `Editor::clear_backup` — and no other
-    /// prompt goes up (`Editor::ask`), since one would take the offer's place.
+    /// Set after a backup of this document fails, so a read-only temp directory reports once
+    /// rather than every tick. Cleared by `replace_doc`: the next document gets its own try.
+    autosave_failed: bool,
+    /// The crash copy a dead session left is on offer and its prompt is unanswered. While it
+    /// is, no other prompt goes up (`Editor::ask`), since one would take the offer's place.
+    /// The copy itself needs no guarding: it is that session's file, not this one's.
     recovery_pending: bool,
     /// The play-through walked so far, last entry first — `None` when not playing. One vec
     /// carries the current node, Back and Restart.
@@ -711,6 +715,20 @@ impl Editor {
         })
         .detach();
 
+        #[cfg(unix)]
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(HANDOVER_POLL).await;
+                if this
+                    .update_in(cx, |this, window, cx| this.receive_handovers(window, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         Self {
             doc: Doc::sample(),
             view: View::default(),
@@ -731,7 +749,10 @@ impl Editor {
             edited: Selection::None,
             text_dirty: false,
             path: None,
+            #[cfg(unix)]
+            handovers: link::Handovers::default(),
             after_save: None,
+            after_save_queue: link::AfterSaveQueue::default(),
             status: None,
             status_gen: 0,
             searching: false,
@@ -749,6 +770,7 @@ impl Editor {
             open_menu: None,
             closing: false,
             autosave_off: false,
+            autosave_failed: false,
             recovery_pending: false,
             play: None,
             pane: SidePane::default(),
@@ -766,28 +788,22 @@ impl Editor {
     /// Writes a crash copy, when there is something to lose and it is safe to take one.
     /// Silent on success — the point of an autosave is that nobody notices it.
     fn autosave(&mut self, cx: &mut Context<Self>) {
-        // There is one crash copy, so a backup taken while a previous run's is on offer
-        // would write over the very work the prompt is asking about.
-        if self.recovery_pending {
+        if self.autosave_off || self.autosave_failed {
             return;
         }
-        if self.autosave_off || !self.doc.is_dirty() || self.drag.is_some() {
+        if !self.doc.is_dirty() || self.drag.is_some() {
             return;
         }
         if let Err(error) = self.doc.write_backup(self.path.as_deref()) {
-            self.autosave_off = true;
+            self.autosave_failed = true;
             self.set_status(format!("Autosave failed: {error}"), cx);
         }
     }
 
-    /// Deletes the crash copy — unless a previous run's is still on offer, which only the
-    /// prompt's Discard may delete. Every clear in the editor comes through here, because
-    /// the prompt does not hold the mouse on Linux: a save, a New or a close can all happen
-    /// underneath it.
+    /// Deletes this session's crash copy. Every clear in the editor comes through here; a
+    /// dead session's copy on offer is never touched by one, only by the offer's answer.
     fn clear_backup(&self) {
-        if !self.recovery_pending {
-            doc::clear_backup();
-        }
+        doc::clear_backup();
     }
 
     /// Puts up a prompt and resolves to the index of the answer — unless the recovery offer
@@ -825,18 +841,20 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.after_save = request.after_save.take();
-        match read_backup() {
-            Some(backup) => self.prompt_recovery(backup, request, window, cx),
+        match doc::find_recovery() {
+            Some((backup, orphan)) => self.prompt_recovery(backup, orphan, request, window, cx),
             None => self.open_requested(request, window, cx),
         }
     }
 
     /// Puts the offer up and holds the crash copy until it is answered: at startup, and
     /// again after a Recover that could not be carried out, so the offer stands until the
-    /// author has actually chosen. The backup and the request ride along to the answer.
+    /// author has actually chosen. The backup, the claim on its file and the request ride
+    /// along to the answer.
     fn prompt_recovery(
         &mut self,
         backup: Backup,
+        orphan: Orphan,
         request: link::Request,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -857,29 +875,27 @@ impl Editor {
         cx.spawn_in(window, async move |this, cx| {
             let answer = answer.await.ok();
             this.update_in(cx, |this, window, cx| {
-                this.answer_recovery(answer, backup, request, window, cx)
+                this.answer_recovery(answer, backup, orphan, request, window, cx)
             })
             .ok();
         })
         .detach();
     }
 
-    /// Acts on the recovery prompt's answer, then on the request it held back. The hold is
-    /// lifted only once all of that is done, so neither installing the recovered work nor
-    /// opening the named file — both through `replace_doc` — deletes the copy on the way:
-    /// Discard does, and is the one clear the hold does not stop.
+    /// Acts on the recovery prompt's answer, then on the request it held back. Recover makes
+    /// the dead session's copy this one's (`Orphan::adopt`); Discard deletes it.
     ///
     /// `None` is a prompt gone without a choice, which gpui reports when the prompt's view is
     /// dropped unanswered. With `ask` keeping every other prompt down, that is only the window
     /// going away — and then the editor is gone too and none of this runs. Should it ever run,
     /// nothing is chosen for the author: the copy stays where it is for the next launch to
-    /// offer, nothing is opened, and only the hold is lifted, so autosave is not stood down
-    /// for good. Putting the offer back up instead was rejected: that answer had no click
+    /// offer, nothing is opened, and only the hold is lifted. Putting the offer back up instead was rejected: that answer had no click
     /// behind it, and a prompt that cannot be shown would come straight back as `None`.
     fn answer_recovery(
         &mut self,
         answer: Option<usize>,
         backup: Backup,
+        orphan: Orphan,
         request: link::Request,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -894,11 +910,14 @@ impl Editor {
                     "Not recovered: save this document's edits first, or Discard".into(),
                     cx,
                 );
-                return self.prompt_recovery(backup, request, window, cx);
+                return self.prompt_recovery(backup, orphan, request, window, cx);
             }
-            Some(0) => self.recover(backup, request, window, cx),
+            Some(0) => {
+                self.recover(backup, request, window, cx);
+                orphan.adopt();
+            }
             Some(_) => {
-                doc::clear_backup();
+                orphan.discard();
                 self.open_requested(request, window, cx);
             }
             None => {}
@@ -917,14 +936,31 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A copy written before origins were made absolute names its file relative to a folder
+        // nobody recorded, so it is recovered unnamed rather than saved over a stranger. So is
+        // one whose file another window has open now, or two windows would save one file.
+        let mut lost = None;
+        let path = backup.path.filter(|path| {
+            let keep = path.is_absolute() && !self.open_elsewhere(path);
+            if !keep {
+                lost = Some(document_name(Some(path)));
+            }
+            keep
+        });
         let canonical = |path: &PathBuf| path.canonicalize().ok();
-        let origin = backup.path.as_ref().and_then(canonical);
+        let origin = path.as_ref().and_then(canonical);
         let same = origin.is_some() && request.file.as_ref().and_then(canonical) == origin;
-        let recovered = document_name(backup.path.as_deref());
-        self.replace_doc(backup.doc, backup.path, cx);
+        let recovered = document_name(path.as_deref());
+        self.replace_doc(backup.doc, path, cx);
         // Recovered work is still unsaved work, and `checkpoint` is the only thing that says
         // so. The price is a first undo that restores the state it was already in.
         self.checkpoint();
+        if let Some(name) = lost {
+            self.set_status(
+                format!("Recovered {name} unnamed: save it to keep it, and check where"),
+                cx,
+            );
+        }
         match &request.file {
             Some(_) if same => self.finish_request(request, window, cx),
             Some(file) => {
@@ -1021,11 +1057,12 @@ impl Editor {
         self.view = View::default();
         self.fit_pending = true;
         self.drag = None;
+        self.autosave_failed = false;
         // Node ids — and flow names — belong to the document that is going away.
         self.play = None;
         self.flow = String::new();
-        self.path = path;
         self.status = None;
+        self.set_path(path, cx);
         // A line being written belongs to the document that left.
         #[cfg(feature = "generate")]
         self.filler.forget();
@@ -1034,6 +1071,32 @@ impl Editor {
         // empty already.
         self.load_premise(cx);
         cx.notify();
+    }
+
+    /// Points the editor at its file, made absolute: a relative path means whatever folder
+    /// the process is in, and the crash copy, the after-save command and the hand-over all
+    /// carry it somewhere else.
+    fn set_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        let path = path.map(|path| std::path::absolute(&path).unwrap_or(path));
+        #[cfg(unix)]
+        if self.handovers.set_file(path.as_deref()).is_err() {
+            // Only a race gets here: every way in asks `open_elsewhere` first.
+            let name = document_name(path.as_deref());
+            self.set_status(format!("{name} is open in another window too"), cx);
+        }
+        self.path = path;
+    }
+
+    /// Whether another window has `path` open. One that does is brought forward, and this
+    /// window must not take the file: two windows saving one file each write over the other.
+    #[cfg(unix)]
+    fn open_elsewhere(&self, path: &std::path::Path) -> bool {
+        self.handovers.open_elsewhere(path)
+    }
+
+    #[cfg(not(unix))]
+    fn open_elsewhere(&self, _: &std::path::Path) -> bool {
+        false
     }
 
     fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
@@ -1155,7 +1218,14 @@ impl Editor {
                 Ok(Ok(Some(path))) => {
                     this.update(cx, |this, cx| {
                         let path = with_default_extension(path, ext);
-                        let status = match write(&this.doc, &path) {
+                        let result = this
+                            .path
+                            .as_deref()
+                            .map_or(Ok(()), |source| {
+                                link::check_export_destination(source, &path)
+                            })
+                            .and_then(|()| write(&this.doc, &path));
+                        let status = match result {
                             Ok(()) => format!("Exported {}", document_name(Some(&path))),
                             Err(error) => format!("Export failed: {error}"),
                         };
@@ -1215,10 +1285,18 @@ impl Editor {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |this, cx| match Doc::load(&path) {
-                Ok(doc) => this.replace_doc(doc, Some(path), cx),
-                // The current document is left untouched on a bad file.
-                Err(error) => this.set_status(format!("Open failed: {error}"), cx),
+            this.update(cx, |this, cx| {
+                // Shown where it is open rather than opened twice, as a second launch is.
+                if this.open_elsewhere(&path) {
+                    let status =
+                        format!("{} is open in another window", document_name(Some(&path)));
+                    return this.set_status(status, cx);
+                }
+                match Doc::load(&path) {
+                    Ok(doc) => this.replace_doc(doc, Some(path), cx),
+                    // The current document is left untouched on a bad file.
+                    Err(error) => this.set_status(format!("Open failed: {error}"), cx),
+                }
             })
             .ok();
         })
@@ -1228,11 +1306,20 @@ impl Editor {
     fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // A path typed without an extension in the dialog still becomes a .dln file.
         let path = with_default_extension(path, FILE_EXT);
+        let path = std::path::absolute(&path).unwrap_or(path);
+        // Save As onto a file another window has open would leave two windows saving it.
+        if self.path.as_ref() != Some(&path) && self.open_elsewhere(&path) {
+            let status = format!(
+                "Not saved: {} is open in another window",
+                document_name(Some(&path))
+            );
+            return self.set_status(status, cx);
+        }
         match self.doc.save(&path) {
             Ok(()) => {
                 // The work is on disk under its own name now; the crash copy is redundant.
                 self.clear_backup();
-                self.path = Some(path.clone());
+                self.set_path(Some(path.clone()), cx);
                 let status = format!("Saved {}", self.file_name());
                 self.set_status(status, cx);
                 if let Some(command) = self.after_save.clone() {
@@ -1247,14 +1334,17 @@ impl Editor {
     /// save itself has already happened and is not undone by a command that fails.
     fn run_after_save(&mut self, command: String, path: PathBuf, cx: &mut Context<Self>) {
         let saved = self.file_name();
+        let result = match self.after_save_queue.enqueue(command, path) {
+            Ok(result) => result,
+            Err(error) => {
+                return self.set_status(format!("Saved {saved} · after-save failed, {error}"), cx);
+            }
+        };
         cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { link::run_after_save(&command, &path) })
-                .await;
-            let status = match outcome.ok {
-                true => format!("Saved {saved} · after-save ran"),
-                false => format!("Saved {saved} · after-save failed, {}", outcome.detail),
+            let status = match result.await {
+                Ok(outcome) if outcome.ok => format!("Saved {saved} · after-save ran"),
+                Ok(outcome) => format!("Saved {saved} · after-save failed, {}", outcome.detail),
+                Err(error) => format!("Saved {saved} · after-save failed, {error}"),
             };
             this.update(cx, |this, cx| this.set_status(status, cx)).ok();
         })
@@ -1297,8 +1387,7 @@ impl Editor {
     }
 
     /// The rest of the request, once the file it names is the document on screen — opened
-    /// from disk, or recovered from its crash copy: the place gone to and, on Unix, the
-    /// window made the one later launches for this file hand their place to (`link.rs`).
+    /// from disk, or recovered from its crash copy.
     fn finish_request(
         &mut self,
         request: link::Request,
@@ -1316,10 +1405,6 @@ impl Editor {
                     cx.notify();
                 }
             }));
-        }
-        #[cfg(unix)]
-        if let Some(file) = request.file {
-            self.take_handovers(file, window, cx);
         }
     }
 
@@ -1381,39 +1466,24 @@ impl Editor {
         }
     }
 
-    /// Takes the places later launches for `file` hand over, while this window still has
-    /// that file open; a launch handed a refusal opens the file itself.
+    /// Handles later launches for the document currently open in this window.
     #[cfg(unix)]
-    fn take_handovers(&mut self, file: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(inbox) = link::listen(&file) else {
-            return;
-        };
-        let file = file.canonicalize().unwrap_or(file);
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(HANDOVER_POLL).await;
-                while let Ok(goto) = inbox.try_recv() {
-                    let took = this.update_in(cx, |this, window, cx| {
-                        let current = this.path.as_ref().and_then(|path| path.canonicalize().ok());
-                        if current.as_ref() != Some(&file) {
-                            return false;
-                        }
-                        if !goto.declarations.is_empty() {
-                            this.declare_from(std::path::Path::new(&goto.declarations), cx);
-                        }
-                        let _ = this.go_to(Some(&goto.flow), Some(&goto.node), window, cx);
-                        window.activate_window();
-                        cx.notify();
-                        true
-                    });
-                    let Ok(took) = took else {
-                        return; // The window closed.
-                    };
-                    let _ = goto.reply.send(took);
-                }
+    fn receive_handovers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(goto) = self.handovers.try_recv() {
+            if let Some(path) = &goto.declarations {
+                self.declare_from(path, cx);
             }
-        })
-        .detach();
+            // The later launch's command, which would otherwise be dropped while it exits
+            // saying it worked.
+            if let Some(command) = goto.after_save {
+                self.after_save = Some(command);
+                self.set_status("After-save command set by a later launch".into(), cx);
+            }
+            let _ = self.go_to(Some(&goto.flow), Some(&goto.node), window, cx);
+            window.activate_window();
+            cx.notify();
+            let _ = goto.reply.send(true);
+        }
     }
 
     /// Shows a message in the status bar and clears it after [`STATUS_FOR`]. A message that
@@ -7927,7 +7997,7 @@ fn checkbox(on: bool, color: Rgba) -> impl IntoElement {
 }
 fn main() {
     // The command line first: a mistake in it is said and nothing opens.
-    let request = match link::parse(std::env::args().skip(1)) {
+    let request = match link::parse(std::env::args_os().skip(1)) {
         Ok(request) => request,
         Err(why) => {
             if !why.is_empty() {
@@ -7961,16 +8031,16 @@ fn main() {
             file,
             request.flow.as_deref().unwrap_or_default(),
             request.node.as_deref().unwrap_or_default(),
-            &request
+            request
                 .declarations
                 .as_deref()
                 .map(|path| {
                     path.canonicalize()
+                        .or_else(|_| std::path::absolute(path))
                         .unwrap_or_else(|_| path.to_path_buf())
-                        .to_string_lossy()
-                        .into_owned()
                 })
-                .unwrap_or_default(),
+                .as_deref(),
+            request.after_save.as_deref(),
         )
     {
         return;
@@ -8094,7 +8164,11 @@ fn main() {
         #[cfg(all(feature = "automation", unix))]
         handle.update(cx, automation::start).unwrap();
 
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        cx.on_window_closed(|cx| {
+            doc::end_session();
+            cx.quit()
+        })
+        .detach();
         cx.activate(true);
     });
 }

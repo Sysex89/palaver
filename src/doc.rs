@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// What a node answers to. Random rather than counted, so two branches of the same file can
@@ -32,19 +33,72 @@ pub fn with_default_extension(path: PathBuf, ext: &str) -> PathBuf {
     }
 }
 
-/// The one crash copy, written by [`Doc::write_backup`] while a document is dirty.
-//
-// ponytail: a fixed path, so a second instance of the app shares it and will clobber it.
-// Suffix the name with `std::process::id()` and offer the newest dead pid's file when
-// running two copies at once stops being hypothetical.
-pub fn autosave_path() -> PathBuf {
-    std::env::temp_dir().join("palaver-recovery.dln")
+/// What every crash copy's file name starts with. A session's own is
+/// `palaver-recovery-<session>.dln`, beside a `.lock` the session holds for as long as it
+/// runs; a copy written before sessions existed is `palaver-recovery.dln`, and is offered like
+/// any dead session's.
+const RECOVERY_PREFIX: &str = "palaver-recovery";
+
+/// This process's crash copy and the lock that says it is alive. One per session rather
+/// than one per machine: with a shared file, one window's autosave wrote over another's and
+/// one window's save deleted another's copy.
+struct Session {
+    copy: PathBuf,
+    lock: PathBuf,
+    /// The lock, held until the process ends. An OS file lock is let go when its holder
+    /// dies, however it dies, so a lock another process can take is a dead session's.
+    held: Option<std::fs::File>,
+}
+
+fn session() -> &'static Session {
+    static SESSION: std::sync::OnceLock<Session> = std::sync::OnceLock::new();
+    SESSION.get_or_init(|| {
+        // The pid alone is reused; with the clock it names this session and no other.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let name = format!("{RECOVERY_PREFIX}-{}-{nanos:x}", std::process::id());
+        let directory = std::env::temp_dir();
+        let lock = directory.join(format!("{name}.lock"));
+        let held = std::fs::File::create(&lock)
+            .ok()
+            .filter(|file| file.try_lock().is_ok());
+        Session {
+            copy: directory.join(format!("{name}.dln")),
+            lock,
+            held,
+        }
+    })
+}
+
+/// This session's crash copy, written by [`Doc::write_backup`] while a document is dirty.
+#[cfg(test)]
+fn autosave_path() -> PathBuf {
+    session().copy.clone()
+}
+
+/// The crash copy's path, only while this session holds its lock: a copy with no live lock
+/// beside it reads as a dead session's, and another window would offer it while this one
+/// is still writing it.
+fn own_copy() -> Result<&'static Path, String> {
+    let session = session();
+    match session.held {
+        Some(_) => Ok(&session.copy),
+        None => Err(format!("could not lock {}", session.lock.display())),
+    }
+}
+
+/// Lets go of this session's lock file as the process ends normally. A crash copy still
+/// there afterwards is offered by the next launch, which is what it is for.
+pub fn end_session() {
+    let _ = std::fs::remove_file(&session().lock);
 }
 
 /// A crashed session's document and the file it came from, so recovery restores the file
 /// association and not just the content.
 #[derive(Deserialize)]
 pub struct Backup {
+    #[serde(deserialize_with = "raw_path::deserialize")]
     pub path: Option<PathBuf>,
     pub doc: Doc,
 }
@@ -52,19 +106,175 @@ pub struct Backup {
 /// The same shape borrowed, so taking a backup does not clone the document.
 #[derive(Serialize)]
 struct BackupRef<'a> {
+    #[serde(serialize_with = "raw_path::serialize")]
     path: Option<&'a Path>,
     doc: &'a Doc,
 }
 
-/// The crash copy a previous run left behind, if there is a readable one.
-pub fn read_backup() -> Option<Backup> {
-    let json = std::fs::read_to_string(autosave_path()).ok()?;
-    serde_json::from_str(&json).ok()
+/// A crash copy's origin, which can be any path the system allows. Text when it is UTF-8,
+/// as it always was, and the platform's own units when it is not: serde's own `Path` support
+/// refuses a non-UTF-8 name, which failed every autosave of a document opened from one.
+mod raw_path {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Text(String),
+        Units(Vec<Unit>),
+    }
+
+    #[cfg(unix)]
+    type Unit = u8;
+    #[cfg(windows)]
+    type Unit = u16;
+
+    pub fn serialize<S: Serializer>(path: &Option<&Path>, out: S) -> Result<S::Ok, S::Error> {
+        path.map(|path| match path.to_str() {
+            Some(text) => Raw::Text(text.to_string()),
+            None => Raw::Units(units(path)),
+        })
+        .serialize(out)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<Option<PathBuf>, D::Error> {
+        Ok(Option::<Raw>::deserialize(input)?.map(|raw| match raw {
+            Raw::Text(text) => PathBuf::from(text),
+            Raw::Units(units) => PathBuf::from(from_units(units)),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn units(path: &Path) -> Vec<Unit> {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(unix)]
+    fn from_units(units: Vec<Unit>) -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(units)
+    }
+
+    #[cfg(windows)]
+    fn units(path: &Path) -> Vec<Unit> {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().collect()
+    }
+
+    #[cfg(windows)]
+    fn from_units(units: Vec<Unit>) -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&units)
+    }
 }
 
-/// Removes the crash copy. Silent: not having one is the normal case.
+/// A dead session's crash copy, claimed: while this is held, no other launch offers it.
+/// Dropped unanswered, the claim lapses and the copy waits for the next launch.
+pub struct Orphan {
+    copy: PathBuf,
+    lock: PathBuf,
+    _held: std::fs::File,
+}
+
+impl Orphan {
+    /// Throws the copy away: the author chose Discard.
+    pub fn discard(self) {
+        // The copy first: a launch that took the lock file's old inode after this lets go
+        // must find nothing left to offer.
+        let _ = std::fs::remove_file(&self.copy);
+        let _ = std::fs::remove_file(&self.lock);
+    }
+
+    /// Makes the copy this session's own. The recovered work is on screen and unsaved, so
+    /// the copy is its crash copy now — until the next autosave replaces it or a save drops
+    /// it, as with any other. Left where it is when this session has no lock to put it
+    /// under, to be offered again rather than lost.
+    pub fn adopt(self) {
+        if let Ok(own) = own_copy()
+            && std::fs::rename(&self.copy, own).is_ok()
+        {
+            let _ = std::fs::remove_file(&self.lock);
+        }
+    }
+}
+
+/// The newest crash copy a dead session left behind, if there is a readable one, claimed for
+/// this launch to offer. The rest stay for later launches; a garbled one is left alone.
+pub fn find_recovery() -> Option<(Backup, Orphan)> {
+    let session = session();
+    recovery_in(&std::env::temp_dir(), &session.copy, &session.lock)
+}
+
+fn recovery_in(directory: &Path, own: &Path, own_lock: &Path) -> Option<(Backup, Orphan)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(directory).ok()?.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if let Some(stem) = name.strip_suffix(".lock")
+            && stem.starts_with(RECOVERY_PREFIX)
+        {
+            // A dead session's lock with no copy beside it: it exited without its tidy-up.
+            if path != own_lock
+                && !directory.join(format!("{stem}.{FILE_EXT}")).exists()
+                && std::fs::File::open(&path).is_ok_and(|file| file.try_lock().is_ok())
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(&format!(".{FILE_EXT}")) else {
+            continue;
+        };
+        if !stem.starts_with(RECOVERY_PREFIX) || path == own {
+            continue;
+        }
+        let lock = directory.join(format!("{stem}.lock"));
+        let Ok(held) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+        else {
+            continue;
+        };
+        // Held: a live window's, or another launch is offering it.
+        if held.try_lock().is_err() {
+            continue;
+        }
+        // Read only once claimed, so a copy discarded or adopted meanwhile is gone by now.
+        let Some(backup) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<Backup>(&json).ok())
+        else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        found.push((
+            modified,
+            backup,
+            Orphan {
+                copy: path,
+                lock,
+                _held: held,
+            },
+        ));
+    }
+    found.sort_by_key(|(modified, ..)| *modified);
+    found.pop().map(|(_, backup, orphan)| (backup, orphan))
+}
+
+/// Removes this session's crash copy. Silent: not having one is the normal case.
 pub fn clear_backup() {
-    let _ = std::fs::remove_file(autosave_path());
+    let _ = std::fs::remove_file(&session().copy);
 }
 
 pub const NODE_W: f32 = 200.0;
@@ -1820,16 +2030,20 @@ impl Doc {
     /// what lets [`Doc::vars_along`] recompute the variables rather than store them.
     ///
     /// Guarded against a cycle the same way [`Doc::start_of`] is, and stops where it
-    /// stands when a jump has no target. The guard covers *this* walk only — seeding it
-    /// from the whole path would make returning to a node the conversation has already
-    /// played look like a loop, and a hub reached back through a jump is the most ordinary
-    /// shape a dialogue graph has.
+    /// stands when a jump has no target. The guard covers the nodes since the last visible
+    /// stop, including any already passed when forcing a check or resuming a replay. The
+    /// player can return to a speech or hub from an earlier step of the run.
     ///
     /// `sets` and `forced` are a [`Run`]'s hand-made changes: the values set by hand count
     /// toward every check from where they were set, and a condition at a position in
     /// `forced` takes the pin its check did not choose.
     fn walk_on(&self, path: &mut Vec<NodeId>, sets: &[Override], forced: &[usize]) {
-        let mut seen: HashSet<NodeId> = path.last().copied().into_iter().collect();
+        let mut seen: HashSet<NodeId> = path
+            .iter()
+            .rev()
+            .copied()
+            .take_while(|&id| !self.pauses_play(id))
+            .collect();
         while let Some(&current) = path.last() {
             if self.pauses_play(current) {
                 return;
@@ -1839,8 +2053,11 @@ impl Doc {
             // of the play state — and it is a walk of a few dozen nodes. A forced one is
             // still evaluated, and sent the other way.
             let next = if self.is_condition(current) {
-                let holds = self.condition_holds(current, &self.vars_with(path, sets));
-                self.pin(current, holds != forced.contains(&(path.len() - 1)))
+                let at = path.len() - 1;
+                // Read the variable state on entry to the check. An override recorded
+                // while stopped here applies to the next node.
+                let holds = self.condition_holds(current, &self.vars_with(&path[..at], sets));
+                self.pin(current, holds != forced.contains(&at))
             } else {
                 self.choices(current).first().map(|(to, _)| *to)
             };
@@ -4113,16 +4330,23 @@ impl Doc {
     /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
     /// title keeps its `*` and the close guard keeps asking.
     pub fn write_backup(&self, origin: Option<&Path>) -> Result<(), String> {
+        self.write_backup_to(own_copy()?, origin)
+    }
+
+    fn write_backup_to(&self, copy: &Path, origin: Option<&Path>) -> Result<(), String> {
+        // Absolute, because recovery may run from any folder: a relative origin named
+        // whatever file of that name the next launch's folder held, and Save overwrote it.
+        let origin = origin.map(|path| std::path::absolute(path).unwrap_or(path.to_path_buf()));
         let json = serde_json::to_string_pretty(&BackupRef {
-            path: origin,
+            path: origin.as_deref(),
             doc: self,
         })
         .map_err(|e| e.to_string())?;
         // Written beside the target and renamed over it. A kill mid-write is the event this
         // file exists for, and a plain write would truncate the last good copy first.
-        let temp = autosave_path().with_extension("tmp");
+        let temp = copy.with_extension("tmp");
         std::fs::write(&temp, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&temp, autosave_path()).map_err(|e| e.to_string())
+        std::fs::rename(&temp, copy).map_err(|e| e.to_string())
     }
 
     /// Restores the last checkpoint. False when there is nothing to undo.
@@ -4334,21 +4558,64 @@ const PLACEHOLDER_FTL: &str = "# placeholder\n";
 /// because a build may be watching for the file to change and read it the moment it does.
 /// Through a symlink, to the file it names; the file's own permissions are kept.
 pub fn write_replacing(path: &Path, text: &str) -> Result<(), String> {
-    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    let temp = target.with_file_name(name);
-    let written = std::fs::write(&temp, text)
-        .and_then(|()| match std::fs::metadata(&target) {
-            Ok(old) => std::fs::set_permissions(&temp, old.permissions()),
-            Err(_) => Ok(()),
-        })
-        .and_then(|()| std::fs::rename(&temp, &target));
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.to_string());
+    let target = replacement_target(path).map_err(|error| error.to_string())?;
+    let directory = parent_directory(&target);
+    let permissions = std::fs::metadata(&target).ok().map(|old| old.permissions());
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".palaver-");
+    #[cfg(unix)]
+    if permissions.is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    Ok(())
+    builder
+        .tempfile_in(directory)
+        .and_then(|mut temp| {
+            temp.write_all(text.as_bytes())?;
+            if let Some(permissions) = permissions {
+                temp.as_file().set_permissions(permissions)?;
+            }
+            temp.persist(&target).map_err(|failure| failure.error)?;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Resolves the last symlink even when the file it points to has yet to be created.
+pub fn replacement_target(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    let mut links = HashSet::new();
+    loop {
+        match target.canonicalize() {
+            Ok(path) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let parent = parent_directory(&target);
+        let name = target.file_name().ok_or(io::ErrorKind::NotFound)?;
+        // Path's component APIs strip trailing slashes and "/.". Keep the OS error
+        // when the caller used either to name a directory that does not exist.
+        if !target
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(name.as_encoded_bytes())
+        {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        let resolved = parent.canonicalize()?.join(name);
+        match std::fs::read_link(&target) {
+            Ok(link) if links.insert(resolved.clone()) => target = parent.join(link),
+            Ok(_) => return Err(io::Error::other("symbolic link loop")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(resolved),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// A node's translation key, which the `.ftl`, the recording script and a game all look
@@ -5373,6 +5640,52 @@ mod tests {
     }
 
     #[test]
+    fn forcing_a_check_cannot_revisit_an_instruction_from_the_same_walk() {
+        let (mut doc, [ask, check, yes, no]) = gate();
+        doc.add_variable("visits");
+        doc.set_default("visits", Value::Int(0));
+        let instruction = doc.add_node(200.0, 0.0);
+        doc.set_kind(instruction, NodeKind::Instruction);
+        doc.set_effect(instruction, "visits", Some(Value::Int(1)), SetOp::Add);
+        doc.edges.retain(|e| e.from != ask && e.to != yes);
+        assert!(doc.add_edge(ask, instruction));
+        assert!(doc.add_edge(instruction, check));
+        assert!(doc.add_edge(check, instruction));
+
+        let mut run = doc.begin(ask);
+        doc.choose(&mut run, instruction);
+        assert_eq!(run.path, [ask, instruction, check, no]);
+        assert!(doc.force(&mut run, 2));
+        assert_eq!(run.path, [ask, instruction, check]);
+        assert_eq!(doc.live_vars(&run)["visits"], Value::Int(1));
+
+        let replay = doc.replay(&run).unwrap();
+        assert_eq!(replay.stopped, None);
+        assert_eq!(replay.run, run);
+    }
+
+    #[test]
+    fn replay_keeps_a_live_edit_after_the_check_that_already_stopped() {
+        let (mut doc, [ask, check, yes, no]) = gate();
+        doc.edges.retain(|e| e.to != no);
+        let mut run = doc.begin(ask);
+        doc.choose(&mut run, check);
+        assert_eq!(run.path, [ask, check]);
+        assert!(doc.set_live(&mut run, "paid", Value::Bool(true)));
+        assert_eq!(doc.live_vars(&run)["paid"], Value::Bool(true));
+
+        let replay = doc.replay(&run).unwrap();
+        assert_eq!(replay.stopped, None);
+        assert_eq!(replay.run, run);
+        assert_eq!(doc.live_vars(&replay.run)["paid"], Value::Bool(true));
+
+        // The edit still applies to the rest of the run when the other pin is taken.
+        assert!(doc.force(&mut run, 1));
+        assert_eq!(run.path, [ask, check, yes]);
+        assert_eq!(doc.live_vars(&run)["paid"], Value::Bool(true));
+    }
+
+    #[test]
     fn restart_keeps_what_was_changed_before_the_first_line() {
         let (doc, [ask, check, yes, no]) = gate();
         let mut run = doc.begin(ask);
@@ -5893,6 +6206,23 @@ mod tests {
         doc.checkpoint();
         assert!(doc.save(&dir.join("missing/talk.dln")).is_err());
         assert!(doc.is_dirty(), "a failed save is not a save");
+    }
+
+    #[test]
+    fn saving_preserves_an_existing_temp_named_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("talk.dln");
+        let sibling = dir.path().join("talk.dln.tmp");
+        std::fs::write(&sibling, "work in progress").unwrap();
+        let mut doc = Doc::sample();
+        doc.save(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doc.to_json());
+        assert_eq!(
+            std::fs::read_to_string(&sibling).unwrap(),
+            "work in progress"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -7679,33 +8009,124 @@ mod tests {
         assert!(doc.is_dirty(), "undo is an edit too");
     }
 
-    // Touches the real `autosave_path()`, so it is the only test allowed to — a second one
-    // would race it. Everything about the backup is asserted here.
+    // Touches this process's own `autosave_path()`, so it is the only test allowed to — a
+    // second one would race it. The rest work in a folder of their own.
     #[test]
-    fn a_backup_round_trips_without_clearing_dirty() {
+    fn a_backup_is_written_without_clearing_dirty() {
         let mut doc = Doc::sample();
         doc.checkpoint();
-        let added = doc.add_node(10.0, 20.0);
+        doc.add_node(10.0, 20.0);
 
-        let origin = PathBuf::from("/tmp/palaver-backup-test.dln");
-        doc.write_backup(Some(&origin)).expect("write backup");
+        doc.write_backup(None).expect("write backup");
         assert!(
             doc.is_dirty(),
             "a backup is not a save: dirty must survive it"
         );
+        assert!(autosave_path().exists());
         assert!(
             !autosave_path().with_extension("tmp").exists(),
             "the temp file is renamed away, not left behind"
         );
+        clear_backup();
+        assert!(!autosave_path().exists());
+        end_session();
+    }
 
-        let backup = read_backup().expect("read backup");
-        assert_eq!(backup.path, Some(origin));
-        assert_eq!(backup.doc.nodes.len(), doc.nodes.len());
+    /// A crash copy in `folder` as a session named `name` left it, its lock let go.
+    fn dead_session(folder: &Path, name: &str, doc: &Doc, origin: Option<&Path>) -> PathBuf {
+        let copy = folder.join(format!("{name}.dln"));
+        doc.write_backup_to(&copy, origin).unwrap();
+        std::fs::write(folder.join(format!("{name}.lock")), "").unwrap();
+        copy
+    }
+
+    #[test]
+    fn a_dead_sessions_copy_is_offered_with_its_origin_made_absolute() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut doc = Doc::sample();
+        let added = doc.add_node(10.0, 20.0);
+        dead_session(
+            folder.path(),
+            "palaver-recovery-1-a",
+            &doc,
+            Some(Path::new("talk.dln")),
+        );
+
+        let none = Path::new("/nowhere");
+        let (backup, orphan) = recovery_in(folder.path(), none, none).expect("offered");
+        assert_eq!(
+            backup.path,
+            Some(std::env::current_dir().unwrap().join("talk.dln")),
+            "relative to where it was written, not to wherever recovery runs"
+        );
         assert!(backup.doc.node(added).is_some());
         assert!(!backup.doc.is_dirty(), "a read document starts clean");
+        assert!(
+            recovery_in(folder.path(), none, none).is_none(),
+            "claimed: a second launch does not offer it too"
+        );
+        orphan.discard();
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 0);
+    }
 
-        clear_backup();
-        assert!(read_backup().is_none());
+    #[test]
+    fn a_live_sessions_copy_is_not_offered_and_a_dead_ones_lock_is_tidied() {
+        let folder = tempfile::tempdir().unwrap();
+        let copy = dead_session(folder.path(), "palaver-recovery-2-b", &Doc::sample(), None);
+        let lock = copy.with_extension("lock");
+        let live = std::fs::File::open(&lock).unwrap();
+        live.lock().unwrap();
+        let none = Path::new("/nowhere");
+        assert!(recovery_in(folder.path(), none, none).is_none());
+
+        drop(live);
+        std::fs::remove_file(&copy).unwrap();
+        recovery_in(folder.path(), none, none);
+        assert!(
+            !lock.exists(),
+            "a dead session's lock with no copy is removed"
+        );
+    }
+
+    #[test]
+    fn the_newest_copy_is_offered_and_a_copy_from_before_sessions_counts() {
+        let folder = tempfile::tempdir().unwrap();
+        let old = dead_session(folder.path(), "palaver-recovery", &Doc::default(), None);
+        std::fs::remove_file(old.with_extension("lock")).unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        dead_session(folder.path(), "palaver-recovery-3-c", &Doc::sample(), None);
+
+        let none = Path::new("/nowhere");
+        let (newest, claim) = recovery_in(folder.path(), none, none).unwrap();
+        assert!(!newest.doc.nodes.is_empty(), "the newer copy first");
+        let (older, _claim) = recovery_in(folder.path(), none, none).expect("then the old one");
+        assert!(older.doc.nodes.is_empty());
+        drop(claim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_keeps_an_origin_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let folder = tempfile::tempdir().unwrap();
+        let origin = folder
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"talk-\xff.dln"));
+        dead_session(
+            folder.path(),
+            "palaver-recovery-4-d",
+            &Doc::sample(),
+            Some(&origin),
+        );
+        let none = Path::new("/nowhere");
+        let (backup, _claim) = recovery_in(folder.path(), none, none).unwrap();
+        assert_eq!(backup.path, Some(origin));
     }
 
     #[test]
