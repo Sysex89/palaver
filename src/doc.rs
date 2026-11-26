@@ -1043,6 +1043,61 @@ pub enum Line {
     Edge(NodeId, NodeId),
 }
 
+/// What Copy puts on the clipboard and Paste takes off it: some nodes and the edges among
+/// them, still carrying the ids they had where they were copied. [`Doc::paste`] gives every
+/// node a fresh one, so a fragment can be pasted any number of times, into this document or
+/// into another window's.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Fragment {
+    /// Always [`FRAGMENT_MARK`]: what tells a fragment apart from any other JSON somebody
+    /// copied, so a paste of a stray snippet does nothing rather than something odd.
+    palaver: String,
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
+
+/// The value of [`Fragment`]'s `palaver` field. Versioned so a later build that changes the
+/// shape can refuse an old fragment instead of misreading it.
+const FRAGMENT_MARK: &str = "fragment/1";
+
+impl Fragment {
+    /// The text Copy writes to the clipboard.
+    pub fn to_clipboard(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// The fragment in some clipboard text, or `None` when the text is anything else —
+    /// plain prose, someone else's JSON, or a fragment from a build that writes another
+    /// shape.
+    pub fn from_clipboard(text: &str) -> Option<Fragment> {
+        serde_json::from_str::<Fragment>(text)
+            .ok()
+            .filter(|f| f.palaver == FRAGMENT_MARK && !f.nodes.is_empty())
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The box the fragment's nodes fit in, as its min corner then its max, in the
+    /// coordinates they were copied at — what Paste centres on the view and Duplicate
+    /// starts from.
+    pub fn bounds(&self) -> ((f32, f32), (f32, f32)) {
+        self.nodes.iter().fold(
+            (
+                (f32::INFINITY, f32::INFINITY),
+                (f32::NEG_INFINITY, f32::NEG_INFINITY),
+            ),
+            |(lo, hi), n| {
+                (
+                    (lo.0.min(n.x), lo.1.min(n.y)),
+                    (hi.0.max(n.x + NODE_W), hi.1.max(n.y + NODE_H)),
+                )
+            },
+        )
+    }
+}
+
 /// splitmix64's finaliser: a fixed, well-mixed `u64 → u64`. Seeds have to come out the same
 /// on every run and every build, which rules out `RandomState` (seeded per process) and
 /// `DefaultHasher` (free to change between Rust releases).
@@ -2026,21 +2081,32 @@ impl Doc {
     // ponytail: O(nodes) per row slid, and only slides down. A dense column pays one scan per
     // occupied row; index nodes by cell if a document ever has thousands in one column.
     pub fn free_spot(&self, flow: &str, x: f32, y: f32) -> (f32, f32) {
-        let mut y = y;
+        (x, y + self.free_drop(flow, &[(x, y)]))
+    }
+
+    /// How far a group of boxes standing at `spots` on `flow` has to slide down, in whole
+    /// rows, before none of them covers a node already there — [`Doc::free_spot`] for a
+    /// paste, which moves as one so its own layout survives.
+    fn free_drop(&self, flow: &str, spots: &[(f32, f32)]) -> f32 {
+        let covered = |dy: f32| {
+            spots.iter().any(|&(x, y)| {
+                self.nodes_in(flow)
+                    .any(|n| (n.x - x).abs() < NODE_W && (n.y - (y + dy)).abs() < NODE_H + GAP_Y)
+            })
+        };
+        let mut dy = 0.0;
         // Bounded, so a pathological document cannot hang the editor on a menu click. Two
         // slides a node, not one: a node is in the way across a span two rows tall, so one
         // off the row grid can still be in the way after the first slide past it — and with
-        // one slide each the count ran out on top of the last node.
-        for _ in 0..2 * self.nodes.len() + 1 {
-            let covered = self
-                .nodes_in(flow)
-                .any(|n| (n.x - x).abs() < NODE_W && (n.y - y).abs() < NODE_H + GAP_Y);
-            if !covered {
+        // one slide each the count ran out on top of the last node. A group can be held up
+        // by every node once per box, hence the product.
+        for _ in 0..2 * self.nodes.len() * spots.len() + 1 {
+            if !covered(dy) {
                 break;
             }
-            y += NODE_H + GAP_Y;
+            dy += NODE_H + GAP_Y;
         }
-        (x, y)
+        dy
     }
 
     /// Whether [`Doc::link`] would change anything — the pre-checkpoint check, for the
@@ -2107,6 +2173,149 @@ impl Doc {
         // A fresh id is neither a self-loop nor a duplicate, and `can_branch` ruled out a
         // note and a jump with a target, so this cannot fail.
         self.add_edge(from, id);
+        Some(id)
+    }
+
+    /// The nodes `ids` names, in paint order, and the edges among them: what Copy, Cut and
+    /// Duplicate take. An edge reaching outside the set is left behind, since pasted, it
+    /// would hang a new branch off a node nobody copied — except a jump's, which is the
+    /// jump's content rather than a link: its box names the target, so a copied jump goes on
+    /// naming it wherever that node still exists. `None` when no id names a node.
+    pub fn fragment(&self, ids: &[NodeId]) -> Option<Fragment> {
+        let nodes: Vec<Node> = self
+            .nodes
+            .iter()
+            .filter(|n| ids.contains(&n.id))
+            .cloned()
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        let edges = self
+            .edges
+            .iter()
+            .filter(|e| ids.contains(&e.from) && (ids.contains(&e.to) || self.is_jump(e.from)))
+            .cloned()
+            .collect();
+        Some(Fragment {
+            palaver: FRAGMENT_MARK.to_string(),
+            nodes,
+            edges,
+        })
+    }
+
+    /// Adds a copy of `fragment` to `flow` with the top-left of its box at `at`, slid down
+    /// in whole rows until no box covers a node already there, and returns the new ids in
+    /// paint order.
+    ///
+    /// Every node gets a fresh id, so pasting twice makes two copies. An alias comes along
+    /// only while no node in the document already answers to it: Cut and Paste moves the
+    /// handle with the node, while a copy beside its original leaves the alias blank rather
+    /// than make a [`Problem::DuplicateAlias`] — blanking the copy's is not renaming
+    /// anybody's. A copied jump whose target is not in this document (pasted into another
+    /// window, or cut away since) arrives with no target, which `DeadEnd` reports.
+    pub fn paste(&mut self, fragment: &Fragment, flow: &str, at: (f32, f32)) -> Vec<NodeId> {
+        let ((left, top), _) = fragment.bounds();
+        let (dx, dy) = (at.0 - left, at.1 - top);
+        let spots: Vec<(f32, f32)> = fragment
+            .nodes
+            .iter()
+            .map(|n| (n.x + dx, n.y + dy))
+            .collect();
+        let dy = dy + self.free_drop(flow, &spots);
+
+        let mut fresh: HashMap<NodeId, NodeId> = HashMap::new();
+        for node in &fragment.nodes {
+            let id = self.fresh_id();
+            fresh.insert(node.id, id);
+            let alias_taken = !node.alias.trim().is_empty()
+                && self
+                    .nodes
+                    .iter()
+                    .any(|n| n.alias.trim() == node.alias.trim());
+            self.nodes.push(Node {
+                id,
+                x: node.x + dx,
+                y: node.y + dy,
+                flow: flow.to_string(),
+                alias: if alias_taken {
+                    String::new()
+                } else {
+                    node.alias.clone()
+                },
+                ..node.clone()
+            });
+        }
+        for edge in &fragment.edges {
+            let Some(&from) = fresh.get(&edge.from) else {
+                continue;
+            };
+            let to = match fresh.get(&edge.to) {
+                Some(&to) => to,
+                None if self.is_jump(from) && self.node(edge.to).is_some() => edge.to,
+                None => continue,
+            };
+            // Asked again rather than trusted: the fragment may be from a hand-edited
+            // clipboard, and the rules are the document's.
+            if self.can_add_edge(from, to) {
+                self.edges.push(Edge {
+                    from,
+                    to,
+                    ..edge.clone()
+                });
+            }
+        }
+        fragment.nodes.iter().map(|n| fresh[&n.id]).collect()
+    }
+
+    /// Whether [`Doc::split_edge`] would put a `kind` node into edge `index`: the edge exists
+    /// and the kind takes edges, which a note does not. The pre-checkpoint check.
+    pub fn can_split_edge(&self, index: usize, kind: NodeKind) -> bool {
+        kind != NodeKind::Note && index < self.edges.len()
+    }
+
+    /// Puts a new `kind` node into edge `index`, so `A → B` becomes `A → new → B`, and
+    /// returns it. The edge itself is kept and pointed at the new node, so the choice the
+    /// player picks, its once-only flag, a condition's pin — and its place in `A`'s list of
+    /// choices — stay where the author put them; the edge on to `B` is a plain new one.
+    ///
+    /// The node goes one column right of `A`, level with `B`, the spot
+    /// [`Doc::branch_from`] would give a child. When `B` stands in front of `A` but too close
+    /// for a column between them, everything on the canvas from `B`'s column rightward moves
+    /// right to make one. A uniform shift of everything past a line cannot put one box on
+    /// another, and every wire it touches only gets longer, so the conversation reads as it
+    /// did with a beat inserted. `None`, with nothing changed, when
+    /// [`Doc::can_split_edge`] refuses.
+    // ponytail: the shift moves every node at or right of B on that canvas, including other
+    // conversations that happen to stand there. Shifting only what B leads to needs a
+    // collision pass of its own; do it if authors keep unrelated scenes side by side.
+    pub fn split_edge(&mut self, index: usize, kind: NodeKind) -> Option<NodeId> {
+        if !self.can_split_edge(index, kind) {
+            return None;
+        }
+        let Edge { from, to, .. } = self.edges[index];
+        let (a, b) = (self.node(from)?, self.node(to)?);
+        let flow = a.flow.clone();
+        let x = a.x + NODE_W + GAP_X;
+        let (b_x, b_y) = (b.x, b.y);
+        let room = x + NODE_W + GAP_X;
+        if b_x > a.x && b_x < room {
+            let shift = room - b_x;
+            for node in self
+                .nodes
+                .iter_mut()
+                .filter(|n| n.flow == flow && n.x >= b_x)
+            {
+                node.x += shift;
+            }
+        }
+        let (x, y) = self.free_spot(&flow, x, b_y);
+        let id = self.add_node_on(&flow, x, y);
+        if let Some(node) = self.node_mut(id) {
+            node.kind = kind;
+        }
+        self.edges[index].to = id;
+        self.add_edge(id, to);
         Some(id)
     }
 
@@ -4929,6 +5138,268 @@ mod tests {
         assert_eq!(c.x, s.x);
         assert!(c.y >= s.y + NODE_H + GAP_Y, "stacked below, not on top");
         assert!(doc.has_edge(parent, child));
+    }
+
+    /// No two boxes on a canvas closer than a row apart in the same column — the rule
+    /// `free_spot` places by.
+    fn no_box_covers_another(doc: &Doc, flow: &str) -> bool {
+        let nodes: Vec<&Node> = doc.nodes_in(flow).collect();
+        nodes.iter().enumerate().all(|(i, a)| {
+            nodes[i + 1..]
+                .iter()
+                .all(|b| (a.x - b.x).abs() >= NODE_W || (a.y - b.y).abs() >= NODE_H + GAP_Y)
+        })
+    }
+
+    #[test]
+    fn a_fragment_holds_the_edges_among_its_nodes_and_a_jumps_target() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.branch_from(a).unwrap();
+        let outside = doc.branch_from(b).unwrap();
+        let jump = doc.add_node(0.0, 500.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        doc.add_edge(jump, outside);
+
+        let fragment = doc.fragment(&[b, a, jump]).unwrap();
+
+        let ids: Vec<NodeId> = fragment.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![a, b, jump], "paint order, not the order asked in");
+        let pairs: Vec<(NodeId, NodeId)> = fragment.edges.iter().map(|e| (e.from, e.to)).collect();
+        assert_eq!(
+            pairs,
+            vec![(a, b), (jump, outside)],
+            "b → outside stays behind"
+        );
+        assert!(doc.fragment(&[]).is_none());
+    }
+
+    #[test]
+    fn paste_makes_fresh_nodes_with_the_edges_among_them() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.branch_from(a).unwrap();
+        doc.node_mut(a).unwrap().text = "Who goes there?".into();
+        doc.edges[0].label = "A friend.".into();
+        doc.edges[0].once = true;
+        let fragment = doc.fragment(&[a, b]).unwrap();
+
+        let pasted = doc.paste(&fragment, "road", (1000.0, 1000.0));
+
+        assert_eq!(pasted.len(), 2);
+        assert!(pasted.iter().all(|id| *id != a && *id != b), "fresh ids");
+        let (pa, pb) = (doc.node(pasted[0]).unwrap(), doc.node(pasted[1]).unwrap());
+        assert_eq!(pa.text, "Who goes there?");
+        assert_eq!(
+            (pa.x, pa.y),
+            (1000.0, 1000.0),
+            "the box's corner lands at `at`"
+        );
+        assert_eq!(
+            pb.x - pa.x,
+            NODE_W + GAP_X,
+            "and the layout inside it survives"
+        );
+        assert!(pa.flow == "road" && pb.flow == "road");
+        let copy = doc
+            .edges
+            .iter()
+            .find(|e| e.from == pasted[0] && e.to == pasted[1])
+            .expect("the edge between them came along");
+        assert!(copy.label == "A friend." && copy.once);
+        assert_eq!(
+            doc.edges.len(),
+            2,
+            "and nothing joins the copy to the original"
+        );
+
+        let again = doc.paste(&fragment, "road", (1000.0, 1000.0));
+        assert!(
+            again.iter().all(|id| !pasted.contains(id)),
+            "a second paste, a second copy"
+        );
+        assert_eq!(doc.nodes.len(), 6);
+    }
+
+    #[test]
+    fn paste_slides_the_whole_group_past_what_is_there() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.branch_from(a).unwrap();
+        let fragment = doc.fragment(&[a, b]).unwrap();
+
+        // Pasted on top of the originals, as an immediate Ctrl+V does.
+        let pasted = doc.paste(&fragment, "", (0.0, 0.0));
+
+        assert!(no_box_covers_another(&doc, ""));
+        let (pa, pb) = (doc.node(pasted[0]).unwrap(), doc.node(pasted[1]).unwrap());
+        assert_eq!(pa.y, pb.y, "slid as one, so the pair is still level");
+        assert_eq!(pa.x, 0.0, "slid down, never sideways");
+    }
+
+    #[test]
+    fn a_pasted_alias_comes_along_only_while_it_is_free() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        doc.node_mut(a).unwrap().alias = "smith_greet".into();
+        let fragment = doc.fragment(&[a]).unwrap();
+
+        let copy = doc.paste(&fragment, "", (0.0, 0.0))[0];
+        assert_eq!(
+            doc.node(copy).unwrap().alias,
+            "",
+            "a copy beside its original"
+        );
+        assert!(
+            doc.problems()
+                .iter()
+                .all(|p| !matches!(p, Problem::DuplicateAlias(..)))
+        );
+
+        // Cut, then paste: the handle moves with the node.
+        doc.remove_node(a);
+        let moved = doc.paste(&fragment, "road", (0.0, 0.0))[0];
+        assert_eq!(doc.node(moved).unwrap().alias, "smith_greet");
+    }
+
+    #[test]
+    fn a_pasted_jump_keeps_its_target_only_where_it_exists() {
+        let mut doc = Doc::default();
+        let target = doc.add_node(0.0, 0.0);
+        let jump = doc.add_node(0.0, 500.0);
+        doc.node_mut(jump).unwrap().kind = NodeKind::Jump;
+        doc.add_edge(jump, target);
+        let fragment = doc.fragment(&[jump]).unwrap();
+
+        let copy = doc.paste(&fragment, "road", (0.0, 0.0))[0];
+        assert!(doc.has_edge(copy, target), "still names the node it named");
+
+        // Another window's document has no such node.
+        let mut other = Doc::default();
+        let there = other.paste(&fragment, "", (0.0, 0.0))[0];
+        assert!(other.edges.is_empty());
+        assert!(other.node(there).is_some_and(|n| n.kind == NodeKind::Jump));
+    }
+
+    #[test]
+    fn a_fragment_survives_the_clipboard_and_nothing_else_reads_as_one() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        doc.branch_from(a).unwrap();
+        let text = doc.fragment(&[a]).unwrap().to_clipboard();
+
+        let back = Fragment::from_clipboard(&text).expect("round trip");
+        assert_eq!(back.len(), 1);
+
+        for stray in [
+            "Who goes there?",
+            "{}",
+            r#"{ "nodes": [], "edges": [] }"#,
+            r#"{ "palaver": "fragment/1", "nodes": [], "edges": [] }"#,
+            &text.replace("fragment/1", "fragment/99"),
+        ] {
+            assert!(Fragment::from_clipboard(stray).is_none(), "{stray}");
+        }
+    }
+
+    #[test]
+    fn split_edge_puts_a_node_between_and_keeps_the_choice_where_it_was() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let first = doc.add_node(2000.0, 0.0);
+        let second = doc.add_node(2000.0, 400.0);
+        doc.add_edge(a, first);
+        doc.add_edge(a, second);
+        doc.edges[0].label = "Ask about the road.".into();
+        doc.edges[0].once = true;
+
+        let new = doc.split_edge(0, NodeKind::Hub).unwrap();
+
+        assert_eq!(doc.node(new).unwrap().kind, NodeKind::Hub);
+        let into = &doc.edges[0];
+        assert_eq!(
+            (into.from, into.to),
+            (a, new),
+            "the edge itself now leads to the new node"
+        );
+        assert!(
+            into.label == "Ask about the road." && into.once,
+            "the choice stays with it"
+        );
+        assert_eq!(doc.edges[1].to, second, "and stays first among a's choices");
+        let on = doc.edges.iter().find(|e| e.from == new).unwrap();
+        assert!(
+            on.to == first && on.label.is_empty() && !on.once,
+            "the rest is plain"
+        );
+        assert_eq!(
+            doc.node(first).unwrap().x,
+            2000.0,
+            "room enough: nothing moved"
+        );
+    }
+
+    #[test]
+    fn split_edge_makes_room_when_the_target_is_one_column_away() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.branch_from(a).unwrap();
+        let c = doc.branch_from(b).unwrap();
+        // Left of b's column, so the shift has no business with it.
+        let aside = doc.add_node(0.0, 400.0);
+        let (b_x, c_x) = (doc.node(b).unwrap().x, doc.node(c).unwrap().x);
+
+        let new = doc.split_edge(0, NodeKind::Speech).unwrap();
+
+        let n = doc.node(new).unwrap();
+        assert_eq!((n.x, n.y), (b_x, 0.0), "the new node takes b's old spot");
+        let shift = NODE_W + GAP_X;
+        assert_eq!(doc.node(b).unwrap().x, b_x + shift);
+        assert_eq!(
+            doc.node(c).unwrap().x,
+            c_x + shift,
+            "b's column and everything right of it"
+        );
+        assert_eq!(doc.node(aside).unwrap().x, 0.0);
+        assert!(no_box_covers_another(&doc, ""));
+    }
+
+    #[test]
+    fn split_edge_back_along_a_loop_moves_nothing() {
+        let mut doc = Doc::default();
+        let hub = doc.add_node(0.0, 0.0);
+        let answer = doc.branch_from(hub).unwrap();
+        doc.add_edge(answer, hub);
+        let before: Vec<(f32, f32)> = doc.nodes.iter().map(|n| (n.x, n.y)).collect();
+
+        let new = doc.split_edge(1, NodeKind::Instruction).unwrap();
+
+        let after: Vec<(f32, f32)> = doc.nodes.iter().take(2).map(|n| (n.x, n.y)).collect();
+        assert_eq!(before, after);
+        assert!(doc.has_edge(answer, new) && doc.has_edge(new, hub));
+        assert!(no_box_covers_another(&doc, ""));
+    }
+
+    #[test]
+    fn split_edge_keeps_a_pin_and_refuses_a_note() {
+        let mut doc = Doc::default();
+        let check = doc.add_node(0.0, 0.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        let yes = doc.add_node(2000.0, 0.0);
+        let no = doc.add_node(2000.0, 400.0);
+        doc.add_edge(check, yes);
+        doc.add_edge(check, no);
+        assert!(doc.edges[0].branch && !doc.edges[1].branch);
+
+        assert!(!doc.can_split_edge(1, NodeKind::Note));
+        assert_eq!(doc.split_edge(1, NodeKind::Note), None);
+        assert!(!doc.can_split_edge(9, NodeKind::Speech));
+        assert_eq!(doc.nodes.len(), 3, "a refusal adds nothing");
+
+        let inner = doc.split_edge(1, NodeKind::Condition).unwrap();
+        assert!(!doc.edges[1].branch, "the false pin is still the false pin");
+        let on = doc.edges.iter().find(|e| e.from == inner).unwrap();
+        assert!(on.branch, "a new condition's first wire takes its true pin");
     }
 
     #[test]

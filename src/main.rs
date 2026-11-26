@@ -13,18 +13,18 @@ mod text_input;
 mod theme;
 
 use doc::{
-    Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Line, MAP_H, MAP_W,
-    Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R, Problem, Ref,
-    SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, WIRE_STUB, box_exit, clean_tag,
-    in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup, route, snippet,
-    split_set, with_default_extension,
+    Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
+    MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R,
+    Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, WIRE_STUB, box_exit,
+    clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup, route,
+    snippet, split_set, with_default_extension,
 };
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder,
-    PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle, ScrollWheelEvent,
-    SharedString, Subscription, Window, WindowAppearance, WindowBounds, WindowHandle,
-    WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
+    AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path,
+    PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle,
+    ScrollWheelEvent, SharedString, Subscription, Window, WindowAppearance, WindowBounds,
+    WindowHandle, WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
 };
 use settings::{Settings, TextFont, ThemePref, UiFont};
 use std::path::PathBuf;
@@ -36,6 +36,10 @@ actions!(
     palaver,
     [
         DeleteNode,
+        CopyNodes,
+        CutNodes,
+        PasteNodes,
+        DuplicateNodes,
         Undo,
         Redo,
         ZoomIn,
@@ -218,14 +222,21 @@ const MENUS: &[MenuSpec] = &[
         &[
             ("Undo", "Ctrl+Z", |e, w, cx| e.on_undo(&Undo, w, cx)),
             ("Redo", "Ctrl+Shift+Z", |e, w, cx| e.on_redo(&Redo, w, cx)),
+            ("Cut", "Ctrl+X", |e, w, cx| e.on_cut(&CutNodes, w, cx)),
+            ("Copy", "Ctrl+C", |e, w, cx| e.on_copy(&CopyNodes, w, cx)),
+            ("Paste", "Ctrl+V", |e, w, cx| e.on_paste(&PasteNodes, w, cx)),
+            ("Duplicate", "Ctrl+D", |e, w, cx| {
+                e.on_duplicate(&DuplicateNodes, w, cx)
+            }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
             }),
         ],
     ),
-    // Every kind is one keystroke, hung off the selected node. Without this a condition
-    // took a double-click and a trip through the inspector's kind picker to reach.
+    // Every kind is one keystroke, hung off the selected node — or put into the selected
+    // edge. Without this a condition took a double-click and a trip through the inspector's
+    // kind picker to reach.
     (
         "Node",
         &[
@@ -1861,6 +1872,79 @@ impl Editor {
         cx.notify();
     }
 
+    fn on_copy(&mut self, _: &CopyNodes, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(n) = self.copy_selection(cx) {
+            let s = if n == 1 { "" } else { "s" };
+            self.set_status(format!("Copied {n} node{s}."), cx);
+        }
+    }
+
+    /// Copy, then the Delete that already exists, so a cut is one undo step and leaves the
+    /// selection exactly as a deletion does.
+    fn on_cut(&mut self, _: &CutNodes, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(n) = self.copy_selection(cx) {
+            self.on_delete(&DeleteNode, window, cx);
+            let s = if n == 1 { "" } else { "s" };
+            self.set_status(format!("Cut {n} node{s}."), cx);
+        }
+    }
+
+    /// Puts the selected nodes and the edges among them on the system clipboard, so a paste
+    /// can land in this document or in another window's, and says how many went. An edge
+    /// selection is not copied: an edge pasted without its ends would have nothing to join.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) -> Option<usize> {
+        let Some(fragment) = self.doc.fragment(self.selection.nodes()) else {
+            self.set_status("Select nodes to copy.".into(), cx);
+            return None;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(fragment.to_clipboard()));
+        Some(fragment.len())
+    }
+
+    /// Pastes the clipboard's nodes into the middle of the view, on the canvas being looked
+    /// at — where Ctrl+6 puts a note, and slid down past whatever stands there the same way —
+    /// and selects them, so the next drag moves the whole paste.
+    fn on_paste(&mut self, _: &PasteNodes, window: &mut Window, cx: &mut Context<Self>) {
+        let fragment = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .and_then(|text| Fragment::from_clipboard(&text));
+        let Some(fragment) = fragment else {
+            return self.set_status("The clipboard holds no nodes to paste.".into(), cx);
+        };
+        // Pasted where nobody can see it would be pasted by accident, as `insert_node` says.
+        self.flow_map = false;
+        let ((left, top), (right, bottom)) = fragment.bounds();
+        let (x, y) = self.view.to_doc(Self::pane_center(window));
+        let at = (x - (right - left) / 2.0, y - (bottom - top) / 2.0);
+        self.place(&fragment, at, "Pasted", cx);
+    }
+
+    /// A copy of the selection straight below it, leaving the clipboard alone: Duplicate is
+    /// for "another one like this, here", which should not cost what was copied before.
+    fn on_duplicate(&mut self, _: &DuplicateNodes, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(fragment) = self.doc.fragment(self.selection.nodes()) else {
+            return self.set_status("Select nodes to duplicate.".into(), cx);
+        };
+        // At the originals' own corner, which they cover, so the paste's slide puts the copy
+        // in the first rows clear below them.
+        let (corner, _) = fragment.bounds();
+        self.place(&fragment, corner, "Duplicated", cx);
+    }
+
+    /// The one checkpointed paste Paste and Duplicate share.
+    fn place(&mut self, fragment: &Fragment, at: (f32, f32), verb: &str, cx: &mut Context<Self>) {
+        self.drag = None;
+        self.checkpoint();
+        let flow = self.flow.clone();
+        let ids = self.doc.paste(fragment, &flow, at);
+        let n = ids.len();
+        self.select(Selection::Nodes(ids), cx);
+        let s = if n == 1 { "" } else { "s" };
+        self.set_status(format!("{verb} {n} node{s}."), cx);
+        cx.notify();
+    }
+
     fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         // A drag in progress ends with the step: carried on, its moves would be written
         // with no checkpoint of their own, and be lost with the next undo.
@@ -2131,14 +2215,25 @@ impl Editor {
             .only_node()
             .filter(|_| kind != NodeKind::Note)
             .filter(|id| self.doc.can_branch(*id));
+        // With an edge selected the node goes *into* it, which is how a beat is added to a
+        // conversation already drawn without deleting and redrawing the choice. A note
+        // takes no edges, so it lands in the middle of the view as it would anyway.
+        let into = match self.selection {
+            Selection::Edge(index) if self.doc.can_split_edge(index, kind) => Some(index),
+            _ => None,
+        };
 
         self.checkpoint();
-        let id = match parent {
-            Some(from) => match self.doc.branch_from(from) {
+        let id = match (into, parent) {
+            (Some(index), _) => match self.doc.split_edge(index, kind) {
                 Some(id) => id,
                 None => return,
             },
-            None => {
+            (None, Some(from)) => match self.doc.branch_from(from) {
+                Some(id) => id,
+                None => return,
+            },
+            (None, None) => {
                 // Centred on the view rather than parked at its origin, so the node lands
                 // where you are already looking, and onto the canvas being looked at. The
                 // branch arm needs no equivalent: `branch_from` inherits the parent's, and
@@ -2771,6 +2866,10 @@ impl Render for Editor {
         div()
             .key_context("Editor")
             .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_copy))
+            .on_action(cx.listener(Self::on_cut))
+            .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_duplicate))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_zoom_in))
@@ -7224,6 +7323,12 @@ fn main() {
             KeyBinding::new("delete", DeleteNode, Some("Canvas")),
             KeyBinding::new("backspace", DeleteNode, Some("Canvas")),
             KeyBinding::new("tab", Branch, Some("Canvas")),
+            // In a text field these four are the field's own, so they are the canvas's
+            // only while the canvas has the focus, like Delete and Tab.
+            KeyBinding::new("ctrl-c", CopyNodes, Some("Canvas")),
+            KeyBinding::new("ctrl-x", CutNodes, Some("Canvas")),
+            KeyBinding::new("ctrl-v", PasteNodes, Some("Canvas")),
+            KeyBinding::new("ctrl-d", DuplicateNodes, Some("Canvas")),
             // Bare `f`, so canvas-only like the three above: in a text field it is a letter.
             KeyBinding::new("f", FitView, Some("Canvas")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
