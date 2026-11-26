@@ -4,7 +4,7 @@
 //!
 //! **Every command goes through a handler the UI already uses** — a menu item's `fn`
 //! pointer, `Editor::select`, `jump_to`, `switch_pane`, `show_flow`, `play_advance`,
-//! `play_force`, `play_rewind`, `play_set`, or a
+//! `play_force`, `play_rewind`, `play_set`, `save_run`, `replay_run`, or a
 //! field's `set_content`, which the `sync_fields` observer then writes into the node exactly
 //! as typing does. Nothing here touches `Doc` directly, so a script can reach no state a
 //! person could not, and a screenshot never shows a state the UI cannot get into.
@@ -310,6 +310,25 @@ fn run(
                 other => return Err(format!("no rewind {other:?}")),
             };
             editor.play_rewind(restart, window, cx);
+            Ok(String::new())
+        }
+
+        // `saverun` — the play panel's Save run.
+        "saverun" => {
+            if editor.play.is_none() {
+                return Err("not playing".into());
+            }
+            editor.save_run(cx);
+            Ok(String::new())
+        }
+
+        // `replay 0` — the first saved run's Replay, as the document summary lists them.
+        "replay" => {
+            let index: usize = rest.parse().map_err(|_| "expected a run number")?;
+            if index >= editor.doc.runs.len() {
+                return Err(format!("only {} saved runs", editor.doc.runs.len()));
+            }
+            editor.replay_run(index, window, cx);
             Ok(String::new())
         }
 

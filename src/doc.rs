@@ -344,6 +344,7 @@ struct Snapshot {
     characters: Vec<Character>,
     flows: Vec<String>,
     premise: String,
+    runs: Vec<SavedRun>,
 }
 
 /// Serialized by hand ([`Doc::serialize`]), field for field as a derive would, so that what
@@ -372,6 +373,12 @@ pub struct Doc {
     /// grow into a property bag. `default` so an older `.dln` loads with none.
     #[serde(default)]
     pub premise: String,
+    /// Play-throughs kept to replay — test data about this document, so they travel with it
+    /// the way articy keeps journeys in the project. `default` so an older `.dln` loads with
+    /// none, and not written while there are none, so a file nobody saved a run in is byte
+    /// for byte what it was.
+    #[serde(default)]
+    pub runs: Vec<SavedRun>,
     // ponytail: full snapshots, 50 deep; switch to an edit log if docs get big.
     #[serde(skip)]
     undo: Vec<Snapshot>,
@@ -452,6 +459,11 @@ impl Serialize for Doc {
         doc.serialize_field("characters", &characters)?;
         doc.serialize_field("flows", &self.flows)?;
         doc.serialize_field("premise", &self.premise)?;
+        if self.runs.is_empty() {
+            doc.skip_field("runs")?;
+        } else {
+            doc.serialize_field("runs", &self.runs)?;
+        }
         doc.end()
     }
 }
@@ -1027,6 +1039,22 @@ pub struct Run {
     /// Positions in `path` of conditions sent down the pin their check did not choose.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forced: Vec<usize>,
+}
+
+/// A [`Run`] kept in the document under a name, to replay with [`Doc::replay`].
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct SavedRun {
+    pub name: String,
+    pub run: Run,
+}
+
+/// What [`Doc::replay`] made of a saved run: the play-through as far as the document still
+/// takes it, and — when that is not the whole way — the position in the saved path of the
+/// first step it no longer takes.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Replay {
+    pub run: Run,
+    pub stopped: Option<usize>,
 }
 
 impl Run {
@@ -1939,6 +1967,78 @@ impl Doc {
         true
     }
 
+    /// Keeps a copy of `run` in the document as "Run N", the first number no saved run uses,
+    /// and returns the name. A document edit like any other: the view checkpoints first.
+    pub fn save_run(&mut self, run: &Run) -> String {
+        let name = (1..)
+            .map(|n| format!("Run {n}"))
+            .find(|name| !self.runs.iter().any(|saved| saved.name == *name))
+            .unwrap_or_default();
+        self.runs.push(SavedRun {
+            name: name.clone(),
+            run: run.clone(),
+        });
+        name
+    }
+
+    /// Takes a saved run out of the document. Out of range is a no-op.
+    pub fn remove_run(&mut self, index: usize) {
+        if index < self.runs.len() {
+            self.runs.remove(index);
+        }
+    }
+
+    /// Plays `saved` again against the document as it is now: the same first node, the same
+    /// values set by hand and the same checks forced, at the same points, and the same
+    /// choices at every line — with the checks evaluated afresh, which is the point: a run
+    /// that showed a bug is how a fix to it is checked.
+    ///
+    /// It goes as far as the document still takes it. Where the walk now goes somewhere the
+    /// run did not — a check that answers differently, a jump retargeted — the replay keeps
+    /// the new way, as far as it walks on its own, and stops there; where a choice the run
+    /// took is no longer offered (deleted, spent, never drawn), it stops on the line that
+    /// offered it. Either way `stopped` is the position in the saved path of the first step
+    /// not taken, and the hand-made changes past it are dropped, since they were made on a
+    /// route the replay is no longer on. `None` when the first node is gone.
+    pub fn replay(&self, saved: &Run) -> Option<Replay> {
+        let &seed = saved.path.first()?;
+        self.node(seed)?;
+        let mut run = Run {
+            path: vec![seed],
+            sets: saved.sets.clone(),
+            forced: saved.forced.clone(),
+        };
+        self.walk_on(&mut run.path, &run.sets, &run.forced);
+        loop {
+            // Where the live walk left the saved path, if it did, while walking through
+            // what the player does not see.
+            if let Some(at) = run.path.iter().zip(&saved.path).position(|(a, b)| a != b) {
+                run.path.truncate(at);
+                run.trim();
+                self.walk_on(&mut run.path, &run.sets, &run.forced);
+                return Some(Replay {
+                    run,
+                    stopped: Some(at),
+                });
+            }
+            let at = run.path.len();
+            let Some(&next) = saved.path.get(at) else {
+                return Some(Replay { run, stopped: None });
+            };
+            let offered = self
+                .offered(&run.path)
+                .is_some_and(|offered| offered.iter().any(|&(to, _, spent)| to == next && !spent));
+            if !offered {
+                run.trim();
+                return Some(Replay {
+                    run,
+                    stopped: Some(at),
+                });
+            }
+            self.choose(&mut run, next);
+        }
+    }
+
     /// Steps back to the previous node the player actually saw, dropping the invisible run
     /// walked through to reach the current one. False when there is no earlier one — which
     /// is also what hides the Back button.
@@ -2650,6 +2750,11 @@ impl Doc {
                     var.clone_from(new);
                 }
             }
+            for set in self.runs.iter_mut().flat_map(|saved| &mut saved.run.sets) {
+                if set.var == *old {
+                    set.var.clone_from(new);
+                }
+            }
         }
         renames.len()
     }
@@ -2670,6 +2775,11 @@ impl Doc {
             node.effects.retain(|e| e.var != name);
             node.conditions.retain(|c| c.var != name);
             dropped += before - node.effects.len() - node.conditions.len();
+        }
+        // A saved run's value for it goes too, for the same reason; not counted, since it is
+        // test data and not a reference the author wrote into the graph.
+        for saved in &mut self.runs {
+            saved.run.sets.retain(|set| set.var != name);
         }
         dropped
     }
@@ -2701,6 +2811,13 @@ impl Doc {
                 var.clear();
                 var.push_str(to);
                 moved += 1;
+            }
+        }
+        // A saved run's hand-set values name variables too, so they follow; not counted, as
+        // in `remove_variable`.
+        for set in self.runs.iter_mut().flat_map(|saved| &mut saved.run.sets) {
+            if set.var == from {
+                set.var = to.to_string();
             }
         }
         moved
@@ -2740,6 +2857,11 @@ impl Doc {
                     check.op = Cmp::Eq;
                 }
                 moved += 1;
+            }
+        }
+        for set in self.runs.iter_mut().flat_map(|saved| &mut saved.run.sets) {
+            if set.var == name {
+                set.value = set.value.coerce(to);
             }
         }
         moved
@@ -3229,6 +3351,7 @@ impl Doc {
                 .collect(),
             flows: self.flows.clone(),
             premise: self.premise.clone(),
+            runs: self.runs.clone(),
         }
     }
 
@@ -3240,6 +3363,7 @@ impl Doc {
             characters,
             flows,
             premise,
+            runs,
         } = snapshot;
         self.nodes = nodes;
         self.edges = edges;
@@ -3247,6 +3371,7 @@ impl Doc {
         self.characters = characters;
         self.flows = flows;
         self.premise = premise;
+        self.runs = runs;
         // A snapshot holds none of the outside names, so nothing in the lists it restored is
         // a merged one — least of all a declaration of the document's own that shares a
         // name with one, which the merge would otherwise take out as its own leftover.
@@ -5047,6 +5172,112 @@ mod tests {
         doc.force(&mut run, 0);
         doc.restart(&mut run);
         assert_eq!(run.path, vec![check, yes]);
+    }
+
+    #[test]
+    fn saved_runs_take_the_first_free_name() {
+        let (mut doc, [ask, ..]) = gate();
+        let run = doc.begin(ask);
+        assert_eq!(doc.save_run(&run), "Run 1");
+        assert_eq!(doc.save_run(&run), "Run 2");
+        doc.remove_run(0);
+        assert_eq!(
+            doc.save_run(&run),
+            "Run 1",
+            "a removed run's name is free again"
+        );
+        doc.remove_run(9);
+        assert_eq!(doc.runs.len(), 2);
+    }
+
+    #[test]
+    fn replay_retraces_a_run_with_its_changes_by_hand() {
+        let (mut doc, [ask, check, yes, _]) = gate();
+        let then = doc.add_node(1200.0, 0.0);
+        doc.add_edge(yes, then);
+        let mut run = doc.begin(ask);
+        doc.set_live(&mut run, "paid", Value::Bool(true));
+        doc.choose(&mut run, check);
+        doc.choose(&mut run, then);
+        let mut forced = doc.begin(ask);
+        doc.choose(&mut forced, check);
+        doc.force(&mut forced, 1);
+
+        for saved in [run, forced] {
+            let replay = doc.replay(&saved).unwrap();
+            assert_eq!(replay.stopped, None);
+            assert_eq!(replay.run, saved);
+        }
+    }
+
+    #[test]
+    fn replay_takes_the_new_way_where_a_check_now_answers_differently() {
+        let (mut doc, [ask, check, yes, no]) = gate();
+        let mut run = doc.begin(ask);
+        doc.choose(&mut run, check);
+        assert_eq!(run.path.last(), Some(&no));
+
+        // The fix: the check now asks for the flag being false.
+        doc.set_condition(check, "paid", Some(Value::Bool(false)), Cmp::Eq);
+        let replay = doc.replay(&run).unwrap();
+        assert_eq!(replay.run.path, vec![ask, check, yes]);
+        assert_eq!(replay.stopped, Some(2), "where it left the saved path");
+    }
+
+    #[test]
+    fn replay_stops_on_the_line_whose_choice_is_gone() {
+        let (mut doc, hub, [a, b, _]) = three_choices();
+        let mut run = doc.begin(hub);
+        doc.choose(&mut run, b);
+        doc.edges.retain(|e| !(e.from == hub && e.to == b));
+
+        let replay = doc.replay(&run).unwrap();
+        assert_eq!(replay.run.path, vec![hub]);
+        assert_eq!(replay.stopped, Some(1));
+        assert!(
+            doc.offered(&replay.run.path)
+                .unwrap()
+                .iter()
+                .any(|&(to, ..)| to == a)
+        );
+
+        doc.remove_node(hub);
+        assert_eq!(doc.replay(&run), None, "nothing to start from");
+    }
+
+    #[test]
+    fn a_saved_runs_values_follow_the_variable() {
+        let (mut doc, [ask, ..]) = gate();
+        let mut run = doc.begin(ask);
+        doc.set_live(&mut run, "paid", Value::Bool(true));
+        doc.save_run(&run);
+
+        doc.rename_variable("paid", "settled");
+        assert_eq!(doc.runs[0].run.sets[0].var, "settled");
+        doc.retype_variable("settled", Value::Int(0));
+        assert_eq!(doc.runs[0].run.sets[0].value, Value::Int(1));
+        doc.add_variable("tab.paid");
+        doc.rename_variable("settled", "tab.settled");
+        doc.rename_set("tab", "bill");
+        assert_eq!(doc.runs[0].run.sets[0].var, "bill.settled");
+        doc.remove_variable("bill.settled");
+        assert!(doc.runs[0].run.sets.is_empty());
+    }
+
+    #[test]
+    fn saved_runs_are_saved_undone_and_left_out_of_a_file_without_any() {
+        let (mut doc, [ask, ..]) = gate();
+        assert!(!doc.to_json().contains("\"runs\""), "no runs, no field");
+        let run = doc.begin(ask);
+        doc.checkpoint();
+        doc.save_run(&run);
+        let back = Doc::from_json(&doc.to_json()).unwrap();
+        assert_eq!(back.runs, doc.runs);
+
+        assert!(doc.undo());
+        assert!(doc.runs.is_empty(), "an undo takes the saved run back out");
+        assert!(doc.redo());
+        assert_eq!(doc.runs.len(), 1);
     }
 
     #[test]

@@ -15,9 +15,9 @@ mod theme;
 use doc::{
     Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
     MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R,
-    Problem, Ref, Run, SCRIPT_EXT, SetOp, Severity, Step, Use, Value, VarState, View, WIRE_STUB,
-    box_exit, clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup,
-    route, snippet, split_set, with_default_extension,
+    Problem, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step, Use, Value, VarState, View,
+    WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port,
+    read_backup, route, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
@@ -2423,6 +2423,56 @@ impl Editor {
         {
             cx.notify();
         }
+    }
+
+    /// Keeps the play-through going now in the document, to replay after an edit.
+    fn save_run(&mut self, cx: &mut Context<Self>) {
+        let Some(run) = self.play.clone() else {
+            return;
+        };
+        self.checkpoint();
+        let name = self.doc.save_run(&run);
+        self.set_status(
+            format!("Saved as {name}. Saved runs are listed when nothing is selected."),
+            cx,
+        );
+    }
+
+    /// Plays a saved run again against the document as it stands, and says how far it got.
+    fn replay_run(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) {
+        let Some(saved) = self.doc.runs.get(index) else {
+            return;
+        };
+        let name = saved.name.clone();
+        let Some(Replay { run, stopped }) = self.doc.replay(&saved.run) else {
+            return self.set_status(format!("{name} starts on a node that is gone."), cx);
+        };
+        let said = match stopped {
+            None => format!("Replayed {name} to the end."),
+            Some(at) => {
+                let from = saved.run.path[at - 1];
+                format!(
+                    "{name} goes a new way after {}: this is as far as it still gets.",
+                    node_number(&self.doc, from)
+                )
+            }
+        };
+        self.dismiss_overlays(cx);
+        self.editing = None;
+        self.follow(&run.path, window, cx);
+        self.play = Some(run);
+        self.set_status(said, cx);
+        cx.notify();
+    }
+
+    /// Takes a saved run out of the document. An edit, so one undo brings it back.
+    fn remove_run(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.doc.runs.len() {
+            return;
+        }
+        self.checkpoint();
+        self.doc.remove_run(index);
+        cx.notify();
     }
 
     /// Brings the node a play-through has arrived at into view.
@@ -5106,6 +5156,79 @@ impl Editor {
             .collect()
     }
 
+    /// The document summary's saved runs: each one's name, where it starts and how many
+    /// lines it reaches, with Replay and Remove. `None` when there are none, so a document
+    /// nobody saved a run in shows no empty section.
+    fn runs_list(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.doc.runs.is_empty() {
+            return None;
+        }
+        let link = |id: (&'static str, usize), label: &'static str, color: Rgba| {
+            div()
+                .id(id)
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(color)
+                .hover(|style| style.bg(theme::hover()))
+                .child(label)
+        };
+        let rows = self.doc.runs.iter().enumerate().map(|(i, saved)| {
+            let lines = saved
+                .run
+                .path
+                .iter()
+                .filter(|&&id| self.doc.node(id).is_some() && self.doc.pauses_play(id))
+                .count();
+            let s = if lines == 1 { "" } else { "s" };
+            let from = saved
+                .run
+                .path
+                .first()
+                .map_or("nowhere".to_string(), |&id| node_number(&self.doc, id));
+            // Two runs over the same lines differ only in what was done by hand, so say it.
+            let by_hand = match saved.run.sets.len() + saved.run.forced.len() {
+                0 => String::new(),
+                n => format!(" · {n} by hand"),
+            };
+            // The buttons share the name's line, so the detail under it has the full width:
+            // beside them it was cut off before the count of changes made by hand.
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .one_line()
+                                .child(saved.name.clone()),
+                        )
+                        .child(link(("run-replay", i), "Replay", theme::accent()).on_click(
+                            cx.listener(move |this, _, window, cx| this.replay_run(i, window, cx)),
+                        ))
+                        .child(
+                            link(("run-remove", i), "Remove", theme::text_muted()).on_click(
+                                cx.listener(move |this, _, _, cx| this.remove_run(i, cx)),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .type_hint()
+                        .one_line()
+                        .child(format!("from {from} · {lines} line{s}{by_hand}")),
+                )
+        });
+        Some(div().flex().flex_col().gap_2().children(rows))
+    }
+
     /// The play panel's "Checked on the way": one row per condition passed since the player
     /// last stopped — what it checks, which pin it went down, and a button for the other
     /// one. A forced row says so and offers to let the check choose again. `None` when the
@@ -5376,6 +5499,13 @@ impl Editor {
                         row(("play-nav", 1), "Restart".into(), theme::text_muted()).on_click(
                             cx.listener(|this, _, window, cx| this.play_rewind(true, window, cx)),
                         ),
+                    )
+                    // Kept with the document, to replay after an edit; listed in the
+                    // document summary.
+                    .child(
+                        row(("play-nav", 2), "Save run".into(), theme::accent())
+                            .ml_auto()
+                            .on_click(cx.listener(|this, _, _, cx| this.save_run(cx))),
                     ),
             )
             // The checks passed on the way here, each with the pin it went down and a way to
@@ -6969,6 +7099,7 @@ impl Editor {
                             ))
                             .child(stat("Problems", problem_text, problem_color)),
                     ))
+                    .children(self.runs_list(cx).map(|list| section("Runs", list)))
                     .child(section(
                         "Tips",
                         div()
@@ -6982,6 +7113,7 @@ impl Editor {
                                 "Click a node or an edge to edit it."
                             })
                             .child("Ctrl+F finds a node.")
+                            .child("F5 plays the conversation; Save run keeps it to replay.")
                             .child("F1 lists every shortcut."),
                     ))
                     .into_any_element()
