@@ -1000,6 +1000,44 @@ fn tag_under(tag: &str, name: &str) -> bool {
 /// see [`Doc::vars_along`], which recomputes it from the path instead.
 pub type VarState = HashMap<String, Value>;
 
+/// A value a tester set by hand during a play-through. It applies just before node
+/// `path[at]`, so one set while standing on the last node of a path `at` long changes what
+/// comes next and nothing already played — and a Back past that point takes it away, as it
+/// takes away the flags the instructions after it set.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Override {
+    pub at: usize,
+    pub var: String,
+    pub value: Value,
+}
+
+/// A play-through: the path walked, and what the tester did to it by hand on the way.
+///
+/// The path is still the play state — the variables are recomputed from it, a spent choice
+/// is read off it, Back truncates it — and the two hand-made kinds of change are recorded
+/// *at a position in it*, so a Back that drops the position drops the change with it and
+/// there is still no second copy of anything to fall out of step.
+#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Run {
+    /// Every node visited, including the ones walked through, the current one last.
+    pub path: Vec<NodeId>,
+    /// Values set by hand, in the order they were set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sets: Vec<Override>,
+    /// Positions in `path` of conditions sent down the pin their check did not choose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forced: Vec<usize>,
+}
+
+impl Run {
+    /// Drops every change recorded past the end of the path, after it was cut short.
+    fn trim(&mut self) {
+        let len = self.path.len();
+        self.sets.retain(|set| set.at <= len);
+        self.forced.retain(|&at| at < len);
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub from: NodeId,
@@ -1737,10 +1775,9 @@ impl Doc {
         }
     }
 
-    /// The branch a condition sends the flow down, given the variables as they stand.
-    /// None when that pin has nothing wired to it, which stops the walk where it is.
-    fn condition_branch(&self, id: NodeId, vars: &VarState) -> Option<NodeId> {
-        let holds = self.condition_holds(id, vars);
+    /// Where a condition's `holds` pin leads. None when that pin has nothing wired to it,
+    /// which stops the walk where it is.
+    fn pin(&self, id: NodeId, holds: bool) -> Option<NodeId> {
         self.edges
             .iter()
             .find(|e| e.from == id && e.branch == holds && self.node(e.to).is_some())
@@ -1757,17 +1794,23 @@ impl Doc {
     /// from the whole path would make returning to a node the conversation has already
     /// played look like a loop, and a hub reached back through a jump is the most ordinary
     /// shape a dialogue graph has.
-    fn walk_on(&self, path: &mut Vec<NodeId>) {
+    ///
+    /// `sets` and `forced` are a [`Run`]'s hand-made changes: the values set by hand count
+    /// toward every check from where they were set, and a condition at a position in
+    /// `forced` takes the pin its check did not choose.
+    fn walk_on(&self, path: &mut Vec<NodeId>, sets: &[Override], forced: &[usize]) {
         let mut seen: HashSet<NodeId> = path.last().copied().into_iter().collect();
         while let Some(&current) = path.last() {
             if self.pauses_play(current) {
                 return;
             }
-            // The only place a condition is ever evaluated. `vars_along` is recomputed for
+            // The only place a condition is ever evaluated. `vars_with` is recomputed for
             // each one met rather than carried along, which keeps the path the single copy
-            // of the play state — and it is a walk of a few dozen nodes.
+            // of the play state — and it is a walk of a few dozen nodes. A forced one is
+            // still evaluated, and sent the other way.
             let next = if self.is_condition(current) {
-                self.condition_branch(current, &self.vars_along(path))
+                let holds = self.condition_holds(current, &self.vars_with(path, sets));
+                self.pin(current, holds != forced.contains(&(path.len() - 1)))
             } else {
                 self.choices(current).first().map(|(to, _)| *to)
             };
@@ -1783,16 +1826,117 @@ impl Doc {
 
     /// The path a play-through opens on: `seed`, plus whatever it walks through to reach
     /// the first node the player sees.
+    // The path-only forms of `begin` and `choose`, which the editor no longer needs: the tests
+    // written before runs had hand-made changes are written against them.
+    #[cfg(test)]
     pub fn start_walk(&self, seed: NodeId) -> Vec<NodeId> {
-        let mut path = vec![seed];
-        self.walk_on(&mut path);
-        path
+        self.begin(seed).path
     }
 
     /// Takes the choice leading to `to` and walks on from there.
+    #[cfg(test)]
     pub fn advance(&self, path: &mut Vec<NodeId>, to: NodeId) {
         path.push(to);
-        self.walk_on(path);
+        self.walk_on(path, &[], &[]);
+    }
+
+    /// A play-through from `seed`, walked on to the first node the player sees, with
+    /// nothing changed by hand yet.
+    pub fn begin(&self, seed: NodeId) -> Run {
+        let mut run = Run {
+            path: vec![seed],
+            ..Run::default()
+        };
+        self.walk_on(&mut run.path, &[], &[]);
+        run
+    }
+
+    /// [`Doc::advance`] for a run: its hand-made changes count toward the checks ahead.
+    pub fn choose(&self, run: &mut Run, to: NodeId) {
+        run.path.push(to);
+        self.walk_on(&mut run.path, &run.sets, &run.forced);
+    }
+
+    /// [`Doc::step_back`] for a run, dropping whatever was changed by hand after the node it
+    /// steps back to — a value set there stays, since it was set standing there.
+    pub fn back(&self, run: &mut Run) -> bool {
+        let stepped = self.step_back(&mut run.path);
+        run.trim();
+        stepped
+    }
+
+    /// Plays the run again from its first node. What was changed by hand before the first
+    /// line — a value set while standing on it, an opening check sent the other way — is
+    /// the run's starting state, and stays; everything after it goes, with the path.
+    pub fn restart(&self, run: &mut Run) {
+        let opening = match run.path.iter().position(|&id| self.pauses_play(id)) {
+            Some(first) => first + 1,
+            None => run.path.len(),
+        };
+        run.path.truncate(1);
+        run.sets.retain(|set| set.at <= opening);
+        run.forced.retain(|&at| at < opening);
+        self.walk_on(&mut run.path, &run.sets, &run.forced);
+    }
+
+    /// Sets a variable by hand from this point of the run on, replacing a value set for it
+    /// at the same point. False, with nothing changed, for a variable the document does not
+    /// declare or a value of the wrong type — the same refusal `Condition::holds` gives a
+    /// mistyped check, rather than a flag quietly turned into a number.
+    pub fn set_live(&self, run: &mut Run, var: &str, value: Value) -> bool {
+        let fits = self
+            .variable(var)
+            .is_some_and(|v| std::mem::discriminant(&v.default) == std::mem::discriminant(&value));
+        if !fits {
+            return false;
+        }
+        let at = run.path.len();
+        run.sets.retain(|set| !(set.at == at && set.var == var));
+        run.sets.push(Override {
+            at,
+            var: var.to_string(),
+            value,
+        });
+        true
+    }
+
+    /// The variables as they stand at the end of the run, hand-made values included.
+    pub fn live_vars(&self, run: &Run) -> VarState {
+        self.vars_with(&run.path, &run.sets)
+    }
+
+    /// The positions of the conditions passed since the player last stopped, and the one the
+    /// run is stuck on if it is: the checks the play panel offers to send the other way.
+    pub fn checks_on_the_way(&self, path: &[NodeId]) -> Vec<usize> {
+        let Some(last) = path.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        let from = path[..last]
+            .iter()
+            .rposition(|&id| self.pauses_play(id))
+            .map_or(0, |at| at + 1);
+        (from..=last)
+            .filter(|&at| self.is_condition(path[at]))
+            .collect()
+    }
+
+    /// Sends the condition at position `at` of the run down its other pin — or back down the
+    /// one its check chooses, if it was already forced — and walks on from there. What the
+    /// run did after that condition is gone, as a Back would take it. False, with nothing
+    /// changed, when there is no condition at `at`.
+    pub fn force(&self, run: &mut Run, at: usize) -> bool {
+        if !run.path.get(at).is_some_and(|&id| self.is_condition(id)) {
+            return false;
+        }
+        let was = run.forced.contains(&at);
+        run.path.truncate(at + 1);
+        run.trim();
+        run.forced.retain(|&i| i != at);
+        if !was {
+            run.forced.push(at);
+        }
+        self.walk_on(&mut run.path, &run.sets, &run.forced);
+        true
     }
 
     /// Steps back to the previous node the player actually saw, dropping the invisible run
@@ -2658,19 +2802,37 @@ impl Doc {
     /// Recomputed from the path rather than carried beside it, which is what makes it
     /// impossible for the two to drift — stepping back through the path steps the
     /// variables back with it for free.
+    #[cfg(test)]
     pub fn vars_along(&self, path: &[NodeId]) -> VarState {
+        self.vars_with(path, &[])
+    }
+
+    /// [`Doc::vars_along`] with values set by hand: each [`Override`] lands just before the
+    /// node at its position, so an instruction after it can still overwrite it, as it would
+    /// any value.
+    pub fn vars_with(&self, path: &[NodeId], sets: &[Override]) -> VarState {
         let mut vars = self.initial_vars();
-        let instructions = path
-            .iter()
-            .filter_map(|id| self.node(*id))
-            .filter(|n| n.kind == NodeKind::Instruction);
-        for effect in instructions.flat_map(|n| &n.effects) {
-            // Only a declared variable. Inventing one here would paper over the broken file
-            // that `problems` is about to report.
-            if let Some(slot) = vars.get_mut(&effect.var) {
-                *slot = apply(*slot, effect.op, effect.value);
+        let set_by_hand = |vars: &mut VarState, at: usize| {
+            for set in sets.iter().filter(|set| set.at == at) {
+                if let Some(slot) = vars.get_mut(&set.var) {
+                    *slot = set.value;
+                }
+            }
+        };
+        for (at, id) in path.iter().enumerate() {
+            set_by_hand(&mut vars, at);
+            let Some(node) = self.node(*id).filter(|n| n.kind == NodeKind::Instruction) else {
+                continue;
+            };
+            for effect in &node.effects {
+                // Only a declared variable. Inventing one here would paper over the broken
+                // file that `problems` is about to report.
+                if let Some(slot) = vars.get_mut(&effect.var) {
+                    *slot = apply(*slot, effect.op, effect.value);
+                }
             }
         }
+        set_by_hand(&mut vars, path.len());
         vars
     }
 
@@ -4737,6 +4899,154 @@ mod tests {
         doc.advance(&mut path, sets);
 
         assert_eq!(path, vec![here, sets, there]);
+    }
+
+    /// A line, then a check of `paid` with both pins wired, then a second line on each side:
+    /// `ask → check → (yes | no)`, `paid` a flag starting false.
+    fn gate() -> (Doc, [NodeId; 4]) {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        let ask = doc.add_node(0.0, 0.0);
+        let check = doc.add_node(400.0, 0.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.set_condition(check, "paid", Some(Value::Bool(true)), Cmp::Eq);
+        let yes = doc.add_node(800.0, 0.0);
+        let no = doc.add_node(800.0, 200.0);
+        doc.add_edge(ask, check);
+        doc.add_edge(check, yes);
+        doc.add_edge(check, no);
+        (doc, [ask, check, yes, no])
+    }
+
+    #[test]
+    fn a_value_set_by_hand_changes_what_comes_next() {
+        let (doc, [ask, check, yes, no]) = gate();
+        let mut run = doc.begin(ask);
+        assert!(doc.set_live(&mut run, "paid", Value::Bool(true)));
+        assert_eq!(doc.live_vars(&run)["paid"], Value::Bool(true));
+        assert_eq!(
+            doc.vars_along(&run.path)["paid"],
+            Value::Bool(false),
+            "defaults untouched"
+        );
+
+        doc.choose(&mut run, check);
+        assert_eq!(run.path, vec![ask, check, yes]);
+
+        // Set standing on `ask`, so a Back to `ask` keeps it, and the same choice goes the
+        // same way.
+        assert!(doc.back(&mut run));
+        assert_eq!(run.sets.len(), 1);
+        doc.choose(&mut run, check);
+        assert_eq!(run.path.last(), Some(&yes));
+
+        // Set standing on `yes`, after the check: a Back past it takes it away.
+        doc.set_live(&mut run, "paid", Value::Bool(false));
+        assert_eq!(run.sets.len(), 2);
+        doc.back(&mut run);
+        assert_eq!(run.sets.len(), 1);
+        assert_ne!(run.path.last(), Some(&no));
+    }
+
+    #[test]
+    fn set_live_refuses_an_unknown_variable_or_the_wrong_type() {
+        let (doc, [ask, ..]) = gate();
+        let mut run = doc.begin(ask);
+        assert!(!doc.set_live(&mut run, "gold", Value::Int(3)));
+        assert!(!doc.set_live(&mut run, "paid", Value::Int(1)));
+        assert!(run.sets.is_empty());
+        // A second set at the same point replaces the first.
+        doc.set_live(&mut run, "paid", Value::Bool(true));
+        doc.set_live(&mut run, "paid", Value::Bool(false));
+        assert_eq!(run.sets.len(), 1);
+        assert_eq!(doc.live_vars(&run)["paid"], Value::Bool(false));
+    }
+
+    #[test]
+    fn an_instruction_after_a_set_value_still_writes_over_it() {
+        let (mut doc, [ask, check, yes, _]) = gate();
+        let pay = doc.add_node(200.0, 0.0);
+        doc.node_mut(pay).unwrap().kind = NodeKind::Instruction;
+        doc.set_effect(pay, "paid", Some(Value::Bool(false)), SetOp::Set);
+        doc.edges.retain(|e| !(e.from == ask && e.to == check));
+        doc.add_edge(ask, pay);
+        doc.add_edge(pay, check);
+
+        let mut run = doc.begin(ask);
+        doc.set_live(&mut run, "paid", Value::Bool(true));
+        doc.choose(&mut run, pay);
+        assert_ne!(
+            run.path.last(),
+            Some(&yes),
+            "the instruction ran after the set"
+        );
+    }
+
+    #[test]
+    fn force_sends_a_check_the_other_way_and_back() {
+        let (doc, [ask, check, yes, no]) = gate();
+        let mut run = doc.begin(ask);
+        doc.choose(&mut run, check);
+        assert_eq!(run.path, vec![ask, check, no]);
+        assert_eq!(doc.checks_on_the_way(&run.path), vec![1]);
+
+        assert!(doc.force(&mut run, 1));
+        assert_eq!(run.path, vec![ask, check, yes]);
+        assert_eq!(run.forced, vec![1]);
+        assert_eq!(
+            doc.live_vars(&run)["paid"],
+            Value::Bool(false),
+            "a force sets nothing"
+        );
+
+        assert!(doc.force(&mut run, 1), "forcing it again undoes the force");
+        assert_eq!(run.path, vec![ask, check, no]);
+        assert!(run.forced.is_empty());
+
+        assert!(!doc.force(&mut run, 0), "a line is not a check");
+        doc.force(&mut run, 1);
+        doc.back(&mut run);
+        assert!(run.forced.is_empty(), "Back takes the force with the step");
+    }
+
+    #[test]
+    fn a_force_down_an_unwired_pin_stops_on_the_check() {
+        let (mut doc, [ask, check, yes, _]) = gate();
+        doc.edges.retain(|e| e.to != yes);
+        let mut run = doc.begin(ask);
+        doc.choose(&mut run, check);
+        doc.force(&mut run, 1);
+        assert_eq!(run.path, vec![ask, check]);
+        assert!(
+            doc.offered(&run.path).is_none(),
+            "the panel says the flow stops here"
+        );
+        assert_eq!(
+            doc.checks_on_the_way(&run.path),
+            vec![1],
+            "and offers the check back"
+        );
+    }
+
+    #[test]
+    fn restart_keeps_what_was_changed_before_the_first_line() {
+        let (doc, [ask, check, yes, no]) = gate();
+        let mut run = doc.begin(ask);
+        doc.set_live(&mut run, "paid", Value::Bool(true));
+        doc.choose(&mut run, check);
+        doc.set_live(&mut run, "paid", Value::Bool(false));
+        doc.restart(&mut run);
+        assert_eq!(run.path, vec![ask]);
+        assert_eq!(run.sets.len(), 1, "only the value set on the opening line");
+        doc.choose(&mut run, check);
+        assert_eq!(run.path.last(), Some(&yes));
+
+        // Played from the check itself, the force *is* the opening.
+        let mut run = doc.begin(check);
+        assert_eq!(run.path, vec![check, no]);
+        doc.force(&mut run, 0);
+        doc.restart(&mut run);
+        assert_eq!(run.path, vec![check, yes]);
     }
 
     #[test]

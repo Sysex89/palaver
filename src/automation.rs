@@ -3,7 +3,8 @@
 //! `--features automation`, and `tools/shots.py` is the only thing meant to talk to it.
 //!
 //! **Every command goes through a handler the UI already uses** — a menu item's `fn`
-//! pointer, `Editor::select`, `jump_to`, `switch_pane`, `show_flow`, `play_advance`, or a
+//! pointer, `Editor::select`, `jump_to`, `switch_pane`, `show_flow`, `play_advance`,
+//! `play_force`, `play_rewind`, `play_set`, or a
 //! field's `set_content`, which the `sync_fields` observer then writes into the node exactly
 //! as typing does. Nothing here touches `Doc` directly, so a script can reach no state a
 //! person could not, and a screenshot never shows a state the UI cannot get into.
@@ -27,7 +28,7 @@ use std::time::Duration;
 
 use gpui::{Context, Focusable, Window, px, size};
 
-use crate::doc::{Doc, NodeKind};
+use crate::doc::{Doc, NodeKind, Value};
 use crate::settings::{TextFont, ThemePref, UiFont};
 use crate::{
     Editor, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection, SidePane, node_number,
@@ -269,11 +270,11 @@ fn run(
         // panel lists them: `Doc::offered` is the list both read, so a script can pick
         // nothing the panel does not show.
         "choose" => {
-            let path = editor.play.as_ref().ok_or("not playing")?;
+            let run = editor.play.as_ref().ok_or("not playing")?;
             let index: usize = rest.parse().map_err(|_| "expected a choice number")?;
             let offered = editor
                 .doc
-                .offered(path)
+                .offered(&run.path)
                 .ok_or("nothing is offered: the flow stopped here")?;
             let &(to, _, spent) = offered
                 .get(index)
@@ -282,6 +283,49 @@ fn run(
                 return Err("that choice is spent".into());
             }
             editor.play_advance(to, window, cx);
+            Ok(String::new())
+        }
+
+        // `force 0` — the first row of the play panel's "Checked on the way", as the panel
+        // lists them (`Doc::checks_on_the_way`), through the handler its button calls.
+        "force" => {
+            let run = editor.play.as_ref().ok_or("not playing")?;
+            let index: usize = rest.parse().map_err(|_| "expected a check number")?;
+            let checks = editor.doc.checks_on_the_way(&run.path);
+            let &at = checks
+                .get(index)
+                .ok_or_else(|| format!("only {} checks on the way", checks.len()))?;
+            editor.play_force(at, window, cx);
+            Ok(String::new())
+        }
+
+        // `rewind back`, `rewind restart` — the play panel's Back and Restart.
+        "rewind" => {
+            if editor.play.is_none() {
+                return Err("not playing".into());
+            }
+            let restart = match rest {
+                "back" => false,
+                "restart" => true,
+                other => return Err(format!("no rewind {other:?}")),
+            };
+            editor.play_rewind(restart, window, cx);
+            Ok(String::new())
+        }
+
+        // `live paid true`, `live gold 12` — a variable's value for the run going now, as a
+        // click in the variables pane sets it.
+        "live" => {
+            if editor.play.is_none() {
+                return Err("not playing".into());
+            }
+            let (name, value) = rest.split_once(' ').ok_or("expected a name and a value")?;
+            let value = match value.trim() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                n => Value::Int(n.parse().map_err(|_| format!("bad value {n:?}"))?),
+            };
+            editor.play_set(name.trim(), value, cx);
             Ok(String::new())
         }
 
@@ -424,7 +468,7 @@ fn state(editor: &Editor, window: &Window, cx: &gpui::App) -> String {
                 .join(",")
         ),
     };
-    let playing = match editor.play.as_ref().and_then(|path| path.last()) {
+    let playing = match editor.play.as_ref().and_then(|run| run.path.last()) {
         Some(&id) => node_number(doc, id).trim_start_matches("Node ").to_string(),
         None => "no".into(),
     };

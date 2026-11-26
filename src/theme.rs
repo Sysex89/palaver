@@ -280,6 +280,13 @@ pub fn danger() -> Rgba {
 pub fn playing() -> Rgba {
     success()
 }
+/// A value or a check the tester changed by hand in a play-through, rather than one the
+/// run reached on its own. The accent, since it is the tester's interaction — and not
+/// [`playing`], which is the same green as [`true_pin`], so a flag set true by hand read
+/// exactly like one the conversation set.
+pub fn by_hand() -> Rgba {
+    accent()
+}
 /// A node or edge the play-through has already passed. Fainter than [`playing`], so the
 /// current node is still the one bright thing.
 pub fn trail() -> Rgba {

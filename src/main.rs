@@ -15,7 +15,7 @@ mod theme;
 use doc::{
     Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
     MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R,
-    Problem, Ref, SCRIPT_EXT, SetOp, Severity, Step, Use, Value, VarState, View, WIRE_STUB,
+    Problem, Ref, Run, SCRIPT_EXT, SetOp, Severity, Step, Use, Value, VarState, View, WIRE_STUB,
     box_exit, clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup,
     route, snippet, split_set, with_default_extension,
 };
@@ -480,7 +480,7 @@ struct Editor {
     recovery_pending: bool,
     /// The play-through walked so far, last entry first — `None` when not playing. One vec
     /// carries the current node, Back and Restart.
-    play: Option<Vec<NodeId>>,
+    play: Option<Run>,
     /// Which list the left pane is showing. Its only new state: the cast rides the container
     /// and the text field the variables list already proved out, and a *third* pane was
     /// rejected because `window_pos` is the one place a new one breaks every hit test.
@@ -554,6 +554,9 @@ enum ValueTarget {
     Default(String),
     Effect(NodeId, String),
     Check(NodeId, String),
+    /// A variable's value in the play-through running now, not in the document: set by hand
+    /// from where the run stands, and gone when it stops.
+    Live(String),
 }
 
 /// Which side of a variable a `var_rows` list is editing: what an instruction writes, or
@@ -1592,7 +1595,7 @@ impl Editor {
     /// outranks the ordinary edge colour. An edge leaving a jump is not drawn at all: the
     /// node itself names its target, which is the whole point of the kind.
     fn edge_lines(&self) -> Vec<Wire> {
-        let path = self.play.as_deref().unwrap_or(&[]);
+        let path = self.play.as_ref().map_or(&[][..], |run| &run.path[..]);
         self.doc
             .edges
             .iter()
@@ -2338,6 +2341,10 @@ impl Editor {
             return;
         }
         self.play = None;
+        // A number typed into a live value belonged to the run that just ended.
+        if matches!(self.editing, Some(ValueTarget::Live(_))) {
+            self.editing = None;
+        }
         cx.notify();
     }
 
@@ -2362,9 +2369,9 @@ impl Editor {
     /// always ends on a node worth showing. The nodes walked *through* stay in it — that
     /// is what lets `Doc::vars_along` recompute the variables from the path alone.
     fn start_play(&mut self, at: NodeId, window: &Window, cx: &mut Context<Self>) {
-        let path = self.doc.start_walk(at);
-        self.follow(&path, window, cx);
-        self.play = Some(path);
+        let run = self.doc.begin(at);
+        self.follow(&run.path, window, cx);
+        self.play = Some(run);
         // A number being typed is dropped rather than held: `editing_target` hides it while
         // this runs, and it would otherwise come back, unasked, when the play-through ends.
         self.editing = None;
@@ -2373,13 +2380,49 @@ impl Editor {
 
     /// Advances the play-through, or ends it if the choice leads nowhere real.
     fn play_advance(&mut self, to: NodeId, window: &Window, cx: &mut Context<Self>) {
-        let Some(mut path) = self.play.take() else {
+        let Some(mut run) = self.play.take() else {
             return;
         };
-        self.doc.advance(&mut path, to);
-        self.follow(&path, window, cx);
-        self.play = Some(path);
+        self.doc.choose(&mut run, to);
+        self.follow(&run.path, window, cx);
+        self.play = Some(run);
         cx.notify();
+    }
+
+    /// Sends the condition at `at` in the run the other way, or back the way its check goes.
+    fn play_force(&mut self, at: usize, window: &Window, cx: &mut Context<Self>) {
+        let Some(mut run) = self.play.take() else {
+            return;
+        };
+        if self.doc.force(&mut run, at) {
+            self.follow(&run.path, window, cx);
+        }
+        self.play = Some(run);
+        cx.notify();
+    }
+
+    /// Back and Restart, the play panel's two rewinds.
+    fn play_rewind(&mut self, restart: bool, window: &Window, cx: &mut Context<Self>) {
+        let Some(mut run) = self.play.take() else {
+            return;
+        };
+        match restart {
+            true => self.doc.restart(&mut run),
+            false => _ = self.doc.back(&mut run),
+        }
+        self.follow(&run.path, window, cx);
+        self.play = Some(run);
+        cx.notify();
+    }
+
+    /// Sets a variable for the rest of this play-through, leaving its default alone. A
+    /// value of the wrong type is refused by the model and changes nothing.
+    fn play_set(&mut self, var: &str, value: Value, cx: &mut Context<Self>) {
+        if let Some(run) = self.play.as_mut()
+            && self.doc.set_live(run, var, value)
+        {
+            cx.notify();
+        }
     }
 
     /// Brings the node a play-through has arrived at into view.
@@ -3109,7 +3152,7 @@ impl Editor {
     /// Everything the canvas pane draws over the edge lines when it is showing a canvas:
     /// node boxes, labels, ports, the roots' rings and the marquee.
     fn canvas_children(&self, view: View) -> Vec<AnyElement> {
-        let playing = self.play.as_ref().and_then(|path| path.last().copied());
+        let playing = self.play.as_ref().and_then(|run| run.path.last().copied());
         let mut children: Vec<AnyElement> = self
             .doc
             .nodes_in(&self.flow)
@@ -3117,7 +3160,7 @@ impl Editor {
                 let passed = self
                     .play
                     .as_ref()
-                    .is_some_and(|path| path.contains(&node.id));
+                    .is_some_and(|run| run.path.contains(&node.id));
                 let target = (node.kind == NodeKind::Jump)
                     .then(|| self.doc.choices(node.id).first().map(|&(to, _)| to))
                     .flatten()
@@ -3460,10 +3503,12 @@ impl Editor {
     /// right-hand inspector is for.
     ///
     /// It stays up during play, where it switches from showing what each variable *starts*
-    /// at to what it stands at now, and goes read-only: a click that edited a default while
-    /// the pane displayed a live value would be editing one thing and showing another.
+    /// at to what it stands at now, and a click changes that live value for the run — never
+    /// the default, since a click that edited a default while the pane displayed a live value
+    /// would be editing one thing and showing another. Everything else in it is read-only
+    /// while a run is up.
     fn vars_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let playing = self.play.as_ref().map(|path| self.doc.vars_along(path));
+        let playing = self.play.as_ref().map(|run| self.doc.live_vars(run));
         // A rename the document has moved on from — undone, deleted, or in a file that has
         // since been closed — is simply not a rename any more.
         let renaming = self
@@ -3598,7 +3643,7 @@ impl Editor {
                     div()
                         .type_hint()
                         .text_color(theme::playing())
-                        .child("Live values — read-only"),
+                        .child("Live values — click one to change it for this run"),
                 )
             })
             // Whose the locked names are, once, above the list that marks them.
@@ -3994,12 +4039,12 @@ impl Editor {
     /// not a target any more, which is the filtering `renaming` gets and for the same reason:
     /// one place, rather than every site that could invalidate it.
     fn editing_target(&self) -> Option<&ValueTarget> {
-        // Not during a play-through, when the pane is live values and nothing in it edits:
-        // an editor opened before F5 stayed up over them, and its ✓ still wrote a default.
-        // Here, so the row that draws the editor and the ✓ that commits it both stand down.
-        if self.play.is_some() {
-            return None;
-        }
+        // A live value only while there is a run to hold it, and the document's values only
+        // while there is not — the pane shows one or the other, never both: an editor opened
+        // on a default before F5 stayed up over the live values, and its ✓ still wrote the
+        // default. Here, so the row that draws the editor and the ✓ that commits it both
+        // stand down.
+        let playing = self.play.is_some();
         // And still a number: retyped to a flag, the variable's row draws a checkbox with
         // no editor in it, and an editor left aimed at it would write a number onto a flag.
         let is_int = |name: &str| {
@@ -4008,9 +4053,10 @@ impl Editor {
                 .is_some_and(|variable| matches!(variable.default, Value::Int(_)))
         };
         self.editing.as_ref().filter(|target| match target {
-            ValueTarget::Default(name) => is_int(name),
+            ValueTarget::Live(name) => playing && is_int(name),
+            ValueTarget::Default(name) => !playing && is_int(name),
             ValueTarget::Effect(id, name) | ValueTarget::Check(id, name) => {
-                self.doc.node(*id).is_some() && is_int(name)
+                !playing && self.doc.node(*id).is_some() && is_int(name)
             }
         })
     }
@@ -4098,8 +4144,18 @@ impl Editor {
                             ValueTarget::Check(id, name) => {
                                 this.doc.condition_of(*id, name).map(|check| check.want)
                             }
+                            ValueTarget::Live(name) => this
+                                .play
+                                .as_ref()
+                                .and_then(|run| this.doc.live_vars(run).get(name).copied()),
                         };
                         if now == Some(value) {
+                            this.editing = None;
+                            return cx.notify();
+                        }
+                        // A run's value is not the document's: no undo step, no dirty flag.
+                        if let ValueTarget::Live(name) = &target {
+                            this.play_set(name, value, cx);
                             this.editing = None;
                             return cx.notify();
                         }
@@ -4116,6 +4172,7 @@ impl Editor {
                                 let op = this.doc.condition_of(*id, name).map_or(Cmp::Eq, |c| c.op);
                                 this.doc.set_condition(*id, name, Some(value), op);
                             }
+                            ValueTarget::Live(_) => {}
                         }
                         this.editing = None;
                         cx.notify();
@@ -4240,9 +4297,16 @@ impl Editor {
         let is_int = matches!(variable.default, Value::Int(_));
         // Declared by another tool for this session: shown and used, never changed here.
         let outside = self.doc.is_outside_variable(&variable.name);
-        let editing = self
-            .editing_target()
-            .is_some_and(|target| *target == ValueTarget::Default(name.clone()));
+        let editing = self.editing_target().is_some_and(|target| match target {
+            ValueTarget::Default(aimed) | ValueTarget::Live(aimed) => *aimed == name,
+            _ => false,
+        });
+        // Set by hand in the run going now: drawn in its own colour, so a value the run would
+        // not have reached on its own is never mistaken for one it did.
+        let by_hand = self
+            .play
+            .as_ref()
+            .is_some_and(|run| run.sets.iter().any(|set| set.var == name));
         let target = Ref::Variable(variable.name.clone());
         let used_by = self.used_by_toggle(("var-refs", i), &target, cx);
         let open = (self.used_by.as_ref() == Some(&target)).then(|| self.used_by_list(&target, cx));
@@ -4260,7 +4324,11 @@ impl Editor {
                     .gap_2()
                     .flex_1()
                     .min_w(px(0.0))
-                    .text_color(if on { theme::true_pin() } else { theme::text() })
+                    .text_color(match (by_hand, on) {
+                        (true, _) => theme::by_hand(),
+                        (false, true) => theme::true_pin(),
+                        (false, false) => theme::text(),
+                    })
                     .child(checkbox(
                         on,
                         if on {
@@ -4270,10 +4338,16 @@ impl Editor {
                         },
                     ))
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
-                    .when(playing.is_none() && !outside, |this| {
+                    // Live while playing — another tool's variable too, since a run's value
+                    // is not its declaration — and the default otherwise.
+                    .when(playing.is_some() || !outside, |this| {
+                        let live = playing.is_some();
                         this.cursor_pointer()
                             .hover(|style| style.text_color(theme::text()))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if live {
+                                    return this.play_set(&name, Value::Bool(!on), cx);
+                                }
                                 this.checkpoint();
                                 this.doc.set_default(&name, Value::Bool(!on));
                                 cx.notify();
@@ -4288,13 +4362,19 @@ impl Editor {
                     .flex_1()
                     .min_w(px(0.0))
                     .items_center()
-                    .text_color(theme::text())
+                    .text_color(if by_hand {
+                        theme::by_hand()
+                    } else {
+                        theme::text()
+                    })
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .child(if editing {
                         self.value_editor(cx).into_any_element()
-                    } else if playing.is_some() || outside {
-                        // Read-only while playing, like everything else in the pane, and
-                        // always when another tool declared it.
+                    } else if playing.is_some() {
+                        self.number_cell(("var-value", i), n, ValueTarget::Live(name), cx)
+                            .into_any_element()
+                    } else if outside {
+                        // Read-only when another tool declared it.
                         div()
                             .px_1()
                             .text_color(theme::text())
@@ -5026,10 +5106,115 @@ impl Editor {
             .collect()
     }
 
+    /// The play panel's "Checked on the way": one row per condition passed since the player
+    /// last stopped — what it checks, which pin it went down, and a button for the other
+    /// one. A forced row says so and offers to let the check choose again. `None` when the
+    /// walk here passed no check.
+    fn checks_list(&self, run: &Run, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let checks = self.doc.checks_on_the_way(&run.path);
+        if checks.is_empty() {
+            return None;
+        }
+        let rows = checks.into_iter().map(|at| {
+            let id = run.path[at];
+            let what =
+                self.doc
+                    .node(id)
+                    .map_or(String::new(), |node| match node.conditions.as_slice() {
+                        [] => "(checks nothing)".to_string(),
+                        checks => checks
+                            .iter()
+                            .map(|c| format!("{} {} {}", c.var, cmp_text(c.op), value_text(c.want)))
+                            .collect::<Vec<_>>()
+                            .join(" and "),
+                    });
+            // The pin taken is the edge to the next node; none when the run stopped here,
+            // because the pin it chose has nothing wired to it.
+            let went = run.path.get(at + 1).and_then(|&to| {
+                self.doc
+                    .edges
+                    .iter()
+                    .find(|e| e.from == id && e.to == to)
+                    .map(|e| e.branch)
+            });
+            let forced = run.forced.contains(&at);
+            let (went_text, went_color) = match went {
+                Some(true) => ("went true", theme::true_pin()),
+                Some(false) => ("went false", theme::false_pin()),
+                None => ("went nowhere", theme::danger()),
+            };
+            let action = match (forced, went) {
+                (true, _) => "Let it choose".to_string(),
+                (false, Some(pin)) => format!("Take {}", !pin),
+                // Stuck on a pin with nothing wired: the other is the only way on.
+                (false, None) => "Take the other".to_string(),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(icon(icon::CONDITION, 11.0, theme::kind_condition()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_color(theme::text())
+                                .one_line()
+                                .child(what),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(19.0))
+                        .child(div().text_color(went_color).child(went_text))
+                        // Its own element in its own colour, and spaced by hand: a flex gap
+                        // between two bare text runs rendered them as one word.
+                        .when(forced, |this| {
+                            this.child(div().ml_1().text_color(theme::by_hand()).child("by hand"))
+                        })
+                        .child(
+                            div()
+                                .id(("play-force", at))
+                                .ml_auto()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(theme::accent())
+                                .hover(|style| style.bg(theme::hover()))
+                                .child(action)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.play_force(at, window, cx)
+                                })),
+                        ),
+                )
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .pt_2()
+                .border_t_1()
+                .border_color(theme::divider())
+                .child(div().type_section().child("CHECKED ON THE WAY"))
+                .children(rows),
+        )
+    }
+
     /// The conversation as a reader meets it: what the current node says, and the choices
     /// leading out of it. Replaces the inspector while it is up, so the sidebar is never
     /// both an editor and a player.
-    fn play_panel(&self, path: &[NodeId], cx: &mut Context<Self>) -> impl IntoElement {
+    fn play_panel(&self, run: &Run, cx: &mut Context<Self>) -> impl IntoElement {
+        let path = &run.path[..];
         let row = |id: (&'static str, usize), label: String, color: Rgba| {
             div()
                 .id(id)
@@ -5179,31 +5364,25 @@ impl Editor {
                         this.child(
                             row(("play-nav", 0), "← Back".into(), theme::text_muted()).on_click(
                                 cx.listener(|this, _, window, cx| {
-                                    let Some(mut path) = this.play.take() else {
-                                        return;
-                                    };
-                                    this.doc.step_back(&mut path);
-                                    this.follow(&path, window, cx);
-                                    this.play = Some(path);
-                                    cx.notify();
+                                    this.play_rewind(false, window, cx)
                                 }),
                             ),
                         )
                     })
+                    // Re-walked rather than truncated, so a conversation that opens on an
+                    // instruction runs it again — keeping what was set by hand before the
+                    // first line, which is the run's starting state.
                     .child(
                         row(("play-nav", 1), "Restart".into(), theme::text_muted()).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                let Some(path) = this.play.as_ref() else {
-                                    return;
-                                };
-                                // Re-walked rather than truncated, so a conversation that
-                                // opens on an instruction runs it again.
-                                let seed = path[0];
-                                this.start_play(seed, window, cx);
-                            }),
+                            cx.listener(|this, _, window, cx| this.play_rewind(true, window, cx)),
                         ),
                     ),
             )
+            // The checks passed on the way here, each with the pin it went down and a way to
+            // send it down the other — the branch you want to test, without editing a
+            // default or replaying the route that sets the flag. Under the player's own
+            // controls, since it is the tester's tool and not part of the conversation.
+            .children(self.checks_list(run, cx))
     }
 
     /// The strip under the three panes: what is true of the *document and the view* rather
@@ -6516,8 +6695,8 @@ impl Editor {
                 .child(div().font_family(theme::text_font()).child(input.clone()))
         };
 
-        if let Some(path) = self.play.clone() {
-            return self.play_panel(&path, cx).into_any_element();
+        if let Some(run) = self.play.clone() {
+            return self.play_panel(&run, cx).into_any_element();
         }
 
         match (self.selection.only_node(), &self.selection) {
