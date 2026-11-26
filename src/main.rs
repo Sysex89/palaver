@@ -15,9 +15,9 @@ mod theme;
 use doc::{
     Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
     MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R,
-    Problem, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step, Use, Value, VarState, View,
-    WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port,
-    read_backup, route, snippet, split_set, with_default_extension,
+    Problem, RECORDING_EXT, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step, Use, Value,
+    VarState, View, WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell, map_hit,
+    node_center, out_port, read_backup, route, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
@@ -62,6 +62,7 @@ actions!(
         SaveAs,
         ExportFluent,
         ExportScreenplay,
+        ExportRecording,
         Open,
         Play,
         PlayFromHere,
@@ -217,6 +218,9 @@ const MENUS: &[MenuSpec] = &[
             }),
             ("Export Screenplay…", "", |e, w, cx| {
                 e.on_export_screenplay(&ExportScreenplay, w, cx)
+            }),
+            ("Export Recording Script…", "", |e, w, cx| {
+                e.on_export_recording(&ExportRecording, w, cx)
             }),
         ],
     ),
@@ -1065,6 +1069,17 @@ impl Editor {
     /// Writes the translatable strings out for a game build.
     fn on_export_fluent(&mut self, _: &ExportFluent, window: &mut Window, cx: &mut Context<Self>) {
         self.export(FTL_EXT, Doc::export_ftl, window, cx);
+    }
+
+    /// Writes every line a voice records as a spreadsheet, keyed like the `.ftl`, for booking
+    /// and running a session.
+    fn on_export_recording(
+        &mut self,
+        _: &ExportRecording,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.export(RECORDING_EXT, Doc::export_recording_script, window, cx);
     }
 
     /// Writes the dialogue out as a script for a table read or a recording session.
@@ -3046,6 +3061,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_save_as))
             .on_action(cx.listener(Self::on_export_fluent))
             .on_action(cx.listener(Self::on_export_screenplay))
+            .on_action(cx.listener(Self::on_export_recording))
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_play))
             .on_action(cx.listener(Self::on_play_from_here))

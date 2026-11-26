@@ -21,6 +21,8 @@ pub const FTL_EXT: &str = "ftl";
 
 /// Extension of a screenplay, written by [`Doc::export_screenplay`].
 pub const SCRIPT_EXT: &str = "md";
+/// The recording script's extension: a spreadsheet, the form a booth session is booked in.
+pub const RECORDING_EXT: &str = "csv";
 
 /// Gives the path an extension unless it already has one.
 pub fn with_default_extension(path: PathBuf, ext: &str) -> PathBuf {
@@ -3523,10 +3525,11 @@ impl Doc {
             // finds nothing — and a blank node is already `Problem::Empty`, so the document
             // says so where the author reads it.
             if let Some(text) = node.player_text().filter(|t| !t.trim().is_empty()) {
+                out += &ftl_comment(&self.context(Line::Node(node.id)));
                 if node.is_placeholder() {
                     out += PLACEHOLDER_FTL;
                 }
-                out += &Self::ftl_entry(&format!("node-{}", node.id), text);
+                out += &Self::ftl_entry(&node_key(node.id), text);
             }
         }
         // A label is a choice only where the player chooses: out of a condition it is a
@@ -3537,10 +3540,11 @@ impl Doc {
                 .node(edge.from)
                 .is_some_and(|n| n.player_text().is_some());
             if chosen && !edge.label.trim().is_empty() {
+                out += &ftl_comment(&self.context(Line::Edge(edge.from, edge.to)));
                 if self.is_placeholder_choice(edge) {
                     out += PLACEHOLDER_FTL;
                 }
-                out += &Self::ftl_entry(&format!("edge-{}-{}", edge.from, edge.to), &edge.label);
+                out += &Self::ftl_entry(&edge_key(edge.from, edge.to), &edge.label);
             }
         }
         out
@@ -3957,6 +3961,169 @@ impl Doc {
         std::fs::write(path, self.to_screenplay()).map_err(|e| e.to_string())
     }
 
+    /// What the player last read or picked before reaching `id`, quoted the way a context
+    /// column writes it: back along the first-drawn edge in, through whatever plumbing the
+    /// walk passes unseen, to the first node that [`Doc::pauses_play`] — and if the edge out
+    /// of it is a choice, the choice, since that is what the line answers ("Two coppers a
+    /// night" answers "A room for the night?", not the hub's "Anything else?"). `None` at the
+    /// top of a conversation, past a loop of plumbing, or where the line found is blank. The
+    /// first way in, not every way in: a line reached from three places names one of them.
+    fn heard_before(&self, id: NodeId) -> Option<String> {
+        let mut seen = HashSet::from([id]);
+        let mut at = id;
+        loop {
+            let edge = self.edges.iter().find(|e| e.to == at)?;
+            if !seen.insert(edge.from) {
+                return None;
+            }
+            if self.node(edge.from).is_some() && self.pauses_play(edge.from) {
+                return match self.choice_label(edge) {
+                    "" => self.said(self.node(edge.from)?),
+                    label => Some(format!("the choice \"{}\"", clip(label))),
+                };
+            }
+            at = edge.from;
+        }
+    }
+
+    /// What a line is, for someone who has only the line: who says it, or that it is a
+    /// heading or a choice, and the line it follows — `Innkeeper, after Player: "Where am
+    /// I?"`. Empty when there is nothing to say. The one rule the `.ftl`'s comments and the
+    /// recording script's columns are both written from, so a translator and an actor are
+    /// told the same thing about a line.
+    pub fn context(&self, line: Line) -> String {
+        let (who, before) = match line {
+            Line::Node(id) => {
+                let Some(node) = self.node(id) else {
+                    return String::new();
+                };
+                let who = match node.kind {
+                    NodeKind::Hub => "Heading over the player's choices".to_string(),
+                    _ => node.player_speaker().unwrap_or("").trim().to_string(),
+                };
+                (who, self.heard_before(id))
+            }
+            Line::Edge(from, _) => (
+                "Player's choice".to_string(),
+                self.node(from).and_then(|node| self.said(node)),
+            ),
+        };
+        match (who.is_empty(), before) {
+            (_, None) => who,
+            (true, Some(before)) => format!("after {before}"),
+            (false, Some(before)) => format!("{who}, after {before}"),
+        }
+    }
+
+    /// A line as a context column quotes it: its speaker and its first line, cut to a
+    /// length a comment can hold. `None` for a blank one, which says nothing.
+    fn said(&self, node: &Node) -> Option<String> {
+        let text = node.player_text()?.trim().lines().next()?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let text = clip(text);
+        Some(match node.player_speaker().map(str::trim).unwrap_or("") {
+            "" => format!("\"{text}\""),
+            speaker => format!("{speaker}: \"{text}\""),
+        })
+    }
+
+    /// The recording script: every string [`Doc::to_ftl`] writes, one row each, keyed by the
+    /// same key — so a take named after its key is matched to its line, its translations
+    /// and the game's lookup by one name. In the screenplay's order, with the section it is
+    /// in (`§4`), so the two documents can be read side by side; who says it, so a session
+    /// can be booked by sorting on one column; the line it follows; the line's tags, where
+    /// `#vo.recorded` lives; and whether it is still a placeholder.
+    ///
+    /// CSV by RFC 4180 — a field holding a comma, a quote or a line break is quoted, its
+    /// quotes doubled — and no dependency, for the reason the `.ftl` writer has none. It
+    /// opens with a UTF-8 byte-order mark: Excel, where a booth's spreadsheet usually lives,
+    /// reads a CSV without one in the system's legacy encoding and garbles `§`, `…` and every
+    /// accented line. A spreadsheet hides the mark; code reading the file should open it as
+    /// `utf-8-sig`, or the first header is `\u{feff}key`.
+    // ponytail: a line opening with `=`, `+`, `-` or `@` is read as a formula by Excel on
+    // open (LibreOffice asks first). Written verbatim, since the key column is what a
+    // pipeline reads back; prefix a `'` in the cell if a booth ever trips on one.
+    pub fn to_recording_script(&self) -> String {
+        let (sections, number) = self.script_blocks();
+        let mut out =
+            String::from("\u{feff}key,character,kind,line,after,section,tags,placeholder\r\n");
+        let mut row = |fields: [&str; 8]| {
+            let cells: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
+            out += &cells.join(",");
+            out += "\r\n";
+        };
+        for (_, blocks) in sections {
+            for chain in blocks {
+                let section = number
+                    .get(&chain[0])
+                    .map_or(String::new(), |n| format!("§{n}"));
+                for &id in &chain {
+                    let Some(node) = self.node(id) else { continue };
+                    if let Some(text) = node.player_text().filter(|t| !t.trim().is_empty()) {
+                        let (character, kind) = match node.kind {
+                            NodeKind::Hub => ("", "heading"),
+                            _ => (node.player_speaker().unwrap_or("").trim(), "line"),
+                        };
+                        let tags: Vec<String> = node.tags.iter().map(|t| format!("#{t}")).collect();
+                        row([
+                            &node_key(id),
+                            character,
+                            kind,
+                            text.trim(),
+                            &self.after(Line::Node(id)),
+                            &section,
+                            &tags.join(" "),
+                            if node.is_placeholder() { "yes" } else { "" },
+                        ]);
+                    }
+                    // Its choices straight after it: the player says them next. The same
+                    // filter `to_ftl` puts a label through.
+                    if node.player_text().is_none() {
+                        continue;
+                    }
+                    for edge in self.edges.iter().filter(|e| e.from == id) {
+                        if edge.label.trim().is_empty() {
+                            continue;
+                        }
+                        row([
+                            &edge_key(edge.from, edge.to),
+                            "",
+                            "choice",
+                            edge.label.trim(),
+                            &self.after(Line::Edge(edge.from, edge.to)),
+                            &section,
+                            "",
+                            if self.is_placeholder_choice(edge) {
+                                "yes"
+                            } else {
+                                ""
+                            },
+                        ]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The line a recording-script row follows, as its "after" column quotes it: the part of
+    /// [`Doc::context`] after "after ", since the row already says who speaks.
+    fn after(&self, line: Line) -> String {
+        match line {
+            Line::Node(id) => self.heard_before(id),
+            Line::Edge(from, _) => self.node(from).and_then(|node| self.said(node)),
+        }
+        .unwrap_or_default()
+    }
+
+    /// Writes [`Doc::to_recording_script`]. `&self` for the reason [`Doc::export_ftl`] takes
+    /// it: an export is not a save.
+    pub fn export_recording_script(&self, path: &Path) -> Result<(), String> {
+        std::fs::write(path, self.to_recording_script()).map_err(|e| e.to_string())
+    }
+
     /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
     /// title keeps its `*` and the close guard keeps asking.
     pub fn write_backup(&self, origin: Option<&Path>) -> Result<(), String> {
@@ -4174,6 +4341,49 @@ type ScriptSection<'a> = (&'a str, Vec<Vec<NodeId>>);
 /// translator or a reader at a table read knows it is not the script. A Fluent comment —
 /// it attaches to the entry under it, so tools keep it with the string.
 const PLACEHOLDER_FTL: &str = "# placeholder\n";
+
+/// A node's translation key, which the `.ftl`, the recording script and a game all look
+/// the line up by: the id, never the alias, which an author may rename.
+pub fn node_key(id: NodeId) -> String {
+    format!("node-{id}")
+}
+
+/// A choice's translation key: by its ends, since an edge's index changes with any removal.
+pub fn edge_key(from: NodeId, to: NodeId) -> String {
+    format!("edge-{from}-{to}")
+}
+
+/// A line of [`Doc::context`] as an FTL comment, which a parser attaches to the message
+/// right under it: a single `#`, on one line, or nothing when there is no context. Written
+/// above the `# placeholder` mark, so the two read as one comment and the mark still sits
+/// directly over its entry.
+fn ftl_comment(context: &str) -> String {
+    match context.trim() {
+        "" => String::new(),
+        context => format!("# {}\n", context.replace(['\r', '\n'], " ")),
+    }
+}
+
+/// A line cut to the length a context comment or column can hold, with `…` where it was cut.
+fn clip(text: &str) -> String {
+    const MOST: usize = 60;
+    match text.chars().count() > MOST {
+        true => format!(
+            "{}…",
+            text.chars().take(MOST).collect::<String>().trim_end()
+        ),
+        false => text.to_string(),
+    }
+}
+
+/// One CSV field by RFC 4180: quoted when it holds a comma, a quote or a line break, with
+/// its quotes doubled; bare otherwise.
+fn csv_field(field: &str) -> String {
+    match field.contains([',', '"', '\n', '\r']) {
+        true => format!("\"{}\"", field.replace('"', "\"\"")),
+        false => field.to_string(),
+    }
+}
 const PLACEHOLDER_SCRIPT: &str = " *(placeholder)*";
 
 fn flow_title(flow: &str) -> &str {
@@ -8094,15 +8304,110 @@ mod tests {
     }
 
     /// A display name with a space in it is not a Fluent identifier, and it is already the
-    /// key `rename_character` finds and replaces.
+    /// key `rename_character` finds and replaces — so a speaker is never an entry. It is in
+    /// the comment over the line, which is context for the translator and nothing a parser
+    /// reads as a message.
     #[test]
-    fn ftl_leaves_speaker_names_out() {
+    fn ftl_writes_a_speaker_only_as_a_comment() {
         let mut doc = Doc::default();
         let a = spoken(&mut doc, 0.0, 0.0);
         doc.node_mut(a).unwrap().speaker = "Innkeeper".into();
         doc.node_mut(a).unwrap().text = "Ale?".into();
 
-        assert!(!doc.to_ftl().contains("Innkeeper"));
+        let ftl = doc.to_ftl();
+        assert_eq!(ftl, format!("# Innkeeper\nnode-{a} = Ale?\n"));
+        assert!(
+            ftl.lines()
+                .filter(|line| !line.starts_with('#'))
+                .all(|line| !line.contains("Innkeeper"))
+        );
+    }
+
+    #[test]
+    fn context_names_the_line_before_through_the_plumbing() {
+        let mut doc = Doc::default();
+        let ask = doc.add_node(0.0, 0.0);
+        let step = doc.add_node(400.0, 0.0);
+        let answer = doc.add_node(800.0, 0.0);
+        doc.node_mut(step).unwrap().kind = NodeKind::Instruction;
+        for (id, speaker, text) in [
+            (ask, "Player", "Where am I?\nAnd who are you?"),
+            (answer, "Innkeeper", "Sern's Rest."),
+        ] {
+            doc.node_mut(id).unwrap().speaker = speaker.into();
+            doc.node_mut(id).unwrap().text = text.into();
+        }
+        doc.add_edge(ask, step);
+        doc.add_edge(step, answer);
+
+        assert_eq!(
+            doc.context(Line::Node(answer)),
+            "Innkeeper, after Player: \"Where am I?\"",
+            "through the instruction, and the first line only"
+        );
+        assert_eq!(
+            doc.context(Line::Node(ask)),
+            "Player",
+            "nothing before the top"
+        );
+        assert_eq!(
+            doc.context(Line::Edge(ask, step)),
+            "Player's choice, after Player: \"Where am I?\""
+        );
+
+        doc.node_mut(ask).unwrap().text = "x".repeat(100);
+        assert!(
+            doc.context(Line::Node(answer)).ends_with("…\""),
+            "a long line is cut"
+        );
+
+        // Reached by a choice, a line answers the choice, not the line that offered it.
+        let edge = doc.edges.iter_mut().find(|e| e.from == ask).unwrap();
+        edge.label = "Who runs this place?".into();
+        assert_eq!(
+            doc.context(Line::Node(answer)),
+            "Innkeeper, after the choice \"Who runs this place?\""
+        );
+    }
+
+    #[test]
+    fn the_recording_script_has_a_row_for_every_ftl_key_and_no_other() {
+        let doc = Doc::sample();
+        let ftl_keys: HashSet<String> = doc
+            .to_ftl()
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.starts_with(' '))
+            .filter_map(|line| line.split_once(" =").map(|(key, _)| key.to_string()))
+            .collect();
+        let script = doc.to_recording_script();
+        let mut rows = script
+            .trim_start_matches('\u{feff}')
+            .split("\r\n")
+            .filter(|row| !row.is_empty());
+        assert_eq!(
+            rows.next(),
+            Some("key,character,kind,line,after,section,tags,placeholder")
+        );
+        let script_keys: HashSet<String> = rows
+            .filter_map(|row| row.split(',').next())
+            .filter(|key| key.starts_with("node-") || key.starts_with("edge-"))
+            .map(str::to_string)
+            .collect();
+        assert!(!ftl_keys.is_empty());
+        assert_eq!(script_keys, ftl_keys);
+        assert!(
+            script.starts_with('\u{feff}'),
+            "a BOM, so Excel reads it as UTF-8"
+        );
+        assert!(script.contains(",Innkeeper,line,\"You look lost, traveler.\",,§1,"));
+    }
+
+    #[test]
+    fn a_recording_script_field_is_quoted_only_when_it_has_to_be() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a, b"), "\"a, b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("one\ntwo"), "\"one\ntwo\"");
     }
 
     /// An FTL value ends at the first unindented line, so a multi-line one becomes a block —
@@ -9135,7 +9440,10 @@ mod tests {
         let node = doc.node_mut(hub).unwrap();
         node.kind = NodeKind::Hub;
         node.text = "Anything else?".into();
-        assert_eq!(doc.to_ftl(), format!("node-{hub} = Anything else?\n"));
+        assert_eq!(
+            doc.to_ftl(),
+            format!("# Heading over the player's choices\nnode-{hub} = Anything else?\n")
+        );
     }
 
     /// Greek writes a final sigma differently, and a string-wise lowercase picks one form
