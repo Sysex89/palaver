@@ -7937,6 +7937,23 @@ fn main() {
             std::process::exit(if why.is_empty() { 0 } else { 2 });
         }
     };
+    // An export writes and leaves: before the hand-over, or a build step run while the file
+    // is open would hand itself to the window and write nothing, and before gpui, so it needs
+    // no display.
+    if !request.exports.is_empty() {
+        match link::export(&request, &mut std::io::stdout().lock()) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    eprintln!("palaver: {warning}");
+                }
+                return;
+            }
+            Err(why) => {
+                eprintln!("palaver: {why}");
+                std::process::exit(1);
+            }
+        }
+    }
     // A file already open in a window is shown there, not opened twice (`link.rs`).
     #[cfg(unix)]
     if let Some(file) = &request.file

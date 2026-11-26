@@ -3475,25 +3475,11 @@ impl Doc {
 
     // ponytail: file IO runs on the foreground executor; fine for documents this size.
     //
-    // Written beside the file and renamed over it, as the crash copy is: a plain write
-    // truncates the author's only copy first, and a kill or a full disk half-way leaves
-    // neither the old document nor the new. Through a symlink, to the file it names; the
-    // file's own permissions are kept.
+    // Through `write_replacing`, beside the file and renamed over it, as the crash copy is:
+    // a plain write truncates the author's only copy first, and a kill or a full disk
+    // half-way leaves neither the old document nor the new.
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
-        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let mut name = target.file_name().unwrap_or_default().to_os_string();
-        name.push(".tmp");
-        let temp = target.with_file_name(name);
-        let written = std::fs::write(&temp, self.to_json())
-            .and_then(|()| match std::fs::metadata(&target) {
-                Ok(old) => std::fs::set_permissions(&temp, old.permissions()),
-                Err(_) => Ok(()),
-            })
-            .and_then(|()| std::fs::rename(&temp, &target));
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&temp);
-            return Err(error.to_string());
-        }
+        write_replacing(path, &self.to_json())?;
         self.dirty = false;
         Ok(())
     }
@@ -3617,7 +3603,7 @@ impl Doc {
     /// export is not a save: it must not clear `dirty`, drop the crash copy, or become the
     /// document's own path.
     pub fn export_ftl(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_ftl()).map_err(|e| e.to_string())
+        write_replacing(path, &self.to_ftl())
     }
 
     /// Every node that refers to `target`, in document order, with the field it does it
@@ -3958,7 +3944,7 @@ impl Doc {
 
     /// Writes [`Doc::to_screenplay`]. `&self` for the reason [`Doc::export_ftl`] takes it.
     pub fn export_screenplay(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_screenplay()).map_err(|e| e.to_string())
+        write_replacing(path, &self.to_screenplay())
     }
 
     /// What the player last read or picked before reaching `id`, quoted the way a context
@@ -4121,7 +4107,7 @@ impl Doc {
     /// Writes [`Doc::to_recording_script`]. `&self` for the reason [`Doc::export_ftl`] takes
     /// it: an export is not a save.
     pub fn export_recording_script(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_recording_script()).map_err(|e| e.to_string())
+        write_replacing(path, &self.to_recording_script())
     }
 
     /// Writes a crash copy. Deliberately *not* [`Doc::save`]: `dirty` stays set, so the
@@ -4341,6 +4327,29 @@ type ScriptSection<'a> = (&'a str, Vec<Vec<NodeId>>);
 /// translator or a reader at a table read knows it is not the script. A Fluent comment —
 /// it attaches to the entry under it, so tools keep it with the string.
 const PLACEHOLDER_FTL: &str = "# placeholder\n";
+
+/// Writes `text` to `path` beside it and renames it over, so the file is never seen half
+/// written: a kill or a full disk half-way leaves the old file, not a truncated one. A save
+/// needs it because a plain write truncates the author's only copy first; an export needs it
+/// because a build may be watching for the file to change and read it the moment it does.
+/// Through a symlink, to the file it names; the file's own permissions are kept.
+pub fn write_replacing(path: &Path, text: &str) -> Result<(), String> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let temp = target.with_file_name(name);
+    let written = std::fs::write(&temp, text)
+        .and_then(|()| match std::fs::metadata(&target) {
+            Ok(old) => std::fs::set_permissions(&temp, old.permissions()),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
 
 /// A node's translation key, which the `.ftl`, the recording script and a game all look
 /// the line up by: the id, never the alias, which an author may rename.

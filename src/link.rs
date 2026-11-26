@@ -25,13 +25,63 @@
 //! `.dln`. A later launch hands its file over with its place, so a window already open
 //! picks up names the tool has added since.
 //!
+//! **`--export-ftl`, `--export-screenplay` and `--export-recording` write those documents
+//! from FILE and open no window** — a build step, typically the `--after-save` command
+//! itself: `palaver "$PALAVER_FILE" --export-ftl strings.ftl`. They run before the hand-over,
+//! or an export launched while the file was open would hand itself to the window and write
+//! nothing, and before gpui starts, so a build machine with no display can run them. `-` is
+//! standard output. The flags that are only about a window — `--flow`, `--node`,
+//! `--after-save`, `--declarations` — are refused beside them rather than ignored.
+//!
 //! [`Doc::find_node`]: crate::doc::Doc::find_node
 //! [`Declarations`]: crate::doc::Declarations
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::doc::{Doc, Problem};
+
 pub const USAGE: &str = "usage: palaver [FILE] [--flow NAME] [--node ALIAS|ID] \
-     [--after-save COMMAND] [--declarations FILE]";
+     [--after-save COMMAND] [--declarations FILE]
+       palaver FILE [--export-ftl PATH] [--export-screenplay PATH] [--export-recording PATH]
+         writes the exports and opens no window; PATH - is standard output";
+
+/// One of the documents the File menu exports, as the command line names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Export {
+    Ftl,
+    Screenplay,
+    Recording,
+}
+
+impl Export {
+    const ALL: [Export; 3] = [Export::Ftl, Export::Screenplay, Export::Recording];
+
+    fn flag(self) -> &'static str {
+        match self {
+            Export::Ftl => "--export-ftl",
+            Export::Screenplay => "--export-screenplay",
+            Export::Recording => "--export-recording",
+        }
+    }
+
+    /// The same text the File menu writes, and through the same `Doc` function for a file.
+    fn text(self, doc: &Doc) -> String {
+        match self {
+            Export::Ftl => doc.to_ftl(),
+            Export::Screenplay => doc.to_screenplay(),
+            Export::Recording => doc.to_recording_script(),
+        }
+    }
+
+    fn write(self, doc: &Doc, path: &Path) -> Result<(), String> {
+        match self {
+            Export::Ftl => doc.export_ftl(path),
+            Export::Screenplay => doc.export_screenplay(path),
+            Export::Recording => doc.export_recording_script(path),
+        }
+    }
+}
 
 /// What the command line asked for.
 #[derive(Debug, Default, PartialEq)]
@@ -41,6 +91,9 @@ pub struct Request {
     pub node: Option<String>,
     pub after_save: Option<String>,
     pub declarations: Option<PathBuf>,
+    /// Each document to write and where, in the order asked; `-` is standard output. Not
+    /// empty means no window opens.
+    pub exports: Vec<(Export, String)>,
 }
 
 /// Reads the arguments after the program's name. `Err("")` is a request for the usage
@@ -57,6 +110,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Request, String> 
             "--declarations" => {
                 request.declarations = Some(PathBuf::from(value("--declarations")?));
             }
+            flag if Export::ALL.iter().any(|export| export.flag() == flag) => {
+                let export = Export::ALL.into_iter().find(|e| e.flag() == flag).unwrap();
+                if request.exports.iter().any(|(given, _)| *given == export) {
+                    return Err(format!("{flag} given twice"));
+                }
+                request.exports.push((export, value(flag)?));
+            }
             "-h" | "--help" => return Err(String::new()),
             option if option.starts_with("--") => return Err(format!("unknown option {option}")),
             file => {
@@ -67,7 +127,67 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Request, String> 
             }
         }
     }
+    if !request.exports.is_empty() {
+        if request.file.is_none() {
+            return Err("an export needs the FILE to export".into());
+        }
+        let window_only = [
+            ("--flow", request.flow.is_some()),
+            ("--node", request.node.is_some()),
+            ("--after-save", request.after_save.is_some()),
+            ("--declarations", request.declarations.is_some()),
+        ];
+        if let Some((flag, _)) = window_only.iter().find(|(_, given)| *given) {
+            return Err(format!(
+                "{flag} is for the window, and an export opens none"
+            ));
+        }
+        if request
+            .exports
+            .iter()
+            .filter(|(_, path)| path == "-")
+            .count()
+            > 1
+        {
+            return Err("only one export can go to standard output (-)".into());
+        }
+    }
     Ok(request)
+}
+
+/// Writes every export `request` asks for from its FILE as saved on disk, in the order
+/// asked, and opens no window. `Ok` carries what is worth saying on stderr even when it
+/// worked — lines still marked as placeholders, which the File menu asks about and a build
+/// script cannot be asked — and `Err` the first thing that failed; an export already written
+/// stays written. Standard output is `out`, so a test can read it.
+pub fn export(request: &Request, out: &mut impl Write) -> Result<Vec<String>, String> {
+    let file = request
+        .file
+        .as_deref()
+        .ok_or("an export needs the FILE to export")?;
+    let doc = Doc::load(file).map_err(|why| format!("{}: {why}", file.display()))?;
+    for (export, path) in &request.exports {
+        if path == "-" {
+            out.write_all(export.text(&doc).as_bytes())
+                .map_err(|why| format!("standard output: {why}"))?;
+        } else {
+            export
+                .write(&doc, Path::new(path))
+                .map_err(|why| format!("{path}: {why}"))?;
+        }
+    }
+    let placeholders = doc
+        .problems()
+        .iter()
+        .filter(|p| matches!(p, Problem::Placeholder(_) | Problem::PlaceholderChoice(_)))
+        .count();
+    Ok(match placeholders {
+        0 => Vec::new(),
+        1 => vec!["1 line is still a placeholder; it is marked in the export".into()],
+        n => vec![format!(
+            "{n} lines are still placeholders; they are marked in the export"
+        )],
+    })
 }
 
 /// How an after-save command went: whether it succeeded, and a line to say about it.
@@ -283,6 +403,113 @@ mod tests {
         );
         assert_eq!(parse(args("a.dln b.dln")), Err("one file at a time".into()));
         assert_eq!(parse(args("--help")), Err(String::new()));
+    }
+
+    #[test]
+    fn the_command_line_reads_exports_and_refuses_what_only_a_window_uses() {
+        let request = parse(args(
+            "talk.dln --export-ftl out/strings.ftl --export-recording - --export-screenplay s.md",
+        ))
+        .unwrap();
+        assert_eq!(
+            request.exports,
+            vec![
+                (Export::Ftl, "out/strings.ftl".into()),
+                (Export::Recording, "-".into()),
+                (Export::Screenplay, "s.md".into()),
+            ],
+            "in the order asked"
+        );
+
+        assert_eq!(
+            parse(args("--export-ftl a.ftl")),
+            Err("an export needs the FILE to export".into())
+        );
+        assert_eq!(
+            parse(args("talk.dln --export-ftl a.ftl --export-ftl b.ftl")),
+            Err("--export-ftl given twice".into())
+        );
+        assert_eq!(
+            parse(args("talk.dln --export-ftl - --export-screenplay -")),
+            Err("only one export can go to standard output (-)".into())
+        );
+        for window in ["--flow road", "--node intro", "--declarations n.json"] {
+            let flag = window.split_whitespace().next().unwrap();
+            assert_eq!(
+                parse(args(&format!("talk.dln --export-ftl a.ftl {window}"))),
+                Err(format!(
+                    "{flag} is for the window, and an export opens none"
+                ))
+            );
+        }
+        assert_eq!(
+            parse(args("talk.dln --export-ftl")),
+            Err("--export-ftl needs a value".into())
+        );
+    }
+
+    #[test]
+    fn an_export_writes_what_the_file_menu_writes_and_opens_nothing() {
+        let folder = std::env::temp_dir().join(format!("palaver-export-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut doc = Doc::sample();
+        let file = folder.join("talk.dln");
+        doc.save(&file).unwrap();
+
+        let ftl = folder.join("strings.ftl");
+        let script = folder.join("talk.md");
+        let line = format!(
+            "{} --export-ftl {} --export-screenplay {} --export-recording -",
+            file.display(),
+            ftl.display(),
+            script.display()
+        );
+        let mut out = Vec::new();
+        let said = export(&parse(args(&line)).unwrap(), &mut out).unwrap();
+
+        assert!(said.is_empty(), "the sample has no placeholders: {said:?}");
+        assert_eq!(std::fs::read_to_string(&ftl).unwrap(), doc.to_ftl());
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            doc.to_screenplay()
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), doc.to_recording_script());
+        assert!(
+            !folder.join("strings.ftl.tmp").exists(),
+            "written beside and renamed"
+        );
+
+        // A placeholder is said on stderr, not refused: the build goes on, as "Export anyway".
+        let id = doc.nodes[0].id;
+        doc.write_placeholder(crate::doc::Line::Node(id), "Evening.", id);
+        doc.save(&file).unwrap();
+        let said = export(&parse(args(&line)).unwrap(), &mut Vec::new()).unwrap();
+        assert_eq!(
+            said,
+            ["1 line is still a placeholder; it is marked in the export"]
+        );
+
+        let missing = folder.join("gone.dln");
+        let request = parse(args(&format!("{} --export-ftl -", missing.display()))).unwrap();
+        let failed = export(&request, &mut Vec::new()).unwrap_err();
+        assert!(
+            failed.starts_with(&missing.display().to_string()),
+            "{failed}"
+        );
+
+        let request = parse(args(&format!(
+            "{} --export-ftl {}",
+            file.display(),
+            folder.join("no/such/folder.ftl").display()
+        )))
+        .unwrap();
+        assert!(
+            export(&request, &mut Vec::new())
+                .unwrap_err()
+                .contains("no/such/folder.ftl")
+        );
+
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     #[cfg(unix)]
