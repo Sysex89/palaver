@@ -1056,6 +1056,13 @@ pub struct Fragment {
     edges: Vec<Edge>,
 }
 
+/// Which way [`Doc::move_choice`] moves a choice in its node's list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    Earlier,
+    Later,
+}
+
 /// The value of [`Fragment`]'s `palaver` field. Versioned so a later build that changes the
 /// shape can refuse an old fragment instead of misreading it.
 const FRAGMENT_MARK: &str = "fragment/1";
@@ -2266,6 +2273,43 @@ impl Doc {
             }
         }
         fragment.nodes.iter().map(|n| fresh[&n.id]).collect()
+    }
+
+    /// The indices of the edges leaving `id`, in the order the walk, the play panel and the
+    /// screenplay read them — which is the order of `edges` and nothing else.
+    pub fn edges_from(&self, id: NodeId) -> Vec<usize> {
+        self.edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.from == id)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Where edge `index` would land if moved one place `step` among the edges leaving the
+    /// same node — the index of the sibling it would trade places with — or `None` when it is
+    /// already at that end, or there is no such edge. The pre-checkpoint check for
+    /// [`Doc::move_choice`].
+    pub fn choice_step(&self, index: usize, step: Step) -> Option<usize> {
+        let from = self.edges.get(index)?.from;
+        let siblings = self.edges_from(from);
+        match step {
+            Step::Earlier => siblings.into_iter().rev().find(|&i| i < index),
+            Step::Later => siblings.into_iter().find(|&i| i > index),
+        }
+    }
+
+    /// Moves a choice one place earlier or later in its node's list, and returns its new
+    /// index. The order is the order of `edges`, so this trades the edge with its neighbouring
+    /// sibling and touches no other edge: every reader of the order — `choices`, `offered`,
+    /// the walk's first edge out of plumbing, the screenplay — follows for nothing, and the
+    /// file needs no new field. `.ftl` keys name an edge by its ends, not its index, so a
+    /// translation survives the move. `None`, with nothing changed, where
+    /// [`Doc::choice_step`] refuses.
+    pub fn move_choice(&mut self, index: usize, step: Step) -> Option<usize> {
+        let other = self.choice_step(index, step)?;
+        self.edges.swap(index, other);
+        Some(other)
     }
 
     /// Whether [`Doc::split_edge`] would put a `kind` node into edge `index`: the edge exists
@@ -5378,6 +5422,95 @@ mod tests {
         assert_eq!(before, after);
         assert!(doc.has_edge(answer, new) && doc.has_edge(new, hub));
         assert!(no_box_covers_another(&doc, ""));
+    }
+
+    /// A hub with three choices, and an edge from elsewhere between them in `edges`, so a
+    /// move that touched anything but the two siblings would show.
+    fn three_choices() -> (Doc, NodeId, [NodeId; 3]) {
+        let mut doc = Doc::default();
+        let hub = doc.add_node(0.0, 0.0);
+        doc.node_mut(hub).unwrap().kind = NodeKind::Hub;
+        let a = doc.add_node(400.0, 0.0);
+        let b = doc.add_node(400.0, 200.0);
+        let c = doc.add_node(400.0, 400.0);
+        let stranger = doc.add_node(800.0, 0.0);
+        doc.add_edge(hub, a);
+        doc.add_edge(a, stranger);
+        doc.add_edge(hub, b);
+        doc.add_edge(hub, c);
+        for (index, label) in [(0, "Rooms?"), (2, "The pass?"), (3, "Goodbye.")] {
+            doc.edges[index].label = label.into();
+        }
+        (doc, hub, [a, b, c])
+    }
+
+    fn labels_from(doc: &Doc, id: NodeId) -> Vec<&str> {
+        doc.choices(id)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
+    }
+
+    #[test]
+    fn move_choice_trades_places_with_its_neighbouring_sibling_only() {
+        let (mut doc, hub, [a, ..]) = three_choices();
+        assert_eq!(doc.edges_from(hub), vec![0, 2, 3]);
+
+        assert_eq!(doc.move_choice(3, Step::Earlier), Some(2));
+        assert_eq!(labels_from(&doc, hub), ["Rooms?", "Goodbye.", "The pass?"]);
+        assert_eq!(
+            doc.move_choice(2, Step::Earlier),
+            Some(0),
+            "steps over the stranger's edge"
+        );
+        assert_eq!(labels_from(&doc, hub), ["Goodbye.", "Rooms?", "The pass?"]);
+        assert_eq!(doc.edges[1].from, a, "and leaves it where it was");
+
+        assert_eq!(doc.move_choice(0, Step::Later), Some(2));
+        assert_eq!(labels_from(&doc, hub), ["Rooms?", "Goodbye.", "The pass?"]);
+    }
+
+    #[test]
+    fn move_choice_refuses_at_either_end() {
+        let (mut doc, hub, _) = three_choices();
+        assert_eq!(doc.choice_step(0, Step::Earlier), None, "already first");
+        assert_eq!(doc.choice_step(3, Step::Later), None, "already last");
+        assert_eq!(doc.choice_step(1, Step::Later), None, "an only child");
+        assert_eq!(doc.choice_step(9, Step::Earlier), None, "no such edge");
+        assert_eq!(doc.move_choice(0, Step::Earlier), None);
+        assert_eq!(labels_from(&doc, hub), ["Rooms?", "The pass?", "Goodbye."]);
+    }
+
+    #[test]
+    fn play_and_the_screenplay_follow_a_moved_choice() {
+        let (mut doc, hub, [a, ..]) = three_choices();
+        doc.move_choice(3, Step::Earlier);
+        doc.move_choice(2, Step::Earlier);
+
+        let offered: Vec<&str> = doc
+            .offered(&[hub])
+            .unwrap()
+            .into_iter()
+            .map(|(_, label, _)| label)
+            .collect();
+        assert_eq!(offered, ["Goodbye.", "Rooms?", "The pass?"]);
+
+        let script = doc.to_screenplay();
+        let at = |needle: &str| script.find(needle).expect(needle);
+        assert!(
+            at("Goodbye.") < at("Rooms?") && at("Rooms?") < at("The pass?"),
+            "{script}"
+        );
+
+        // Out of plumbing the walk takes the first edge, so the order is which way it goes.
+        let step = doc.add_node(-400.0, 0.0);
+        doc.node_mut(step).unwrap().kind = NodeKind::Instruction;
+        doc.add_edge(step, a);
+        doc.add_edge(step, hub);
+        assert_eq!(doc.start_walk(step), vec![step, a]);
+        let second = doc.edges.len() - 1;
+        doc.move_choice(second, Step::Earlier);
+        assert_eq!(doc.start_walk(step), vec![step, hub]);
     }
 
     #[test]

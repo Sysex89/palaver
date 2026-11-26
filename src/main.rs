@@ -15,16 +15,17 @@ mod theme;
 use doc::{
     Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
     MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, PORT_R,
-    Problem, Ref, SCRIPT_EXT, SetOp, Severity, Use, Value, VarState, View, WIRE_STUB, box_exit,
-    clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup, route,
-    snippet, split_set, with_default_extension,
+    Problem, Ref, SCRIPT_EXT, SetOp, Severity, Step, Use, Value, VarState, View, WIRE_STUB,
+    box_exit, clean_tag, in_port, join_set, map_cell, map_hit, node_center, out_port, read_backup,
+    route, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path,
     PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle,
-    ScrollWheelEvent, SharedString, Subscription, Window, WindowAppearance, WindowBounds,
-    WindowHandle, WindowOptions, actions, canvas, deferred, div, point, prelude::*, px, rgb, size,
+    ScrollWheelEvent, SharedString, Subscription, Transformation, Window, WindowAppearance,
+    WindowBounds, WindowHandle, WindowOptions, actions, canvas, deferred, div, point, prelude::*,
+    px, radians, relative, rgb, size, svg,
 };
 use settings::{Settings, TextFont, ThemePref, UiFont};
 use std::path::PathBuf;
@@ -40,6 +41,8 @@ actions!(
         CutNodes,
         PasteNodes,
         DuplicateNodes,
+        MoveChoiceUp,
+        MoveChoiceDown,
         Undo,
         Redo,
         ZoomIn,
@@ -227,6 +230,12 @@ const MENUS: &[MenuSpec] = &[
             ("Paste", "Ctrl+V", |e, w, cx| e.on_paste(&PasteNodes, w, cx)),
             ("Duplicate", "Ctrl+D", |e, w, cx| {
                 e.on_duplicate(&DuplicateNodes, w, cx)
+            }),
+            ("Move choice up", "Alt+Up", |e, w, cx| {
+                e.on_move_choice_up(&MoveChoiceUp, w, cx)
+            }),
+            ("Move choice down", "Alt+Down", |e, w, cx| {
+                e.on_move_choice_down(&MoveChoiceDown, w, cx)
             }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
             ("Delete selection", "Del", |e, w, cx| {
@@ -1945,6 +1954,51 @@ impl Editor {
         cx.notify();
     }
 
+    fn on_move_choice_up(&mut self, _: &MoveChoiceUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_choice(Step::Earlier, cx);
+    }
+
+    fn on_move_choice_down(&mut self, _: &MoveChoiceDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_choice(Step::Later, cx);
+    }
+
+    /// Alt+Up and Alt+Down: the selected edge, one place along its node's list.
+    fn move_selected_choice(&mut self, step: Step, cx: &mut Context<Self>) {
+        let Selection::Edge(index) = self.selection else {
+            return self.set_status("Select a choice to move it.".into(), cx);
+        };
+        if self.doc.choice_step(index, step).is_none() {
+            let end = if step == Step::Earlier {
+                "first"
+            } else {
+                "last"
+            };
+            return self.set_status(format!("That choice is already {end}."), cx);
+        }
+        self.move_choice(index, step, cx);
+    }
+
+    /// Moves a choice and keeps the selection on the edge it was on. `Selection::Edge` is an
+    /// index, and the move trades two indices, so a selection on either of them would
+    /// otherwise land on the other edge — and the next Delete take the wrong choice.
+    fn move_choice(&mut self, index: usize, step: Step, cx: &mut Context<Self>) {
+        // Asked before the checkpoint, so a refused move leaves no empty undo step.
+        let Some(other) = self.doc.choice_step(index, step) else {
+            return;
+        };
+        self.checkpoint();
+        self.doc.move_choice(index, step);
+        let follow = match self.selection {
+            Selection::Edge(i) if i == index => Some(other),
+            Selection::Edge(i) if i == other => Some(index),
+            _ => None,
+        };
+        if let Some(i) = follow {
+            self.select(Selection::Edge(i), cx);
+        }
+        cx.notify();
+    }
+
     fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         // A drag in progress ends with the step: carried on, its moves would be written
         // with no checkpoint of their own, and be lost with the next undo.
@@ -2870,6 +2924,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_cut))
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_duplicate))
+            .on_action(cx.listener(Self::on_move_choice_up))
+            .on_action(cx.listener(Self::on_move_choice_down))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_zoom_in))
@@ -5615,7 +5671,9 @@ impl Editor {
                         .flex()
                         .flex_col()
                         .gap_4()
-                        .max_h(px(640.0))
+                        // As tall as the window allows, so the last group and the credit
+                        // are not hidden behind a scroll edge nothing marks.
+                        .max_h(relative(0.92))
                         .overflow_y_scroll()
                         .p_5()
                         .bg(theme::raised())
@@ -5643,7 +5701,9 @@ impl Editor {
                                 .flex_wrap()
                                 .gap_x_6()
                                 .gap_y_4()
-                                .w(px(540.0))
+                                // Three groups across: in two, the Edit and View columns
+                                // stacked past the bottom of a laptop-sized window.
+                                .w(px(800.0))
                                 .children(
                                     MENUS.iter().filter(|(name, _)| self.menu_shown(name)).map(
                                         |(name, items)| {
@@ -5666,7 +5726,13 @@ impl Editor {
                                         .map(|(what, how)| (what.to_string(), how.to_string()))
                                         .collect(),
                                 )),
-                        ),
+                        )
+                        // CC BY asks for the credit where the work is used, and this sheet is
+                        // the one place in the editor that lists what it is made of.
+                        .child(div().type_hint().child(
+                            "Icons: \"Plain arrow\" by Delapouite, Game Icons \
+                             (game-icons.net), CC BY 3.0.",
+                        )),
                 ),
         )
     }
@@ -6171,6 +6237,104 @@ impl Editor {
             }))
     }
 
+    /// The node's choices in the order the player reads them, each with buttons to move it
+    /// a place up or down, or `None` when there are fewer than two to put in order. A row is
+    /// a choice's text, or where it leads when it has none; clicking it selects the edge.
+    fn choice_list(&self, id: NodeId, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let indices = self.doc.edges_from(id);
+        if indices.len() < 2 {
+            return None;
+        }
+        let last = indices.len() - 1;
+        let rows = indices.into_iter().enumerate().map(|(n, index)| {
+            let edge = &self.doc.edges[index];
+            let label = edge.label.trim();
+            let (text, color) = match label.is_empty() {
+                true => (
+                    format!("No text — to {}", node_number(&self.doc, edge.to)),
+                    theme::text_faint(),
+                ),
+                false => (label.to_string(), theme::text()),
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(16.0))
+                        .type_hint()
+                        .child((n + 1).to_string()),
+                )
+                // Its own flex_1 box with the text as its direct child, so the clamp has a
+                // definite width to truncate at (see `one_line`).
+                .child(
+                    div()
+                        .id(("choice-row", index))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .font_family(theme::text_font())
+                        .text_color(color)
+                        .one_line()
+                        .child(text)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select(Selection::Edge(index), cx);
+                            cx.notify();
+                        })),
+                )
+                .child(self.order_button(index, Step::Earlier, n > 0, cx))
+                .child(self.order_button(index, Step::Later, n < last, cx))
+        });
+        Some(div().flex().flex_col().gap_1().children(rows))
+    }
+
+    /// One of a choice row's two move buttons: the Game Icons arrow, pointing down, or
+    /// turned to point up. Drawn dim and inert at the end of the list it cannot pass, rather
+    /// than left out, so the column of buttons stays a column.
+    fn order_button(
+        &self,
+        index: usize,
+        step: Step,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let up = step == Step::Earlier;
+        div()
+            .id(("choice-move", 2 * index + usize::from(up)))
+            .flex_none()
+            .size_5()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .child(
+                svg()
+                    .path(ARROW_ICON)
+                    .size_3()
+                    .text_color(if enabled {
+                        theme::text_muted()
+                    } else {
+                        theme::text_disabled()
+                    })
+                    .when(up, |icon| {
+                        icon.with_transformation(Transformation::rotate(radians(
+                            std::f32::consts::PI,
+                        )))
+                    }),
+            )
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.move_choice(index, step, cx)))
+            })
+    }
+
     /// Marks a node as a deliberate ending, which is what keeps it out of the dead-end
     /// warnings. A discrete edit, so it checkpoints outright rather than coalescing.
     fn end_toggle(&self, id: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6361,6 +6525,14 @@ impl Editor {
                         };
                         this.child(section("Content", input))
                     })
+                    // Where the player picks, the order of the choices is what they read, so
+                    // it is shown and set here, on the node that offers them.
+                    .when(self.doc.pauses_play(id), |this| {
+                        this.children(
+                            self.choice_list(id, cx)
+                                .map(|list| section("Choices", list)),
+                        )
+                    })
                     .when(kind == NodeKind::Instruction, |this| {
                         this.child(section("Logic", self.var_rows(id, VarRow::Sets, cx)))
                     })
@@ -6431,11 +6603,22 @@ impl Editor {
                 let index = *index;
                 let edge = self.doc.edges.get(index);
                 let ends = match edge {
-                    Some(edge) => format!(
-                        "{} → {}",
-                        node_number(&self.doc, edge.from),
-                        node_number(&self.doc, edge.to)
-                    ),
+                    Some(edge) => {
+                        let ends = format!(
+                            "{} → {}",
+                            node_number(&self.doc, edge.from),
+                            node_number(&self.doc, edge.to)
+                        );
+                        // Its place in the list, where there is a list: what Alt+Up and
+                        // Alt+Down change, so a move shows here as well as on the node.
+                        let siblings = self.doc.edges_from(edge.from);
+                        match siblings.iter().position(|&i| i == index) {
+                            Some(n) if siblings.len() > 1 => {
+                                format!("{ends} · {} of {}", n + 1, siblings.len())
+                            }
+                            _ => ends,
+                        }
+                    }
                     None => "a missing edge".into(),
                 };
                 // Out of a condition this edge is a pin, not a choice: the player never picks
@@ -7273,6 +7456,25 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>, zoom: f32) -> Option<Path
     head.build().ok()
 }
 
+/// Where the arrow on the choice list's move buttons is found by `svg().path(..)`.
+const ARROW_ICON: &str = "icons/plain-arrow.svg";
+
+/// The icons, embedded the way the fonts are so the binary needs no folder beside it. Their
+/// set, author and licence are in `assets/icons/LICENSE.md` and credited in the F1 sheet.
+struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Ok(match path {
+            ARROW_ICON => Some(include_bytes!("../assets/icons/plain-arrow.svg").into()),
+            _ => None,
+        })
+    }
+
+    fn list(&self, _: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(vec![ARROW_ICON.into()])
+    }
+}
 fn main() {
     // The command line first: a mistake in it is said and nothing opens.
     let request = match link::parse(std::env::args().skip(1)) {
@@ -7307,7 +7509,8 @@ fn main() {
         return;
     }
 
-    Application::new().run(move |cx: &mut App| {
+    let app = Application::new().with_assets(Assets);
+    app.run(move |cx: &mut App| {
         // Before the window opens, so the first frame already has its faces.
         if let Err(why) = cx.text_system().add_fonts(
             FONT_FILES
@@ -7329,6 +7532,9 @@ fn main() {
             KeyBinding::new("ctrl-x", CutNodes, Some("Canvas")),
             KeyBinding::new("ctrl-v", PasteNodes, Some("Canvas")),
             KeyBinding::new("ctrl-d", DuplicateNodes, Some("Canvas")),
+            // A field binds neither, so these work while the Choice field has the focus too.
+            KeyBinding::new("alt-up", MoveChoiceUp, Some("Editor")),
+            KeyBinding::new("alt-down", MoveChoiceDown, Some("Editor")),
             // Bare `f`, so canvas-only like the three above: in a text field it is a letter.
             KeyBinding::new("f", FitView, Some("Canvas")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
