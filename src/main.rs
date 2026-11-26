@@ -3428,7 +3428,7 @@ impl Editor {
                                     .rounded_sm()
                                     .cursor_pointer()
                                     .hover(|style| style.bg(theme::hover()))
-                                    .child(div().flex_none().w_4().text_color(color).child(glyph))
+                                    .child(div().flex_none().w_4().child(icon(glyph, 12.0, color)))
                                     .child(
                                         div()
                                             .flex_1()
@@ -4256,11 +4256,19 @@ impl Editor {
                 Value::Bool(on) => div()
                     .id(("var-toggle", i))
                     .flex()
+                    .items_center()
                     .gap_2()
                     .flex_1()
                     .min_w(px(0.0))
                     .text_color(if on { theme::true_pin() } else { theme::text() })
-                    .child(div().flex_none().child(if on { "☑" } else { "☐" }))
+                    .child(checkbox(
+                        on,
+                        if on {
+                            theme::true_pin()
+                        } else {
+                            theme::text_muted()
+                        },
+                    ))
                     .child(div().flex_1().min_w(px(0.0)).one_line().child(label))
                     .when(playing.is_none() && !outside, |this| {
                         this.cursor_pointer()
@@ -5730,8 +5738,8 @@ impl Editor {
                         // CC BY asks for the credit where the work is used, and this sheet is
                         // the one place in the editor that lists what it is made of.
                         .child(div().type_hint().child(
-                            "Icons: \"Plain arrow\" by Delapouite, Game Icons \
-                             (game-icons.net), CC BY 3.0.",
+                            "Icons by Delapouite and Lorc, from Game Icons (game-icons.net), \
+                             CC BY 3.0. Files and authors: assets/icons/LICENSE.md.",
                         )),
                 ),
         )
@@ -6008,7 +6016,7 @@ impl Editor {
                     .hover(|style| style.text_color(theme::text()))
                     // The glyph keeps its kind's colour whether or not the chip is on, so the
                     // picker doubles as the key to what the canvas draws.
-                    .child(div().text_color(color).child(glyph))
+                    .child(icon(glyph, 11.0, color))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.doc.node(id).is_none_or(|node| node.kind == kind) {
@@ -6076,11 +6084,18 @@ impl Editor {
                         };
                         // A flag is a checkbox; a number has no box to tick, so it shows the
                         // operator there instead and the value beside the name.
-                        let (glyph, color) = match current {
-                            None => ("—", theme::text_faint()),
-                            Some((Value::Bool(true), _)) => ("☑", theme::true_pin()),
-                            Some((Value::Bool(false), _)) => ("☐", theme::false_pin()),
-                            Some((Value::Int(_), op)) => (op, theme::accent()),
+                        let (mark, color): (AnyElement, Rgba) = match current {
+                            None => (div().child("—").into_any_element(), theme::text_faint()),
+                            Some((Value::Bool(on), _)) => {
+                                let color = match on {
+                                    true => theme::true_pin(),
+                                    false => theme::false_pin(),
+                                };
+                                (checkbox(on, color).into_any_element(), color)
+                            }
+                            Some((Value::Int(_), op)) => {
+                                (div().child(op).into_any_element(), theme::accent())
+                            }
                         };
                         let number = match current {
                             Some((Value::Int(n), _)) => Some(n),
@@ -6107,7 +6122,8 @@ impl Editor {
                                     .cursor_pointer()
                                     .text_color(color)
                                     .hover(|style| style.bg(theme::hover()))
-                                    .child(glyph)
+                                    .items_center()
+                                    .child(mark)
                                     .child(variable.name.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.checkpoint();
@@ -6195,11 +6211,16 @@ impl Editor {
                 theme::false_pin()
             })
             .hover(|style| style.text_color(theme::text()))
-            .child(if on {
-                "☑ true branch"
-            } else {
-                "☐ false branch"
-            })
+            .items_center()
+            .child(checkbox(
+                on,
+                if on {
+                    theme::true_pin()
+                } else {
+                    theme::false_pin()
+                },
+            ))
+            .child(if on { "true branch" } else { "false branch" })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.doc.edges.get(index).is_none() {
                     return;
@@ -6226,7 +6247,16 @@ impl Editor {
                 theme::text_muted()
             })
             .hover(|style| style.text_color(theme::text()))
-            .child(if on { "☑ once only" } else { "☐ once only" })
+            .items_center()
+            .child(checkbox(
+                on,
+                if on {
+                    theme::text()
+                } else {
+                    theme::text_muted()
+                },
+            ))
+            .child("once only")
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.doc.edges.get(index).is_none() {
                     return;
@@ -6315,7 +6345,7 @@ impl Editor {
             .rounded_sm()
             .child(
                 svg()
-                    .path(ARROW_ICON)
+                    .path(icon::ARROW)
                     .size_3()
                     .text_color(if enabled {
                         theme::text_muted()
@@ -6350,7 +6380,15 @@ impl Editor {
                 theme::text_muted()
             })
             .hover(|style| style.text_color(theme::text()))
-            .child(if on { "☑" } else { "☐" })
+            .items_center()
+            .child(checkbox(
+                on,
+                if on {
+                    theme::ending()
+                } else {
+                    theme::text_muted()
+                },
+            ))
             .child("Ending")
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.doc.node(id).is_none() {
@@ -6498,7 +6536,7 @@ impl Editor {
                     .flex_col()
                     .gap_4()
                     .child(inspector_header(
-                        glyph,
+                        icon(glyph, 16.0, color),
                         color,
                         name,
                         node_number(&self.doc, id),
@@ -6610,10 +6648,11 @@ impl Editor {
                             node_number(&self.doc, edge.to)
                         );
                         // Its place in the list, where there is a list: what Alt+Up and
-                        // Alt+Down change, so a move shows here as well as on the node.
+                        // Alt+Down change, so a move shows here as well as on the node. Not
+                        // for a condition's pins, which the walk picks by branch, not order.
                         let siblings = self.doc.edges_from(edge.from);
                         match siblings.iter().position(|&i| i == index) {
-                            Some(n) if siblings.len() > 1 => {
+                            Some(n) if siblings.len() > 1 && !self.doc.is_condition(edge.from) => {
                                 format!("{ends} · {} of {}", n + 1, siblings.len())
                             }
                             _ => ends,
@@ -6787,10 +6826,10 @@ fn section(title: &str, body: impl IntoElement) -> impl IntoElement {
         .child(body)
 }
 
-/// What the inspector is about: a glyph chip in the thing's colour, its name, and where it
+/// What the inspector is about: a chip in the thing's colour holding its icon or glyph, its name, and where it
 /// is. The one heavy, large element in the pane, so the eye lands here first.
 fn inspector_header(
-    glyph: &'static str,
+    mark: impl IntoElement,
     color: Rgba,
     title: impl Into<SharedString>,
     subtitle: impl Into<SharedString>,
@@ -6811,7 +6850,7 @@ fn inspector_header(
                 .bg(theme::raised())
                 .text_size(px(theme::TITLE))
                 .text_color(color)
-                .child(glyph),
+                .child(mark),
         )
         .child(
             div()
@@ -7164,6 +7203,8 @@ fn node_box(
         passed,
     } = state;
     let (x, y) = view.to_screen((node.x, node.y));
+    // A kind's icon is the box's text size, so it scales with the zoom as the text does.
+    let glyph = view.scale(theme::CANVAS_TEXT);
     div()
         .id(("node", node.id))
         // View-only, like everything a hover does: it never selects and never switches the
@@ -7236,30 +7277,34 @@ fn node_box(
                 ),
             // A branch point says nothing, so its `text` is a label for it rather than a
             // line — an unnamed hub in a graph of hubs is not worth much.
-            NodeKind::Hub => this.justify_center().items_center().child(
+            NodeKind::Hub => this
+                .justify_center()
+                .items_center()
+                .child(match node.text.trim() {
+                    "" => icon(icon::HUB, glyph, theme::kind_hub()).into_any_element(),
+                    label => glyph_row(
+                        NodeKind::Hub,
+                        glyph,
+                        div()
+                            .text_color(theme::kind_hub())
+                            .one_line()
+                            .child(label.to_string()),
+                    )
+                    .into_any_element(),
+                }),
+            NodeKind::Jump => this.justify_center().child(glyph_row(
+                NodeKind::Jump,
+                glyph,
                 div()
-                    .text_color(theme::kind_hub())
-                    .one_line()
-                    .child(match node.text.trim() {
-                        "" => "◇".to_string(),
-                        label => format!("◇ {label}"),
-                    }),
-            ),
-            NodeKind::Jump => this.justify_center().child(
-                div()
-                    .w_full()
                     .text_color(theme::kind_jump())
                     .one_line()
-                    .child(match jump_target {
-                        Some(target) => format!("↪ {target}"),
-                        None => "↪ nowhere".into(),
-                    }),
-            ),
+                    .child(jump_target.unwrap_or_else(|| "nowhere".into())),
+            )),
             // The writes as they read on the page, which is the whole point of logic being
             // a node: `⚙ paid = true` is legible without opening anything.
             NodeKind::Instruction => this.justify_center().child(glyph_row(
-                kind_style(NodeKind::Instruction).0,
-                theme::kind_instruction(),
+                NodeKind::Instruction,
+                glyph,
                 div()
                     .text_color(theme::text())
                     .text_ellipsis()
@@ -7278,8 +7323,8 @@ fn node_box(
             // The checks as articy writes them — `? paid == true` — with no parser behind
             // it; the inspector edits them with the same picker an instruction uses.
             NodeKind::Condition => this.justify_center().child(glyph_row(
-                kind_style(NodeKind::Condition).0,
-                theme::kind_condition(),
+                NodeKind::Condition,
+                glyph,
                 div()
                     .text_color(theme::text())
                     .text_ellipsis()
@@ -7297,8 +7342,8 @@ fn node_box(
             // and no speaker line to share the box with. Same footprint as every other
             // kind — hit-testing is arithmetic over `NODE_W`/`NODE_H`.
             NodeKind::Note => this.child(glyph_row(
-                kind_style(NodeKind::Note).0,
-                theme::kind_note(),
+                NodeKind::Note,
+                glyph,
                 div()
                     // Its own face, not just its own colour: the bundled UI font has no
                     // italic, so `.italic()` alone renders identically to a line of
@@ -7366,29 +7411,40 @@ fn text_prompt(kind: NodeKind) -> &'static str {
 /// line of a box that is only `NODE_H` tall — the one line an instruction's second effect or
 /// a note's fourth line of text needed. `flex_1` + `min_w_0` is what gives the content a
 /// width to wrap and clip to, since it sits in a row now rather than filling a column.
-fn glyph_row(glyph: &'static str, color: Rgba, content: impl IntoElement) -> impl IntoElement {
+///
+/// The icon is `size` square — the box's text size, so it scales with the zoom the way the
+/// glyph of text it replaced did — and sits on the first line's centre rather than its top.
+fn glyph_row(kind: NodeKind, size: f32, content: impl IntoElement) -> impl IntoElement {
+    let (path, _, color) = kind_style(kind);
     div()
         .flex()
         .flex_row()
         .gap_2()
         .items_start()
-        .child(div().flex_none().text_color(color).child(glyph))
+        .child(
+            div()
+                .flex_none()
+                .h(px(size * 1.25))
+                .flex()
+                .items_center()
+                .child(icon(path, size, color)),
+        )
         .child(div().flex_1().min_w(px(0.0)).child(content))
 }
 
-/// How a kind introduces itself — glyph, name and colour. The canvas box, the inspector
-/// header and the kind picker all read it, so they cannot disagree about what a hub looks
-/// like. `Speech` has no glyph of its own on the canvas (its speaker header says who is
-/// talking), so its pilcrow is only for the chip, the header and the find results. A quote
-/// mark was the obvious choice and was unreadable at chip size: it rendered as a speck.
+/// How a kind introduces itself — icon, name and colour. The canvas box, the inspector
+/// header, the kind picker and the find results all read it, so they cannot disagree about
+/// what a hub looks like. `Speech` has no icon of its own on the canvas (its speaker header
+/// says who is talking), so its bubble is only for the chip, the header and the find results.
+/// The condition's icon is a path splitting into a tick and a cross: its true and false pins.
 fn kind_style(kind: NodeKind) -> (&'static str, &'static str, Rgba) {
     match kind {
-        NodeKind::Speech => ("¶", "Speech", theme::kind_speech()),
-        NodeKind::Hub => ("◇", "Hub", theme::kind_hub()),
-        NodeKind::Jump => ("↪", "Jump", theme::kind_jump()),
-        NodeKind::Instruction => ("⚙", "Instruction", theme::kind_instruction()),
-        NodeKind::Condition => ("?", "Condition", theme::kind_condition()),
-        NodeKind::Note => ("▤", "Note", theme::kind_note()),
+        NodeKind::Speech => (icon::SPEECH, "Speech", theme::kind_speech()),
+        NodeKind::Hub => (icon::HUB, "Hub", theme::kind_hub()),
+        NodeKind::Jump => (icon::JUMP, "Jump", theme::kind_jump()),
+        NodeKind::Instruction => (icon::INSTRUCTION, "Instruction", theme::kind_instruction()),
+        NodeKind::Condition => (icon::CONDITION, "Condition", theme::kind_condition()),
+        NodeKind::Note => (icon::NOTE, "Note", theme::kind_note()),
     }
 }
 
@@ -7456,24 +7512,91 @@ fn arrow_head(tip: Point<Pixels>, from: Point<Pixels>, zoom: f32) -> Option<Path
     head.build().ok()
 }
 
-/// Where the arrow on the choice list's move buttons is found by `svg().path(..)`.
-const ARROW_ICON: &str = "icons/plain-arrow.svg";
+/// The icons, by the path `svg().path(..)` asks for. All from Game Icons (CC BY 3.0): each has
+/// a row in `assets/icons/LICENSE.md` and its author in the credit at the foot of the F1 sheet,
+/// and a new one joins `ICONS`, that table and that line.
+mod icon {
+    pub const ARROW: &str = "icons/plain-arrow.svg";
+    pub const CHECK: &str = "icons/check-mark.svg";
+    pub const SPEECH: &str = "icons/chat-bubble.svg";
+    pub const HUB: &str = "icons/radial-balance.svg";
+    pub const JUMP: &str = "icons/return-arrow.svg";
+    pub const INSTRUCTION: &str = "icons/cog.svg";
+    pub const CONDITION: &str = "icons/choice.svg";
+    pub const NOTE: &str = "icons/quill.svg";
+}
 
-/// The icons, embedded the way the fonts are so the binary needs no folder beside it. Their
-/// set, author and licence are in `assets/icons/LICENSE.md` and credited in the F1 sheet.
+/// Every icon's bytes, embedded the way the fonts are so the binary needs no folder beside it.
+const ICONS: &[(&str, &[u8])] = &[
+    (
+        icon::ARROW,
+        include_bytes!("../assets/icons/plain-arrow.svg"),
+    ),
+    (
+        icon::CHECK,
+        include_bytes!("../assets/icons/check-mark.svg"),
+    ),
+    (
+        icon::SPEECH,
+        include_bytes!("../assets/icons/chat-bubble.svg"),
+    ),
+    (
+        icon::HUB,
+        include_bytes!("../assets/icons/radial-balance.svg"),
+    ),
+    (
+        icon::JUMP,
+        include_bytes!("../assets/icons/return-arrow.svg"),
+    ),
+    (icon::INSTRUCTION, include_bytes!("../assets/icons/cog.svg")),
+    (
+        icon::CONDITION,
+        include_bytes!("../assets/icons/choice.svg"),
+    ),
+    (icon::NOTE, include_bytes!("../assets/icons/quill.svg")),
+];
+
+/// The crate's `AssetSource`: [`ICONS`], and nothing else.
 struct Assets;
 
 impl gpui::AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Ok(match path {
-            ARROW_ICON => Some(include_bytes!("../assets/icons/plain-arrow.svg").into()),
-            _ => None,
-        })
+        Ok(ICONS
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, bytes)| (*bytes).into()))
     }
 
     fn list(&self, _: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(vec![ARROW_ICON.into()])
+        Ok(ICONS.iter().map(|(name, _)| (*name).into()).collect())
     }
+}
+
+/// An icon, `size` pixels square, drawn as a mask in `color` — so it follows the theme, or a
+/// node kind's hue, the way a glyph of text did.
+fn icon(path: &'static str, size: f32, color: Rgba) -> gpui::Svg {
+    svg()
+        .path(path)
+        .flex_none()
+        .size(px(size))
+        .text_color(color)
+}
+
+/// A checkbox: a bordered box in `color`, and the check mark in it when `on`. The box is
+/// chrome rather than artwork — Game Icons' outlined square has a 1/28 stroke, a hairline at
+/// this size — so only the mark is an icon. The caller picks the colour, since an empty box
+/// means "off" on a toggle but "false" in a Logic row, where it wears the false pin's hue.
+fn checkbox(on: bool, color: Rgba) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(13.0))
+        .rounded_sm()
+        .border_1()
+        .border_color(color)
+        .when(on, |this| this.child(icon(icon::CHECK, 9.0, color)))
 }
 fn main() {
     // The command line first: a mistake in it is said and nothing opens.
