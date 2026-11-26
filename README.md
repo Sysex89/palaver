@@ -23,10 +23,14 @@ Around that is the project stuff you'd expect:
 - more than one canvas per file, with jumps between them
 - tags, 50 levels of undo, and a crash copy written every 30 seconds while there are unsaved changes
 - a problems list for dead ends, unreachable nodes, broken links, undeclared variables and so on
-- export of the player-facing lines to Fluent (`.ftl`) for translation, or of the whole thing
-  as a numbered Markdown screenplay
+- export of the player-facing lines to Fluent (`.ftl`) for translation, with a comment on each
+  saying who speaks it and what it answers; a recording script (CSV) for voice sessions, keyed
+  the same way; and the whole thing as a numbered Markdown screenplay
+- the same exports from the command line, with no window, so a build or an after-save hook can
+  keep them current
 
-Files are plain JSON with a `.dln` extension.
+Files are plain JSON with a `.dln` extension. [docs/format.md](docs/format.md) describes the
+file and the rules for playing it, for anyone loading one into a game.
 
 ## Making it readable
 
@@ -157,4 +161,6 @@ not to build and why.
 ## License
 
 GPL-3.0-or-later, see [LICENSE](LICENSE). The fonts in `assets/fonts` are under the SIL Open
-Font License; their licence files sit next to them.
+Font License; their licence files sit next to them. The icons in `assets/icons` are from
+[Game Icons](https://game-icons.net), by Delapouite and Lorc, under CC BY 3.0; the file beside
+them lists each one with its author.
