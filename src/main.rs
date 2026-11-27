@@ -90,6 +90,13 @@ actions!(
         FindPrev,
         FindRun,
         LinkTo,
+        KindSpeech,
+        KindHub,
+        KindJump,
+        KindInstruction,
+        KindCondition,
+        KindNote,
+        ToggleCheckbox,
         FillLine,
         RerollLine,
         AcceptLine
@@ -269,6 +276,9 @@ const MENUS: &[MenuSpec] = &[
                 e.on_move_choice_down(&MoveChoiceDown, w, cx)
             }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
+            ("Toggle checkbox", "Ctrl+T", |e, w, cx| {
+                e.on_toggle_checkbox(&ToggleCheckbox, w, cx)
+            }),
             ("Edit selection", "Enter", |e, w, cx| {
                 e.on_edit_selection(&EditSelection, w, cx)
             }),
@@ -295,6 +305,29 @@ const MENUS: &[MenuSpec] = &[
             ("Note", "Ctrl+6", |e, w, cx| e.on_new_note(&NewNote, w, cx)),
             ("Link to…", "Ctrl+L", |e, w, cx| {
                 e.on_link_to(&LinkTo, w, cx)
+            }),
+        ],
+    ),
+    // The kind picker as commands: what the selected node is, where the Node menu makes a
+    // new one. Alt and the same digit as the Node menu's Ctrl, so the number is the kind.
+    (
+        "Kind",
+        &[
+            ("Speech", "Alt+1", |e, _, cx| {
+                e.change_kind(NodeKind::Speech, cx)
+            }),
+            ("Hub", "Alt+2", |e, _, cx| e.change_kind(NodeKind::Hub, cx)),
+            ("Jump", "Alt+3", |e, _, cx| {
+                e.change_kind(NodeKind::Jump, cx)
+            }),
+            ("Instruction", "Alt+4", |e, _, cx| {
+                e.change_kind(NodeKind::Instruction, cx)
+            }),
+            ("Condition", "Alt+5", |e, _, cx| {
+                e.change_kind(NodeKind::Condition, cx)
+            }),
+            ("Note", "Alt+6", |e, _, cx| {
+                e.change_kind(NodeKind::Note, cx)
             }),
         ],
     ),
@@ -3063,6 +3096,113 @@ impl Editor {
         self.focus_field(fields[next], window, cx);
     }
 
+    /// Turns node `id` into `kind`: the kind picker's chips and the Kind menu. Nothing, and no
+    /// undo step, when it already is one.
+    fn set_node_kind(&mut self, id: NodeId, kind: NodeKind, cx: &mut Context<Self>) {
+        if self.doc.node(id).is_none_or(|node| node.kind == kind) {
+            return;
+        }
+        self.checkpoint();
+        self.doc.set_kind(id, kind);
+        // Changing kind in place does not reload the fields.
+        self.text_input
+            .update(cx, |input, cx| input.set_placeholder(text_prompt(kind), cx));
+        cx.notify();
+    }
+
+    /// Alt+1–6, or the Kind menu: the selected node becomes `kind`. Says so when the change
+    /// cut links — a note holds none, a jump keeps one — since the picker shows only the
+    /// kind, and a keyboard user may not be looking at the canvas.
+    fn change_kind(&mut self, kind: NodeKind, cx: &mut Context<Self>) {
+        let Some(id) = self.selection.only_node() else {
+            return self.set_status("Select one node to change its kind.".into(), cx);
+        };
+        let links = |doc: &Doc| {
+            doc.edges
+                .iter()
+                .filter(|e| e.from == id || e.to == id)
+                .count()
+        };
+        let before = links(&self.doc);
+        self.set_node_kind(id, kind, cx);
+        let cut = before - links(&self.doc);
+        if cut > 0 {
+            let s = if cut == 1 { "" } else { "s" };
+            let name = kind_style(kind).1.to_lowercase();
+            let a = if name.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                "an"
+            } else {
+                "a"
+            };
+            self.set_status(format!("Now {a} {name}; {cut} link{s} cut."), cx);
+        }
+    }
+
+    fn toggle_end(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if self.doc.node(id).is_none() {
+            return;
+        }
+        self.checkpoint();
+        if let Some(node) = self.doc.node_mut(id) {
+            node.end = !node.end;
+        }
+        cx.notify();
+    }
+
+    fn toggle_once(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.doc.edges.get(index).is_none() {
+            return;
+        }
+        self.checkpoint();
+        self.doc.edges[index].once = !self.doc.edges[index].once;
+        cx.notify();
+    }
+
+    fn toggle_branch(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.doc.edges.get(index).is_none() {
+            return;
+        }
+        self.checkpoint();
+        self.doc.edges[index].branch = !self.doc.edges[index].branch;
+        cx.notify();
+    }
+
+    /// Ctrl+T, or Edit → Toggle checkbox: the one checkbox the inspector draws for the
+    /// selection — Ending on a line, once only on a choice, the pin on a branch — which
+    /// `inspector_checkbox` names. The status line says where it landed, since the box may
+    /// be scrolled out of the inspector.
+    fn on_toggle_checkbox(&mut self, _: &ToggleCheckbox, _: &mut Window, cx: &mut Context<Self>) {
+        let target = inspector_checkbox(&self.doc, &self.selection, self.play.is_some());
+        let done = match (target, &self.selection) {
+            (Some(Checkbox::Ending), _) => {
+                let Some(id) = self.selection.only_node() else {
+                    return;
+                };
+                self.toggle_end(id, cx);
+                match self.doc.node(id).is_some_and(|node| node.end) {
+                    true => "Marked as an ending.",
+                    false => "No longer marked as an ending.",
+                }
+            }
+            (Some(Checkbox::Once), &Selection::Edge(index)) => {
+                self.toggle_once(index, cx);
+                match self.doc.edges[index].once {
+                    true => "Once only: spent once the player takes it.",
+                    false => "No longer once only.",
+                }
+            }
+            (Some(Checkbox::Branch), &Selection::Edge(index)) => {
+                self.toggle_branch(index, cx);
+                match self.doc.edges[index].branch {
+                    true => "Now the true branch.",
+                    false => "Now the false branch.",
+                }
+            }
+            _ => "Nothing selected has a checkbox: a line, a choice or a branch does.",
+        };
+        self.set_status(done.into(), cx);
+    }
+
     fn on_toggle_flow_map(&mut self, _: &ToggleFlowMap, _: &mut Window, cx: &mut Context<Self>) {
         self.flow_map = !self.flow_map;
         self.drag = None;
@@ -3582,6 +3722,19 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_find_prev))
             .on_action(cx.listener(Self::on_find_run))
             .on_action(cx.listener(Self::on_link_to))
+            .on_action(cx.listener(|e, _: &KindSpeech, _, cx| e.change_kind(NodeKind::Speech, cx)))
+            .on_action(cx.listener(|e, _: &KindHub, _, cx| e.change_kind(NodeKind::Hub, cx)))
+            .on_action(cx.listener(|e, _: &KindJump, _, cx| e.change_kind(NodeKind::Jump, cx)))
+            .on_action(
+                cx.listener(|e, _: &KindInstruction, _, cx| {
+                    e.change_kind(NodeKind::Instruction, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|e, _: &KindCondition, _, cx| e.change_kind(NodeKind::Condition, cx)),
+            )
+            .on_action(cx.listener(|e, _: &KindNote, _, cx| e.change_kind(NodeKind::Note, cx)))
+            .on_action(cx.listener(Self::on_toggle_checkbox))
             .on_action(cx.listener(Self::on_choose))
             .on_action(cx.listener(Self::on_toggle_flow_map))
             .on_action(cx.listener(Self::on_branch))
@@ -3640,7 +3793,9 @@ impl Render for Editor {
             .when(self.searching, |this| {
                 this.child(self.search_overlay(canvas_w, cx))
             })
-            .when(self.help_open, |this| this.child(self.help_overlay(cx)))
+            .when(self.help_open, |this| {
+                this.child(self.help_overlay(help_columns(window), cx))
+            })
             .when(self.prefs_open, |this| this.child(self.prefs_overlay(cx)))
             .when(self.palette_open, |this| {
                 this.child(self.palette_overlay(cx))
@@ -6555,7 +6710,7 @@ impl Editor {
     /// Every command and gesture, over a dimmed window. The shortcuts are read straight off
     /// `MENUS`, so the sheet is the menus' own table and cannot fall out of step with them;
     /// only the mouse gestures, which no menu holds, are written out here.
-    fn help_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn help_overlay(&self, columns: usize, cx: &mut Context<Self>) -> impl IntoElement {
         // The mouse map, as `on_mouse_down` has it. Alt+left and middle both pan.
         const MOUSE: &[(&str, &str)] = &[
             ("Connect two nodes", "Drag from a port"),
@@ -6573,7 +6728,7 @@ impl Editor {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .w(px(250.0))
+                .w(px(HELP_GROUP_W))
                 .child(div().type_section().pb_1().child(title.to_uppercase()))
                 .children(rows.into_iter().map(|(what, keys)| {
                     div()
@@ -6621,10 +6776,11 @@ impl Editor {
                         .flex()
                         .flex_col()
                         .gap_4()
-                        // As tall as the window allows, so the last group and the credit
-                        // are not hidden behind a scroll edge nothing marks.
+                        // As tall as the window allows. Only the groups scroll, between a
+                        // pinned heading and a pinned credit: when the whole card scrolled,
+                        // the credit CC BY asks for went below an edge nothing marks on any
+                        // window short or narrow enough for a third row of groups.
                         .max_h(relative(0.92))
-                        .overflow_y_scroll()
                         .p_5()
                         .bg(theme::raised())
                         .border_1()
@@ -6646,14 +6802,19 @@ impl Editor {
                         )
                         .child(
                             div()
+                                .id("help-groups")
+                                .flex_shrink()
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
                                 .flex()
                                 .flex_row()
                                 .flex_wrap()
-                                .gap_x_6()
+                                .gap_x(px(HELP_GAP))
                                 .gap_y_4()
-                                // Three groups across: in two, the Edit and View columns
-                                // stacked past the bottom of a laptop-sized window.
-                                .w(px(800.0))
+                                // Four groups across where the window has the width, else
+                                // three: in two, the Edit and View columns stacked past the
+                                // bottom of a laptop-sized window (`help_columns`).
+                                .w(px(help_width(columns)))
                                 .children({
                                     let mut groups: Vec<AnyElement> = MENUS
                                         .iter()
@@ -6678,20 +6839,25 @@ impl Editor {
                                             .map(|(what, how)| (what.to_string(), how.to_string()))
                                             .collect(),
                                     );
-                                    // Under the last menu, in its column, rather than a row
-                                    // of its own: Go made seven groups, and a third row put
-                                    // the credit below the scroll edge of an 860px window.
-                                    // Play, the usual last, is three rows long.
-                                    let last = groups.pop();
-                                    groups.push(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_y_4()
-                                            .children(last)
-                                            .child(mouse)
-                                            .into_any_element(),
-                                    );
+                                    // Under the last menu, in its column, where it would
+                                    // otherwise open a row of its own: a row more put the
+                                    // credit below the scroll edge of an 860px window. Play,
+                                    // the usual last, is three rows long. Beside it when the
+                                    // row has room, which is shorter than stacked.
+                                    if groups.len().is_multiple_of(columns) {
+                                        let last = groups.pop();
+                                        groups.push(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_y_4()
+                                                .children(last)
+                                                .child(mouse)
+                                                .into_any_element(),
+                                        );
+                                    } else {
+                                        groups.push(mouse.into_any_element());
+                                    }
                                     groups
                                 }),
                         )
@@ -6979,15 +7145,7 @@ impl Editor {
                     .child(icon(glyph, 11.0, color))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.doc.node(id).is_none_or(|node| node.kind == kind) {
-                            return;
-                        }
-                        this.checkpoint();
-                        this.doc.set_kind(id, kind);
-                        // Changing kind in place does not reload the fields.
-                        this.text_input
-                            .update(cx, |input, cx| input.set_placeholder(text_prompt(kind), cx));
-                        cx.notify();
+                        this.set_node_kind(id, kind, cx);
                     }))
             }),
         )
@@ -7181,14 +7339,7 @@ impl Editor {
                 },
             ))
             .child(if on { "true branch" } else { "false branch" })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.doc.edges.get(index).is_none() {
-                    return;
-                }
-                this.checkpoint();
-                this.doc.edges[index].branch = !this.doc.edges[index].branch;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_branch(index, cx)))
     }
 
     /// Marks a choice as once-only: offered until the player takes it, then greyed out for
@@ -7217,14 +7368,7 @@ impl Editor {
                 },
             ))
             .child("once only")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.doc.edges.get(index).is_none() {
-                    return;
-                }
-                this.checkpoint();
-                this.doc.edges[index].once = !this.doc.edges[index].once;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_once(index, cx)))
     }
 
     /// The node's choices in the order the player reads them, each with buttons to move it
@@ -7350,16 +7494,7 @@ impl Editor {
                 },
             ))
             .child("Ending")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.doc.node(id).is_none() {
-                    return;
-                }
-                this.checkpoint();
-                if let Some(node) = this.doc.node_mut(id) {
-                    node.end = !node.end;
-                }
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_end(id, cx)))
     }
 
     /// Under a line's field: whether it is a placeholder, and the buttons that act on it.
@@ -7964,6 +8099,25 @@ fn inspector_fields(doc: &Doc, selection: &Selection, playing: bool) -> Vec<Fiel
     }
 }
 
+/// The F1 sheet's group width and the gap between groups, which together set how many
+/// columns a window has room for.
+const HELP_GROUP_W: f32 = 250.0;
+const HELP_GAP: f32 = 24.0;
+
+/// The F1 sheet's width for `columns` groups across.
+fn help_width(columns: usize) -> f32 {
+    columns as f32 * HELP_GROUP_W + (columns - 1) as f32 * HELP_GAP
+}
+
+/// How many groups the F1 sheet puts across: four where the window holds them with the
+/// card's padding and a margin either side, else three. Four makes eight groups two rows —
+/// File, Edit, Node and Kind over Go, View, Play and Mouse — where three needed a third, and
+/// a third row is what put the credit below the scroll edge.
+fn help_columns(window: &Window) -> usize {
+    let room = f32::from(window.viewport_size().width) - 2.0 * (20.0 + HELP_GAP);
+    if room >= help_width(4) { 4 } else { 3 }
+}
+
 /// A key as the F1 sheet, the palette and the play panel draw it: a small chip one rung down
 /// from the card it sits on.
 fn keycap(keys: impl Into<SharedString>) -> Div {
@@ -7990,6 +8144,38 @@ fn pick_find_row(
             cx.notify();
         }
     })
+}
+
+/// The checkbox the inspector draws for a selection, which Ctrl+T toggles. A selection has at
+/// most one: Ending on a speech node (a line is what an author vouches for as an ending),
+/// the pin on an edge out of a condition, and once only on a choice the player reads —
+/// asked in the order `inspector` asks, since a condition is not where the player stops.
+/// None while playing, when the sidebar is the player.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Checkbox {
+    Ending,
+    Once,
+    Branch,
+}
+
+fn inspector_checkbox(doc: &Doc, selection: &Selection, playing: bool) -> Option<Checkbox> {
+    if playing {
+        return None;
+    }
+    if let Some(id) = selection.only_node() {
+        return (doc.node(id)?.kind == NodeKind::Speech).then_some(Checkbox::Ending);
+    }
+    let Selection::Edge(index) = selection else {
+        return None;
+    };
+    let edge = doc.edges.get(*index)?;
+    if doc.is_condition(edge.from) {
+        Some(Checkbox::Branch)
+    } else if doc.pauses_play(edge.from) {
+        Some(Checkbox::Once)
+    } else {
+        None
+    }
 }
 
 /// The field Enter goes into: what the selection says rather than what it is called — the
@@ -8773,6 +8959,15 @@ fn main() {
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
             KeyBinding::new("ctrl-l", LinkTo, Some("Editor")),
+            KeyBinding::new("ctrl-t", ToggleCheckbox, Some("Editor")),
+            // `"Editor"`, so a kind can be changed from the node's own Text field; a field the
+            // new kind does not draw gives the focus back to the canvas (`on_focus_lost`).
+            KeyBinding::new("alt-1", KindSpeech, Some("Editor")),
+            KeyBinding::new("alt-2", KindHub, Some("Editor")),
+            KeyBinding::new("alt-3", KindJump, Some("Editor")),
+            KeyBinding::new("alt-4", KindInstruction, Some("Editor")),
+            KeyBinding::new("alt-5", KindCondition, Some("Editor")),
+            KeyBinding::new("alt-6", KindNote, Some("Editor")),
             KeyBinding::new("ctrl-shift-m", ToggleProblems, Some("Editor")),
             KeyBinding::new("f1", ShowHelp, Some("Editor")),
             KeyBinding::new("ctrl-k", ShowPalette, Some("Editor")),
@@ -8907,6 +9102,47 @@ mod tests {
         assert!(inspector_fields(&doc, &Selection::Nodes(vec![ids[0]]), true).is_empty());
         assert!(inspector_fields(&doc, &Selection::None, false).is_empty());
         assert!(inspector_fields(&doc, &Selection::Nodes(ids[..2].to_vec()), false).is_empty());
+    }
+
+    #[test]
+    fn each_selection_has_at_most_the_checkbox_the_inspector_draws() {
+        let mut doc = Doc::default();
+        let line = doc.add_node(0.0, 0.0);
+        let hub = doc.add_node(0.0, 0.0);
+        let check = doc.add_node(0.0, 0.0);
+        let step = doc.add_node(0.0, 0.0);
+        let next = doc.add_node(0.0, 0.0);
+        doc.node_mut(hub).unwrap().kind = NodeKind::Hub;
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.node_mut(step).unwrap().kind = NodeKind::Instruction;
+        for from in [line, hub, check, step] {
+            doc.add_edge(from, next);
+        }
+        let node = |id: NodeId| inspector_checkbox(&doc, &Selection::Nodes(vec![id]), false);
+        let edge = |from: NodeId| {
+            let index = doc.edges.iter().position(|e| e.from == from).unwrap();
+            inspector_checkbox(&doc, &Selection::Edge(index), false)
+        };
+        // Only a line is an ending; the other kinds have no box of their own.
+        assert_eq!(node(line), Some(Checkbox::Ending));
+        for id in [hub, check, step] {
+            assert_eq!(node(id), None);
+        }
+        // A choice the player reads is once-only; a branch has its pin; plumbing has none.
+        assert_eq!(edge(line), Some(Checkbox::Once));
+        assert_eq!(edge(hub), Some(Checkbox::Once));
+        assert_eq!(edge(check), Some(Checkbox::Branch));
+        assert_eq!(edge(step), None);
+        // Nothing while the sidebar is the player, for a group, or for nothing.
+        assert_eq!(
+            inspector_checkbox(&doc, &Selection::Nodes(vec![line]), true),
+            None
+        );
+        assert_eq!(
+            inspector_checkbox(&doc, &Selection::Nodes(vec![line, hub]), false),
+            None
+        );
+        assert_eq!(inspector_checkbox(&doc, &Selection::None, false), None);
     }
 
     #[test]
