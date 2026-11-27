@@ -412,7 +412,7 @@ struct Editor {
     var_input: Entity<TextInput>,
     /// What `var_input` is renaming, or `None` when it is declaring a new one. The panel
     /// has one field and several jobs; this and `Editor::pane` are which. Never cleared on
-    /// a document swap — `vars_pane` filters a name the document no longer has, which
+    /// a document swap — `live_rename` filters a name the document no longer has, which
     /// covers the swap, an undo and a delete in one place instead of three that can be
     /// forgotten.
     renaming: Option<Rename>,
@@ -2687,10 +2687,6 @@ impl Editor {
             let (x, y) = map_cell(i, n);
             let nodes = self.doc.nodes_in(flow).count();
             let lines = self.doc.stats(|node| node.flow == flow).lines;
-            let plural = |n: usize, one: &str| match n {
-                1 => format!("1 {one}"),
-                _ => format!("{n} {one}s"),
-            };
             let on = flow == self.flow;
             div()
                 .absolute()
@@ -3645,74 +3641,14 @@ impl Editor {
     /// while a run is up.
     fn vars_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let playing = self.play.as_ref().map(|run| self.doc.live_vars(run));
-        // A rename the document has moved on from — undone, deleted, or in a file that has
-        // since been closed — is simply not a rename any more.
-        let renaming = self
-            .renaming
-            .clone()
-            .filter(|rename| match (rename, self.pane) {
-                (Rename::Set(set), SidePane::Tags) => self.doc.tag_sets().contains(&set.as_str()),
-                (Rename::Set(set), _) => self.doc.all_sets().contains(&set.as_str()),
-                (Rename::Item(name), SidePane::Tags) => {
-                    self.doc.all_tags().contains(&name.as_str())
-                }
-                (Rename::Item(name), SidePane::Variables) => self.doc.variable(name).is_some(),
-                (Rename::Item(name), SidePane::Cast) => self.doc.character(name).is_some(),
-                (Rename::Item(name), SidePane::Flows) => {
-                    self.doc.all_flows().contains(&name.as_str())
-                }
-            });
-        let is_rename = renaming.is_some();
-        let renaming_set = matches!(renaming, Some(Rename::Set(_)));
-        let pane = self.pane;
-        // Owned for the same reason the flow names are: the picker chips borrow `cx`. The
-        // Tags tab groups by the same dotted convention, so it gets the same picker.
-        let sets: Vec<String> = match pane {
-            SidePane::Tags => self.doc.tag_sets(),
-            _ => self.doc.all_sets(),
-        }
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        // Aimed at a set the document no longer has is aimed at nothing, exactly as above.
-        let set = match sets.contains(&self.set) {
-            true => self.set.clone(),
-            false => String::new(),
+        let list = match self.pane {
+            SidePane::Variables => self.variable_list(playing.as_ref(), cx),
+            SidePane::Cast => (0..self.doc.characters.len())
+                .map(|i| self.cast_row(i, playing.is_some(), cx).into_any_element())
+                .collect(),
+            SidePane::Flows => self.flow_list(playing.is_some(), cx),
+            SidePane::Tags => self.tag_list(playing.is_some(), cx),
         };
-        let selected: Vec<NodeId> = self.selection.nodes().to_vec();
-        // Tags grouped the way variables are below, by the set in the name.
-        let mut tag_groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
-        for tag in self.doc.all_tags() {
-            let set = split_set(tag).0.map(str::to_string);
-            match tag_groups.iter_mut().find(|(s, _)| *s == set) {
-                Some((_, rows)) => rows.push(tag.to_string()),
-                None => tag_groups.push((set, vec![tag.to_string()])),
-            }
-        }
-        // Ungrouped tags lead, then each set in order — `all_tags` is sorted, but a set's
-        // first tag can sort after a loose one.
-        tag_groups.sort_by_key(|(set, _)| set.as_ref().map(|s| s.to_lowercase()));
-        let any_tag_sets = tag_groups.iter().any(|(set, _)| set.is_some());
-        // Owned, so the rows can borrow `cx` mutably. The main flow leads, then every other
-        // canvas the document has — declared or merely stood on, so no node is unreachable.
-        let flows: Vec<String> = std::iter::once(String::new())
-            .chain(self.doc.all_flows().into_iter().map(str::to_string))
-            .collect();
-
-        // Grouped by the set in the name, in first-seen order, each group carrying the
-        // *index* into `doc.variables` — every row id and handler still keys on the whole
-        // dotted name, since that is what the document is keyed by.
-        let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
-        for (i, variable) in self.doc.variables.iter().enumerate() {
-            let set = split_set(&variable.name).0;
-            match groups.iter_mut().find(|(s, _)| *s == set) {
-                Some((_, rows)) => rows.push(i),
-                None => groups.push((set, vec![i])),
-            }
-        }
-        // Nothing dotted means nothing to group, and a document that never adopted the
-        // convention must not grow a header saying so.
-        let any_sets = groups.iter().any(|(set, _)| set.is_some());
 
         div()
             .flex()
@@ -3726,62 +3662,18 @@ impl Editor {
             .border_r_1()
             .border_color(theme::divider())
             .text_color(theme::text())
-            // A segmented control in equal thirds. Chips that wrapped left "Flows" alone on a
-            // second line, and "Variables (now)" while playing was wider than the pane; the
-            // live state is a line of its own below instead of a longer label.
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_none()
-                    .gap(px(2.0))
-                    .p(px(2.0))
-                    .rounded_md()
-                    .bg(theme::canvas())
-                    .children(
-                        [
-                            (SidePane::Variables, "Variables", "pane-variables"),
-                            (SidePane::Cast, "Cast", "pane-cast"),
-                            (SidePane::Flows, "Flows", "pane-flows"),
-                            (SidePane::Tags, "Tags", "pane-tags"),
-                        ]
-                        .map(|(pane, label, element_id)| {
-                            let on = pane == self.pane;
-                            div()
-                                .id(element_id)
-                                // Sized by content, then shared out: four equal quarters of
-                                // this pane are narrower than "Variables" is.
-                                .flex_auto()
-                                .flex()
-                                .justify_center()
-                                .px_1()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_size(px(theme::SMALL))
-                                .font_weight(if on {
-                                    FontWeight::SEMIBOLD
-                                } else {
-                                    FontWeight::NORMAL
-                                })
-                                .when(on, |this| this.bg(theme::pressed()))
-                                .text_color(if on { theme::text() } else { theme::text_faint() })
-                                .hover(|style| style.text_color(theme::text()))
-                                .child(label)
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.switch_pane(pane, cx)),
-                                )
-                        }),
-                    ),
+            .child(self.pane_tabs(cx))
+            .when(
+                playing.is_some() && self.pane == SidePane::Variables,
+                |this| {
+                    this.child(
+                        div()
+                            .type_hint()
+                            .text_color(theme::playing())
+                            .child("Live values — click one to change it for this run"),
+                    )
+                },
             )
-            .when(playing.is_some() && self.pane == SidePane::Variables, |this| {
-                this.child(
-                    div()
-                        .type_hint()
-                        .text_color(theme::playing())
-                        .child("Live values — click one to change it for this run"),
-                )
-            })
             // Whose the locked names are, once, above the list that marks them.
             .when(
                 !self.doc.outside_from().is_empty()
@@ -3805,369 +3697,483 @@ impl Editor {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .map(|list| match self.pane {
-                        SidePane::Cast => list.children(
-                            (0..self.doc.characters.len())
-                                .map(|i| self.cast_row(i, playing.is_some(), cx)),
-                        ),
-                        SidePane::Tags if tag_groups.is_empty() => list.child(
-                            div()
-                                .text_color(theme::text_faint())
-                                .child("No tags yet. Select nodes and tag them below."),
-                        ),
-                        SidePane::Tags => list.children(
-                            tag_groups
-                                .into_iter()
-                                .enumerate()
-                                .map(|(g, (header, rows))| {
-                                    let rows: Vec<_> = rows
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(i, tag)| {
-                                            self.tag_row(g * 1000 + i, tag, playing.is_some(), cx)
-                                        })
-                                        .collect();
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .when(any_tag_sets, |this| {
-                                            this.child(
-                                                div()
-                                                    .flex()
-                                                    .gap_2()
-                                                    .items_center()
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w(px(0.0))
-                                                            .text_color(theme::text_faint())
-                                                            .one_line()
-                                                            .child(header.clone().unwrap_or_else(
-                                                                || "(ungrouped)".to_string(),
-                                                            )),
-                                                    )
-                                                    .when_some(
-                                                        header.filter(|_| playing.is_none()),
-                                                        |this, name| {
-                                                            this.child(
-                                                                self.set_rename_button(&name, cx),
-                                                            )
-                                                        },
-                                                    ),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .when(any_tag_sets, |this| this.pl_2())
-                                                .children(rows),
-                                        )
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                        SidePane::Flows => list.children(
-                            flows
-                                .iter()
-                                .cloned()
-                                .enumerate()
-                                .map(|(i, flow)| self.flow_row(i, flow, playing.is_some(), cx))
-                                .collect::<Vec<_>>(),
-                        ),
-                        SidePane::Variables => list.children(groups.into_iter().map(|(set, rows)| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .when(any_sets, |this| {
-                                let header = set.map(str::to_string);
-                                this.child(
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .flex_grow()
-                                                .type_label()
-                                                .one_line()
-                                                .child(header.clone().unwrap_or_else(|| {
-                                                    "(ungrouped)".to_string()
-                                                })),
-                                        )
-                                        // `(ungrouped)` gets none: it is not a set, so
-                                        // there is no name to rewrite.
-                                        // Nor does a set holding a name another tool
-                                        // declared: it is that tool's to name.
-                                        .when_some(
-                                            header.filter(|name| {
-                                                playing.is_none() && !self.doc.set_is_outside(name)
-                                            }),
-                                            |this, name| {
-                                                this.child(self.set_rename_button(&name, cx))
-                                            },
-                                        ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .when(any_sets, |this| this.pl_2())
-                                    .children(rows.into_iter().map(|i| {
-                                        self.var_row(i, playing.as_ref(), cx)
-                                    })),
-                            )
-                        })),
-                    }),
+                    .children(list),
             )
-            // The foot: the whole cast's dialogue on the Cast tab, the open canvas's on the
-            // Flows tab — the one a click on a flow row has just switched to.
-            .map(|this| {
-                let (whose, count) = match pane {
-                    SidePane::Variables | SidePane::Tags => return this,
-                    SidePane::Cast => ("Whole cast".to_string(), self.doc.stats(|_| true)),
-                    SidePane::Flows => {
-                        let flow = self.flow.as_str();
-                        let whose = if flow.is_empty() { "(main)" } else { flow };
-                        (format!("On {whose}"), self.doc.stats(|node| node.flow == flow))
-                    }
-                };
-                let plural = |n: usize, one: &str| match n {
-                    1 => format!("1 {one}"),
-                    _ => format!("{n} {one}s"),
-                };
+            .children(self.pane_foot())
+            .when(playing.is_none(), |this| {
+                this.children(self.declare_field(cx))
+            })
+    }
+
+    /// The tabs over the left pane: a segmented control in equal thirds. Chips that wrapped
+    /// left "Flows" alone on a second line, and "Variables (now)" while playing was wider
+    /// than the pane; the live state is a line of its own below instead of a longer label.
+    fn pane_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .gap(px(2.0))
+            .p(px(2.0))
+            .rounded_md()
+            .bg(theme::canvas())
+            .children(
+                [
+                    (SidePane::Variables, "Variables", "pane-variables"),
+                    (SidePane::Cast, "Cast", "pane-cast"),
+                    (SidePane::Flows, "Flows", "pane-flows"),
+                    (SidePane::Tags, "Tags", "pane-tags"),
+                ]
+                .map(|(pane, label, element_id)| {
+                    let on = pane == self.pane;
+                    div()
+                        .id(element_id)
+                        // Sized by content, then shared out: four equal quarters of this
+                        // pane are narrower than "Variables" is.
+                        .flex_auto()
+                        .flex()
+                        .justify_center()
+                        .px_1()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_size(px(theme::SMALL))
+                        .font_weight(if on {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .when(on, |this| this.bg(theme::pressed()))
+                        .text_color(if on {
+                            theme::text()
+                        } else {
+                            theme::text_faint()
+                        })
+                        .hover(|style| style.text_color(theme::text()))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.switch_pane(pane, cx)))
+                }),
+            )
+    }
+
+    /// The Variables tab's rows, grouped by the set in the name in first-seen order. Each
+    /// group carries *indices* into `doc.variables` — every row id and handler still keys on
+    /// the whole dotted name, since that is what the document is keyed by.
+    fn variable_list(&self, playing: Option<&VarState>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+        for (i, variable) in self.doc.variables.iter().enumerate() {
+            let set = split_set(&variable.name).0;
+            match groups.iter_mut().find(|(s, _)| *s == set) {
+                Some((_, rows)) => rows.push(i),
+                None => groups.push((set, vec![i])),
+            }
+        }
+        // Nothing dotted means nothing to group, and a document that never adopted the
+        // convention must not grow a header saying so.
+        let grouped = groups.iter().any(|(set, _)| set.is_some());
+        groups
+            .into_iter()
+            .map(|(set, rows)| {
+                let rows = rows
+                    .into_iter()
+                    .map(|i| self.var_row(i, playing, cx).into_any_element());
+                // `(ungrouped)` gets no rename button: it is not a set, so there is no name
+                // to rewrite. Nor does a set holding a name another tool declared: it is that
+                // tool's to name.
+                let renamable =
+                    set.is_some_and(|name| playing.is_none() && !self.doc.set_is_outside(name));
+                let label = div().flex_grow().type_label();
+                self.set_group(set, grouped, label, renamable, rows.collect(), cx)
+            })
+            .collect()
+    }
+
+    /// The Tags tab's rows, grouped the way variables are, by the set in the name.
+    fn tag_list(&self, playing: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for tag in self.doc.all_tags() {
+            let set = split_set(tag).0.map(str::to_string);
+            match groups.iter_mut().find(|(s, _)| *s == set) {
+                Some((_, rows)) => rows.push(tag.to_string()),
+                None => groups.push((set, vec![tag.to_string()])),
+            }
+        }
+        if groups.is_empty() {
+            return vec![
+                div()
+                    .text_color(theme::text_faint())
+                    .child("No tags yet. Select nodes and tag them below.")
+                    .into_any_element(),
+            ];
+        }
+        // Ungrouped tags lead, then each set in order — `all_tags` is sorted, but a set's
+        // first tag can sort after a loose one.
+        groups.sort_by_key(|(set, _)| set.as_ref().map(|s| s.to_lowercase()));
+        let grouped = groups.iter().any(|(set, _)| set.is_some());
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(g, (set, tags))| {
+                let rows = tags
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, tag)| {
+                        self.tag_row(g * 1000 + i, tag, playing, cx)
+                            .into_any_element()
+                    })
+                    .collect();
+                let renamable = set.is_some() && !playing;
+                let label = div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(theme::text_faint());
+                self.set_group(set.as_deref(), grouped, label, renamable, rows, cx)
+            })
+            .collect()
+    }
+
+    /// The Flows tab's rows. The main flow leads, then every other canvas the document has —
+    /// declared or merely stood on, so no node is unreachable.
+    fn flow_list(&self, playing: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        std::iter::once(String::new())
+            .chain(self.doc.all_flows().into_iter().map(str::to_string))
+            .enumerate()
+            .map(|(i, flow)| self.flow_row(i, flow, playing, cx).into_any_element())
+            .collect()
+    }
+
+    /// One group of a list grouped by set: a header naming the set — only once the list
+    /// has any set at all, `grouped` — and its rows under it, indented to match. `label` is
+    /// the header text's styling, which the Variables and Tags tabs draw differently.
+    fn set_group(
+        &self,
+        set: Option<&str>,
+        grouped: bool,
+        label: gpui::Div,
+        renamable: bool,
+        rows: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(grouped, |this| {
                 this.child(
                     div()
-                        .pt_1()
-                        .border_t_1()
-                        .border_color(theme::divider())
-                        .text_color(theme::text_faint())
-                        // Two lines, since a flow name and both counts overflow the pane.
-                        .child(div().one_line().child(whose))
-                        .child(div().one_line().child(format!(
-                            "{} · {}",
-                            plural(count.lines, "line"),
-                            plural(count.words, "word")
-                        ))),
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            label
+                                .one_line()
+                                .child(set.unwrap_or("(ungrouped)").to_string()),
+                        )
+                        .when_some(set.filter(|_| renamable), |this, name| {
+                            this.child(self.set_rename_button(name, cx))
+                        }),
                 )
             })
-            .when(playing.is_none(), |this| {
-                this.when_some(renaming.clone(), |this, old| {
-                    let what = match old {
-                        Rename::Set(name) => format!("Rename set \"{name}\""),
-                        Rename::Item(name) => format!("Rename \"{name}\""),
-                    };
-                    this.child(div().type_label().one_line().child(what))
-                })
-                // Only above the variables, and not while the field holds a set name.
-                .when(
-                    matches!(pane, SidePane::Variables | SidePane::Tags) && !renaming_set,
-                    |this| {
-                        this.child(div().type_section().pt_2().child("DECLARE IN SET"))
-                            .child(self.set_picker(&set, &sets, cx))
-                    },
-                )
-                .child(
+            .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_grow().child(self.var_input.clone()))
-                    // No `TextInput` in the crate binds enter, so the click is the whole
-                    // affordance. A blank or duplicate name is simply refused, and the
-                    // field keeping its content is what says so — which is also how a
-                    // rename to the name it already has reads.
-                    .child(
-                        div()
-                            .id("var-commit")
-                            .px_2()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .bg(theme::raised())
-                            .text_color(theme::text_muted())
-                            .hover(|style| style.text_color(theme::text()))
-                            .child(if is_rename { "✓" } else { "+" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let typed = this.var_input.read(cx).content().to_string();
-                                // On the variables tab the field holds only the rest of the
-                                // name; the picker holds the set. Not when it is renaming a
-                                // set, where the field *is* the set name.
-                                let name = match (pane, renaming_set) {
-                                    (SidePane::Variables | SidePane::Tags, false) => {
-                                        join_set(&set, typed.trim())
-                                    }
-                                    _ => typed,
-                                };
-                                let free = match (pane, &renaming) {
-                                    // A tag rename merges rather than refuses, so the only
-                                    // question is whether it would change anything; a new
-                                    // tag goes onto the selection, and only if some of it
-                                    // lacks it.
-                                    (SidePane::Tags, Some(Rename::Item(old) | Rename::Set(old))) => {
-                                        this.doc.tag_rename_ok(old, &name)
-                                    }
-                                    (SidePane::Tags, None) => this.doc.can_tag(&selected, &name),
-                                    _ => true,
-                                } && match (pane, renaming_set) {
-                                    (SidePane::Tags, _) => true,
-                                    // The set's old name too: one holding an outside name is
-                                    // not renamed, and must not cost a checkpoint to find out.
-                                    (_, true) => {
-                                        this.doc.set_name_free(&name)
-                                            && !matches!(&renaming, Some(Rename::Set(old))
-                                                if this.doc.set_is_outside(old))
-                                    }
-                                    (SidePane::Cast, _) => this.doc.character_name_free(&name),
-                                    (SidePane::Variables, _) => {
-                                        this.doc.variable_name_free(&name)
-                                    }
-                                    (SidePane::Flows, _) => this.doc.flow_name_free(&name),
-                                };
-                                if !free {
-                                    return;
-                                }
-                                this.checkpoint();
-                                match (&renaming, pane) {
-                                    // A tag, or a whole group of them: every node carrying
-                                    // one follows, and the search that found them too.
-                                    (Some(Rename::Item(old) | Rename::Set(old)), SidePane::Tags) => {
-                                        let moved = this.doc.rename_tag(old, &name);
-                                        let s = if moved == 1 { "" } else { "s" };
-                                        let name = clean_tag(&name).unwrap_or_default();
-                                        if this.set == *old {
-                                            this.set = name.clone();
-                                        }
-                                        this.set_status(
-                                            format!(
-                                                "Renamed #{old} to #{name} — {moved} node{s}."
-                                            ),
-                                            cx,
-                                        );
-                                    }
-                                    (None, SidePane::Tags) => {
-                                        let tagged = this.doc.add_tag(&selected, &name);
-                                        let s = if tagged == 1 { "" } else { "s" };
-                                        let name = clean_tag(&name).unwrap_or_default();
-                                        this.set_status(
-                                            format!("Tagged {tagged} node{s} #{name}."),
-                                            cx,
-                                        );
-                                    }
-                                    // Every dotted name in the set follows, and so does
-                                    // every effect and check naming one.
-                                    (Some(Rename::Set(old)), _) => {
-                                        let moved = this.doc.rename_set(old, &name);
-                                        let s = if moved == 1 { "" } else { "s" };
-                                        let name = name.trim();
-                                        if this.set == *old {
-                                            this.set = name.to_string();
-                                        }
-                                        this.set_status(
-                                            format!(
-                                                "Renamed \"{old}\" to \"{name}\" — {moved} variable{s}."
-                                            ),
-                                            cx,
-                                        );
-                                    }
-                                    // Every line the character speaks follows the record.
-                                    (Some(Rename::Item(old)), SidePane::Cast) => {
-                                        let moved = this.doc.rename_character(old, &name);
-                                        let s = if moved == 1 { "" } else { "s" };
-                                        let name = name.trim();
-                                        // The rename rewrites who speaks, never what is said,
-                                        // so say how much prose still has the old name in it.
-                                        let left = this
-                                            .doc
-                                            .mentions(&Ref::Character(old.clone()))
-                                            .len();
-                                        let still = match left {
-                                            0 => String::new(),
-                                            1 => format!(" 1 line still says \"{old}\"."),
-                                            n => format!(" {n} lines still say \"{old}\"."),
-                                        };
-                                        this.set_status(
-                                            format!(
-                                                "Renamed \"{old}\" to \"{name}\" — {moved} line{s}.{still}"
-                                            ),
-                                            cx,
-                                        );
-                                    }
-                                    // Effects and checks follow it, so say how many did.
-                                    (Some(Rename::Item(old)), SidePane::Variables) => {
-                                        let moved = this.doc.rename_variable(old, &name);
-                                        let s = if moved == 1 { "" } else { "s" };
-                                        let name = name.trim();
-                                        this.set_status(
-                                            format!(
-                                                "Renamed \"{old}\" to \"{name}\" — {moved} reference{s}."
-                                            ),
-                                            cx,
-                                        );
-                                    }
-                                    // Renaming a canvas carries every node standing on it,
-                                    // and the one on screen with them.
-                                    (Some(Rename::Item(old)), SidePane::Flows) => {
-                                        let moved = this.doc.rename_flow(old, &name);
-                                        let s = if moved == 1 { "" } else { "s" };
-                                        let name = name.trim();
-                                        if this.flow == *old {
-                                            this.flow = name.to_string();
-                                        }
-                                        this.set_status(
-                                            format!(
-                                                "Renamed \"{old}\" to \"{name}\" — {moved} node{s}."
-                                            ),
-                                            cx,
-                                        );
-                                    }
-                                    // A colour off the palette, so a new cast comes out tinted
-                                    // apart without anybody picking one.
-                                    (None, SidePane::Cast) => {
-                                        let color = CAST_COLORS
-                                            [this.doc.characters.len() % CAST_COLORS.len()];
-                                        this.doc.add_character(&name, color);
-                                    }
-                                    (None, SidePane::Variables) => {
-                                        this.doc.add_variable(&name);
-                                    }
-                                    (None, SidePane::Flows) => {
-                                        this.doc.add_flow(&name);
-                                    }
-                                }
-                                this.renaming = None;
-                                // The set is deliberately *not* cleared: declaring three
-                                // flags into one set should not mean clicking its chip
-                                // three times. Switching tabs and cancelling clear it.
-                                this.var_input
-                                    .update(cx, |input, cx| input.set_content("", cx));
-                                cx.notify();
-                            })),
-                    )
-                    .when(is_rename, |this| {
-                        this.child(
-                            div()
-                                .id("var-rename-cancel")
-                                .px_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_color(theme::text_faint())
-                                .hover(|style| style.text_color(theme::text()))
-                                .child("✗")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.renaming = None;
-                                    this.set = String::new();
-                                    this.var_input
-                                        .update(cx, |input, cx| input.set_content("", cx));
-                                    cx.notify();
-                                })),
-                        )
-                    }),
+                    .flex_col()
+                    .gap_1()
+                    .when(grouped, |this| this.pl_2())
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// The foot: the whole cast's dialogue on the Cast tab, the open canvas's on the Flows
+    /// tab — the one a click on a flow row has just switched to.
+    fn pane_foot(&self) -> Option<impl IntoElement + use<>> {
+        let (whose, count) = match self.pane {
+            SidePane::Variables | SidePane::Tags => return None,
+            SidePane::Cast => ("Whole cast".to_string(), self.doc.stats(|_| true)),
+            SidePane::Flows => {
+                let flow = self.flow.as_str();
+                let whose = if flow.is_empty() { "(main)" } else { flow };
+                (
+                    format!("On {whose}"),
+                    self.doc.stats(|node| node.flow == flow),
                 )
+            }
+        };
+        Some(
+            div()
+                .pt_1()
+                .border_t_1()
+                .border_color(theme::divider())
+                .text_color(theme::text_faint())
+                // Two lines, since a flow name and both counts overflow the pane.
+                .child(div().one_line().child(whose))
+                .child(div().one_line().child(format!(
+                    "{} · {}",
+                    plural(count.lines, "line"),
+                    plural(count.words, "word")
+                ))),
+        )
+    }
+
+    /// `renaming`, if the document still has what it names. A rename the document has moved
+    /// on from — undone, deleted, or in a file that has since been closed — is simply not a
+    /// rename any more.
+    fn live_rename(&self) -> Option<Rename> {
+        self.renaming
+            .clone()
+            .filter(|rename| match (rename, self.pane) {
+                (Rename::Set(set), SidePane::Tags) => self.doc.tag_sets().contains(&set.as_str()),
+                (Rename::Set(set), _) => self.doc.all_sets().contains(&set.as_str()),
+                (Rename::Item(name), SidePane::Tags) => {
+                    self.doc.all_tags().contains(&name.as_str())
+                }
+                (Rename::Item(name), SidePane::Variables) => self.doc.variable(name).is_some(),
+                (Rename::Item(name), SidePane::Cast) => self.doc.character(name).is_some(),
+                (Rename::Item(name), SidePane::Flows) => {
+                    self.doc.all_flows().contains(&name.as_str())
+                }
             })
+    }
+
+    /// The sets the declare field's picker offers, owned because the picker's chips borrow
+    /// `cx`. The Tags tab groups by the same dotted convention, so it gets the same picker.
+    fn pane_sets(&self) -> Vec<String> {
+        match self.pane {
+            SidePane::Tags => self.doc.tag_sets(),
+            _ => self.doc.all_sets(),
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// `set`, if `sets` still has it: aimed at a set the document no longer has is aimed at
+    /// nothing, as for `live_rename`.
+    fn live_set(&self, sets: &[String]) -> String {
+        match sets.contains(&self.set) {
+            true => self.set.clone(),
+            false => String::new(),
+        }
+    }
+
+    /// The foot of the pane outside play: what is being renamed, the set picker, and the
+    /// one text field with its commit (and, mid-rename, cancel) button.
+    fn declare_field(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let renaming = self.live_rename();
+        let mut parts = Vec::new();
+        if let Some(old) = &renaming {
+            let what = match old {
+                Rename::Set(name) => format!("Rename set \"{name}\""),
+                Rename::Item(name) => format!("Rename \"{name}\""),
+            };
+            parts.push(div().type_label().one_line().child(what).into_any_element());
+        }
+        // Only above the variables and tags, and not while the field holds a set name.
+        if matches!(self.pane, SidePane::Variables | SidePane::Tags)
+            && !matches!(renaming, Some(Rename::Set(_)))
+        {
+            let sets = self.pane_sets();
+            parts.push(
+                div()
+                    .type_section()
+                    .pt_2()
+                    .child("DECLARE IN SET")
+                    .into_any_element(),
+            );
+            parts.push(
+                self.set_picker(&self.live_set(&sets), &sets, cx)
+                    .into_any_element(),
+            );
+        }
+        let row = div()
+            .flex()
+            .gap_2()
+            .items_center()
+            .child(div().flex_grow().child(self.var_input.clone()))
+            // No `TextInput` in the crate binds enter, so the click is the whole affordance.
+            // A blank or duplicate name is simply refused, and the field keeping its content
+            // is what says so — which is also how a rename to the name it already has reads.
+            .child(
+                div()
+                    .id("var-commit")
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(theme::raised())
+                    .text_color(theme::text_muted())
+                    .hover(|style| style.text_color(theme::text()))
+                    .child(if renaming.is_some() { "✓" } else { "+" })
+                    .on_click(cx.listener(|this, _, _, cx| this.commit_var_input(cx))),
+            )
+            .when(renaming.is_some(), |this| {
+                this.child(
+                    div()
+                        .id("var-rename-cancel")
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme::text_faint())
+                        .hover(|style| style.text_color(theme::text()))
+                        .child("✗")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_var_input(cx))),
+                )
+            });
+        parts.push(row.into_any_element());
+        parts
+    }
+
+    /// The declare field's commit: a rename when one is live, otherwise a new variable,
+    /// character, flow or tag, depending on the tab. Refused without a checkpoint when the
+    /// model would refuse it, so a rejected name leaves no empty undo step.
+    fn commit_var_input(&mut self, cx: &mut Context<Self>) {
+        let renaming = self.live_rename();
+        let typed = self.var_input.read(cx).content().to_string();
+        // On the variables and tags tabs the field holds only the rest of the name; the
+        // picker holds the set. Not when it is renaming a set, where the field *is* the set
+        // name.
+        let name = match (self.pane, &renaming) {
+            (SidePane::Variables | SidePane::Tags, None | Some(Rename::Item(_))) => {
+                join_set(&self.live_set(&self.pane_sets()), typed.trim())
+            }
+            _ => typed,
+        };
+        if !self.declare_ok(renaming.as_ref(), &name) {
+            return;
+        }
+        self.checkpoint();
+        match renaming {
+            Some(old) => self.rename_in_pane(old, &name, cx),
+            None => self.declare_in_pane(&name, cx),
+        }
+        self.renaming = None;
+        // The set is deliberately *not* cleared: declaring three flags into one set should
+        // not mean clicking its chip three times. Switching tabs and cancelling clear it.
+        self.var_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        cx.notify();
+    }
+
+    fn cancel_var_input(&mut self, cx: &mut Context<Self>) {
+        self.renaming = None;
+        self.set = String::new();
+        self.var_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        cx.notify();
+    }
+
+    /// Whether the model would take `name` — the pre-checkpoint check for every job the
+    /// declare field does.
+    fn declare_ok(&self, renaming: Option<&Rename>, name: &str) -> bool {
+        match (self.pane, renaming) {
+            // A tag rename merges rather than refuses, so the only question is whether it
+            // would change anything; a new tag goes onto the selection, and only if some of
+            // it lacks it.
+            (SidePane::Tags, Some(Rename::Item(old) | Rename::Set(old))) => {
+                self.doc.tag_rename_ok(old, name)
+            }
+            (SidePane::Tags, None) => self.doc.can_tag(self.selection.nodes(), name),
+            // The set's old name too: one holding an outside name is not renamed, and must
+            // not cost a checkpoint to find out.
+            (_, Some(Rename::Set(old))) => {
+                self.doc.set_name_free(name) && !self.doc.set_is_outside(old)
+            }
+            (SidePane::Cast, _) => self.doc.character_name_free(name),
+            (SidePane::Variables, _) => self.doc.variable_name_free(name),
+            (SidePane::Flows, _) => self.doc.flow_name_free(name),
+        }
+    }
+
+    /// Renames what `old` names on the current tab, carrying every reference with it, and
+    /// says how many followed.
+    fn rename_in_pane(&mut self, old: Rename, name: &str, cx: &mut Context<Self>) {
+        let status = match (old, self.pane) {
+            // A tag, or a whole group of them: every node carrying one follows, and the
+            // search that found them too.
+            (Rename::Item(old) | Rename::Set(old), SidePane::Tags) => {
+                let moved = self.doc.rename_tag(&old, name);
+                let name = clean_tag(name).unwrap_or_default();
+                if self.set == old {
+                    self.set = name.clone();
+                }
+                format!("Renamed #{old} to #{name} — {}.", plural(moved, "node"))
+            }
+            // Every dotted name in the set follows, and so does every effect and check
+            // naming one.
+            (Rename::Set(old), _) => {
+                let moved = self.doc.rename_set(&old, name);
+                let name = name.trim();
+                if self.set == old {
+                    self.set = name.to_string();
+                }
+                format!(
+                    "Renamed \"{old}\" to \"{name}\" — {}.",
+                    plural(moved, "variable")
+                )
+            }
+            // Every line the character speaks follows the record.
+            (Rename::Item(old), SidePane::Cast) => {
+                let moved = self.doc.rename_character(&old, name);
+                // The rename rewrites who speaks, never what is said, so say how much prose
+                // still has the old name in it.
+                let still = match self.doc.mentions(&Ref::Character(old.clone())).len() {
+                    0 => String::new(),
+                    1 => format!(" 1 line still says \"{old}\"."),
+                    n => format!(" {n} lines still say \"{old}\"."),
+                };
+                let name = name.trim();
+                format!(
+                    "Renamed \"{old}\" to \"{name}\" — {}.{still}",
+                    plural(moved, "line")
+                )
+            }
+            // Effects and checks follow it, so say how many did.
+            (Rename::Item(old), SidePane::Variables) => {
+                let moved = self.doc.rename_variable(&old, name);
+                let name = name.trim();
+                format!(
+                    "Renamed \"{old}\" to \"{name}\" — {}.",
+                    plural(moved, "reference")
+                )
+            }
+            // Renaming a canvas carries every node standing on it, and the one on screen
+            // with them.
+            (Rename::Item(old), SidePane::Flows) => {
+                let moved = self.doc.rename_flow(&old, name);
+                let name = name.trim();
+                if self.flow == old {
+                    self.flow = name.to_string();
+                }
+                format!(
+                    "Renamed \"{old}\" to \"{name}\" — {}.",
+                    plural(moved, "node")
+                )
+            }
+        };
+        self.set_status(status, cx);
+    }
+
+    /// Declares `name` on the current tab — or, on the Tags tab, puts it on the selection.
+    fn declare_in_pane(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.pane {
+            SidePane::Tags => {
+                let tagged = self.doc.add_tag(self.selection.nodes(), name);
+                let name = clean_tag(name).unwrap_or_default();
+                self.set_status(format!("Tagged {} #{name}.", plural(tagged, "node")), cx);
+            }
+            // A colour off the palette, so a new cast comes out tinted apart without anybody
+            // picking one.
+            SidePane::Cast => {
+                let color = CAST_COLORS[self.doc.characters.len() % CAST_COLORS.len()];
+                self.doc.add_character(name, color);
+            }
+            SidePane::Variables => {
+                self.doc.add_variable(name);
+            }
+            SidePane::Flows => {
+                self.doc.add_flow(name);
+            }
+        }
     }
 
     /// The target the number editor is aimed at, if the document still has it. A variable or
@@ -7299,6 +7305,14 @@ fn menu_dropdown(items: &'static [MenuItem], cx: &mut Context<Editor>) -> impl I
                     }))
             })),
     )
+}
+
+/// `n` of a thing, with the `s` only when it is not one: "1 node", "0 nodes", "3 nodes".
+fn plural(n: usize, one: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        _ => format!("{n} {one}s"),
+    }
 }
 
 /// What to call a node when it has nothing to say for itself. Its *position*, not its id:
