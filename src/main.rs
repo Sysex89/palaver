@@ -63,6 +63,9 @@ actions!(
         GoWireOut,
         GoWireBack,
         GoStart,
+        EditSelection,
+        NextField,
+        PrevField,
         FocusCanvas,
         New,
         Save,
@@ -252,6 +255,9 @@ const MENUS: &[MenuSpec] = &[
                 e.on_move_choice_down(&MoveChoiceDown, w, cx)
             }),
             ("Find…", "Ctrl+F", |e, w, cx| e.on_find(&Find, w, cx)),
+            ("Edit selection", "Enter", |e, w, cx| {
+                e.on_edit_selection(&EditSelection, w, cx)
+            }),
             ("Delete selection", "Del", |e, w, cx| {
                 e.on_delete(&DeleteNode, w, cx)
             }),
@@ -1843,7 +1849,6 @@ impl Editor {
             }
             let node = self.doc.node(id).expect("hit_test returned a live node");
             let grab = (x - node.x, y - node.y);
-            let kind = node.kind;
             // Grabbing a node that is already selected keeps the set, which is what
             // makes a group drag possible; grabbing any other node replaces it.
             if !self.selection.nodes().contains(&id) {
@@ -1858,15 +1863,11 @@ impl Editor {
             // the whole selection, and no play-through in the sidebar: focus on a field that
             // is not rendered lands nowhere.
             if ev.click_count == 2
-                && has_text_field(kind)
                 && self.selection.only_node() == Some(id)
-                && self.play.is_none()
+                && inspector_fields(&self.doc, &self.selection, self.play.is_some())
+                    .contains(&Field::Text)
             {
-                // At the end of the line, to carry on from: loading the fields left the
-                // cursor before the first character, and typing went in ahead of the text.
-                self.text_input
-                    .update(cx, |input, cx| input.move_to_end(cx));
-                window.focus(&self.text_input.read(cx).focus_handle(cx));
+                self.focus_field(Field::Text, window, cx);
                 // The canvas pane tracks focus, so gpui focuses it on every press inside
                 // it — from a listener that runs *after* this one — and the cursor never
                 // reached the field. This is what that listener looks for.
@@ -2783,6 +2784,96 @@ impl Editor {
         cx.notify();
     }
 
+    fn field_input(&self, field: Field) -> &Entity<TextInput> {
+        match field {
+            Field::Speaker => &self.speaker_input,
+            Field::Text => &self.text_input,
+            Field::Alias => &self.alias_input,
+            Field::Choice => &self.label_input,
+        }
+    }
+
+    /// The inspector field with the focus, if any has it.
+    fn focused_field(&self, window: &Window, cx: &App) -> Option<Field> {
+        [Field::Speaker, Field::Text, Field::Alias, Field::Choice]
+            .into_iter()
+            .find(|&field| {
+                self.field_input(field)
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            })
+    }
+
+    /// Puts the cursor at the end of a field, to carry on from: loading the fields leaves it
+    /// before the first character, and typing went in ahead of the text. The caller has
+    /// checked `inspector_fields`, since focus on a field that is not drawn lands nowhere.
+    fn focus_field(&self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.field_input(field).clone();
+        input.update(cx, |input, cx| input.move_to_end(cx));
+        window.focus(&input.read(cx).focus_handle(cx));
+    }
+
+    /// Enter on the canvas, or Edit → Edit selection: into the inspector field that holds what
+    /// the selection says — the line, a hub's label, a note, a choice — or the alias where
+    /// that is the only field there is.
+    fn on_edit_selection(
+        &mut self,
+        _: &EditSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.flow_map || self.help_open || self.prefs_open || self.palette_open {
+            return;
+        }
+        let fields = inspector_fields(&self.doc, &self.selection, self.play.is_some());
+        if let Some(field) = enter_field(&fields) {
+            return self.focus_field(field, window, cx);
+        }
+        let why = match &self.selection {
+            _ if self.play.is_some() => "The sidebar is the player — Esc stops it to edit.",
+            Selection::None => "Select a node or a choice to edit it.",
+            Selection::Nodes(_) => "Select one node to edit it.",
+            Selection::Edge(index)
+                if self
+                    .doc
+                    .edges
+                    .get(*index)
+                    .is_some_and(|edge| self.doc.is_condition(edge.from)) =>
+            {
+                "A branch has no text: the inspector's toggle sets its pin."
+            }
+            Selection::Edge(_) => "This link has no text: the player is offered nothing here.",
+        };
+        self.set_status(why.into(), cx);
+    }
+
+    fn on_next_field(&mut self, _: &NextField, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_field(Step::Later, window, cx);
+    }
+
+    fn on_prev_field(&mut self, _: &PrevField, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_field(Step::Earlier, window, cx);
+    }
+
+    /// Tab and Shift+Tab in an inspector field: the next or previous one it draws, round from
+    /// the last to the first, since Escape is already the way out. Anything else in the
+    /// sidebar with the focus — the number editor in a Logic row — is left alone.
+    fn step_field(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
+        let fields = inspector_fields(&self.doc, &self.selection, self.play.is_some());
+        let Some(at) = self
+            .focused_field(window, cx)
+            .and_then(|field| fields.iter().position(|&f| f == field))
+        else {
+            return;
+        };
+        let next = match step {
+            Step::Later => (at + 1) % fields.len(),
+            Step::Earlier => (at + fields.len() - 1) % fields.len(),
+        };
+        self.focus_field(fields[next], window, cx);
+    }
+
     fn on_toggle_flow_map(&mut self, _: &ToggleFlowMap, _: &mut Window, cx: &mut Context<Self>) {
         self.flow_map = !self.flow_map;
         self.drag = None;
@@ -3312,6 +3403,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_go_wire_out))
             .on_action(cx.listener(Self::on_go_wire_back))
             .on_action(cx.listener(Self::on_go_start))
+            .on_action(cx.listener(Self::on_edit_selection))
+            .on_action(cx.listener(Self::on_next_field))
+            .on_action(cx.listener(Self::on_prev_field))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
@@ -6229,6 +6323,7 @@ impl Editor {
             ("Add to selection", "Shift-click"),
             ("Pan", "Middle-drag or Alt-drag"),
             ("Zoom", "Scroll"),
+            ("Next or previous field", "Tab / Shift+Tab"),
             ("Back to the canvas", "Esc"),
         ];
         let group = |title: &str, rows: Vec<(String, String)>| {
@@ -7103,6 +7198,7 @@ impl Editor {
     /// Sets list never pushes a field off the bottom of a short window.
     fn sidebar(&self, problems: &[Problem], cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .key_context("Inspector")
             .flex()
             .flex_col()
             .flex_none()
@@ -7589,6 +7685,60 @@ fn node_label(doc: &Doc, node: &Node) -> String {
 /// every shortcut is dead until the canvas is clicked again.
 fn has_text_field(kind: NodeKind) -> bool {
     matches!(kind, NodeKind::Speech | NodeKind::Hub | NodeKind::Note)
+}
+
+/// One of the inspector's text fields: the ones Tab steps between and Enter goes into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Field {
+    Speaker,
+    Text,
+    Alias,
+    Choice,
+}
+
+/// The text fields `Editor::inspector` draws for `selection`, top to bottom. It is the one
+/// answer to "which fields exist", for Enter, Tab and a double-click alike: focus on a field
+/// that is not drawn lands nowhere, and from there no shortcut works. Empty while playing,
+/// when the sidebar is the player, and for anything but one node or one choice. A speaker
+/// only on speech, text where `has_text_field`, an alias on every kind, and a choice only on
+/// an edge out of a node the player stops at, since a link out of plumbing has no text.
+fn inspector_fields(doc: &Doc, selection: &Selection, playing: bool) -> Vec<Field> {
+    if playing {
+        return Vec::new();
+    }
+    if let Some(id) = selection.only_node() {
+        let Some(kind) = doc.node(id).map(|node| node.kind) else {
+            return Vec::new();
+        };
+        let mut fields = Vec::new();
+        if kind == NodeKind::Speech {
+            fields.push(Field::Speaker);
+        }
+        if has_text_field(kind) {
+            fields.push(Field::Text);
+        }
+        fields.push(Field::Alias);
+        return fields;
+    }
+    match selection {
+        Selection::Edge(index)
+            if doc
+                .edges
+                .get(*index)
+                .is_some_and(|edge| doc.pauses_play(edge.from)) =>
+        {
+            vec![Field::Choice]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The field Enter goes into: what the selection says rather than what it is called — the
+/// line, or the choice — and the alias only where there is nothing else to write.
+fn enter_field(fields: &[Field]) -> Option<Field> {
+    [Field::Text, Field::Choice, Field::Alias]
+        .into_iter()
+        .find(|field| fields.contains(field))
 }
 
 /// How a node reads in a "Used by" row: what it says, or, for the logic kinds that say
@@ -8335,6 +8485,12 @@ fn main() {
             KeyBinding::new("alt-right", GoWireOut, Some("Canvas")),
             KeyBinding::new("alt-left", GoWireBack, Some("Canvas")),
             KeyBinding::new("home", GoStart, Some("Canvas")),
+            // Enter from the canvas goes into the inspector; Tab inside it steps between its
+            // fields. `"Inspector"` is the sidebar, so the find, palette and variable fields
+            // keep Tab to themselves — and on the canvas Tab is still Branch.
+            KeyBinding::new("enter", EditSelection, Some("Canvas")),
+            KeyBinding::new("tab", NextField, Some("Inspector")),
+            KeyBinding::new("shift-tab", PrevField, Some("Inspector")),
             // A field binds neither, so these work while the Choice field has the focus too.
             KeyBinding::new("alt-up", MoveChoiceUp, Some("Editor")),
             KeyBinding::new("alt-down", MoveChoiceDown, Some("Editor")),
@@ -8442,6 +8598,61 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fields_are_the_ones_each_kind_draws() {
+        let mut doc = Doc::default();
+        let kinds = [
+            NodeKind::Speech,
+            NodeKind::Hub,
+            NodeKind::Note,
+            NodeKind::Instruction,
+            NodeKind::Condition,
+            NodeKind::Jump,
+        ];
+        let ids: Vec<NodeId> = kinds
+            .iter()
+            .map(|&kind| {
+                let id = doc.add_node(0.0, 0.0);
+                doc.node_mut(id).unwrap().kind = kind;
+                id
+            })
+            .collect();
+        let fields = |id: NodeId| inspector_fields(&doc, &Selection::Nodes(vec![id]), false);
+        use Field::*;
+        assert_eq!(fields(ids[0]), [Speaker, Text, Alias]);
+        assert_eq!(fields(ids[1]), [Text, Alias]);
+        assert_eq!(fields(ids[2]), [Text, Alias]);
+        for &id in &ids[3..] {
+            assert_eq!(fields(id), [Alias]);
+        }
+        // Enter goes to what the node says, and to the alias only where nothing is said.
+        assert_eq!(enter_field(&fields(ids[0])), Some(Text));
+        assert_eq!(enter_field(&fields(ids[3])), Some(Alias));
+        // Nothing while playing, for none, or for a group.
+        assert!(inspector_fields(&doc, &Selection::Nodes(vec![ids[0]]), true).is_empty());
+        assert!(inspector_fields(&doc, &Selection::None, false).is_empty());
+        assert!(inspector_fields(&doc, &Selection::Nodes(ids[..2].to_vec()), false).is_empty());
+    }
+
+    #[test]
+    fn only_a_choice_the_player_reads_has_a_field() {
+        let mut doc = Doc::default();
+        let line = doc.add_node(0.0, 0.0);
+        let check = doc.add_node(0.0, 0.0);
+        let next = doc.add_node(0.0, 0.0);
+        doc.node_mut(check).unwrap().kind = NodeKind::Condition;
+        doc.add_edge(line, next);
+        doc.add_edge(check, next);
+        let edge = |from: NodeId| {
+            let index = doc.edges.iter().position(|e| e.from == from).unwrap();
+            inspector_fields(&doc, &Selection::Edge(index), false)
+        };
+        assert_eq!(edge(line), [Field::Choice]);
+        assert_eq!(enter_field(&edge(line)), Some(Field::Choice));
+        assert!(edge(check).is_empty());
+        assert!(inspector_fields(&doc, &Selection::Edge(99), false).is_empty());
+    }
 
     fn labels(query: &str) -> Vec<&'static str> {
         palette_entries(query)

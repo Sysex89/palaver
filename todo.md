@@ -5,39 +5,30 @@ taking my hands off the keyboard.*
 
 What reaches the keyboard today: every `MENUS` command (through the Ctrl+K palette and its
 own shortcut), the arrow keys walking the graph (the Go menu: nodes along edges, wires with
-Alt, Home for the start), Tab / Ctrl+1–6 to branch or place a node, the clipboard keys,
-undo, zoom, Fit, the overlays, the file commands, and F5 / Escape to start and stop a
-play-through. Each piece below closes one gap in the story, in the order they matter.
+Alt, Home for the start), Enter into the selection's field and Tab between the inspector's
+fields, Tab / Ctrl+1–6 to branch or place a node, the clipboard keys, undo, zoom, Fit, the
+overlays, the file commands, and F5 / Escape to start and stop a play-through. Each piece
+below closes one gap in the story, in the order they matter.
 
-## 1. Enter to edit, Tab between fields
-
-The Text field is reachable only by double-click, and the inspector's fields have no focus
-order: Tab in a field does nothing.
-
-- **Enter** on a selected node puts the cursor at the end of its Text field (or Speaker
-  where the kind has no text); on a selected edge, in its Choice field.
-- **Tab / Shift+Tab** in an inspector field move to the next and previous field. Tab means
-  Branch only in `"Canvas"`, so a `"TextInput"` binding does not collide with it.
-
-## 2. Keys in the find overlay
+## 1. Keys in the find overlay
 
 Find filters, but a hit can only be clicked. **Up / Down** move a highlighted hit and
 **Enter** jumps to it, on the command palette's pattern (a key context on the card, an
 ancestor of its field).
 
-## 3. Link to an existing node
+## 2. Link to an existing node
 
 The only way to connect to an existing node is to drag from the out-port, so merges, loops
 and a jump's target cannot be made from the keyboard. **Link to…** is a command that reuses
 the find list as a picker and calls `Doc::link`, guarded by `Doc::can_link` before its
 checkpoint.
 
-## 4. Choosing in play
+## 3. Choosing in play
 
 The play panel's choices are click-only, so F5 starts a run that cannot be advanced.
 **1–9** pick from `Doc::offered`, and the panel numbers its rows so the keys are visible.
 
-## 5. Kind, Ending and Once-only as commands
+## 4. Kind, Ending and Once-only as commands
 
 The kind picker and the Ending and once-only toggles are chips with no command behind
 them, so the palette cannot reach them. Each becomes a command by the four-place convention
