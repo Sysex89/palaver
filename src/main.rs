@@ -2187,12 +2187,15 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_show_help(&mut self, _: &ShowHelp, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_show_help(&mut self, _: &ShowHelp, window: &mut Window, cx: &mut Context<Self>) {
         // Modal, like Preferences: whatever else is up comes down first, so nothing is
         // left open under its scrim for one Escape to close along with it.
         let was_open = self.help_open;
         self.dismiss_overlays(cx);
         self.help_open = !was_open;
+        if self.help_open {
+            window.focus(&self.focus_handle);
+        }
         cx.notify();
     }
 
@@ -2213,10 +2216,13 @@ impl Editor {
 
     /// Ctrl+,. Modal, like the palette: it closes whatever else is up, and the other overlay
     /// handlers close it in turn, so two never stack.
-    fn on_show_prefs(&mut self, _: &ShowPrefs, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_show_prefs(&mut self, _: &ShowPrefs, window: &mut Window, cx: &mut Context<Self>) {
         let was_open = self.prefs_open;
         self.dismiss_overlays(cx);
         self.prefs_open = !was_open;
+        if self.prefs_open {
+            window.focus(&self.focus_handle);
+        }
         cx.notify();
     }
 
@@ -2284,15 +2290,16 @@ impl Editor {
         action(self, window, cx);
     }
 
-    /// Closes the find overlay, the problems drawer, the cheat sheet and the palette. True when there was
-    /// something to close, which is how Escape knows it has already done its job. The query
+    /// Closes the find overlay, the problems drawer, the cheat sheet, the palette, Preferences
+    /// and an open menu. True when there was something to close, which is how Escape knows it has already done its job. The query
     /// is cleared with the overlay, so find always opens on a clean slate.
     fn dismiss_overlays(&mut self, cx: &mut Context<Self>) -> bool {
         let any = self.searching
             || self.problems_open
             || self.help_open
             || self.palette_open
-            || self.prefs_open;
+            || self.prefs_open
+            || self.open_menu.is_some();
         if self.searching {
             self.search_input
                 .update(cx, |input, cx| input.set_content("", cx));
@@ -2302,6 +2309,7 @@ impl Editor {
         self.problems_open = false;
         self.help_open = false;
         self.prefs_open = false;
+        self.open_menu = None;
         if any {
             cx.notify();
         }
@@ -2394,8 +2402,9 @@ impl Editor {
         }
         self.select(Selection::Nodes(vec![id]), cx);
         // Only a speech node has a field worth landing in; every other kind is edited with
-        // pickers, so the keyboard stays on the canvas.
-        if kind == NodeKind::Speech {
+        // pickers, so the keyboard stays on the canvas. Not while playing, when the sidebar
+        // is the player and draws no Speaker field.
+        if kind == NodeKind::Speech && self.play.is_none() {
             window.focus(&self.speaker_input.read(cx).focus_handle(cx));
         }
         cx.notify();
@@ -3383,8 +3392,13 @@ impl Editor {
             .iter()
             // A condition's edges always carry a label — which pin they leave by — even
             // though the player never chooses one, so the empty-label skip lets them past.
+            // Otherwise only a choice is labelled: `choice_label` is empty out of an
+            // instruction, so a label left there by a kind change stays hidden as `is_once`
+            // keeps a stale flag hidden.
             .filter(|edge| {
-                !edge.label.is_empty() || self.doc.is_condition(edge.from) || self.doc.is_once(edge)
+                self.doc.is_condition(edge.from)
+                    || self.doc.is_once(edge)
+                    || !self.doc.choice_label(edge).is_empty()
             })
             .filter_map(|edge| {
                 let is_pin = self.doc.is_condition(edge.from);
@@ -4114,6 +4128,11 @@ impl Editor {
             // Every line the character speaks follows the record.
             (Rename::Item(old), SidePane::Cast) => {
                 let moved = self.doc.rename_character(&old, name);
+                // The inspector's Speaker field still holds the old name on a selected node,
+                // and the next keystroke in another field would write it back over the new one.
+                if self.edited.only_node().is_some() {
+                    self.load_fields(self.edited.clone(), cx);
+                }
                 // The rename rewrites who speaks, never what is said, so say how much prose
                 // still has the old name in it.
                 let still = match self.doc.mentions(&Ref::Character(old.clone())).len() {
@@ -4197,8 +4216,23 @@ impl Editor {
         self.editing.as_ref().filter(|target| match target {
             ValueTarget::Live(name) => playing && is_int(name),
             ValueTarget::Default(name) => !playing && is_int(name),
-            ValueTarget::Effect(id, name) | ValueTarget::Check(id, name) => {
-                !playing && self.doc.node(*id).is_some() && is_int(name)
+            ValueTarget::Effect(id, name) => {
+                !playing
+                    && self
+                        .doc
+                        .node(*id)
+                        .is_some_and(|n| n.kind == NodeKind::Instruction)
+                    && self.doc.effect_of(*id, name).is_some()
+                    && is_int(name)
+            }
+            ValueTarget::Check(id, name) => {
+                !playing
+                    && self
+                        .doc
+                        .node(*id)
+                        .is_some_and(|n| n.kind == NodeKind::Condition)
+                    && self.doc.condition_of(*id, name).is_some()
+                    && is_int(name)
             }
         })
     }
@@ -7062,8 +7096,10 @@ impl Editor {
                     None => "a missing edge".into(),
                 };
                 // Out of a condition this edge is a pin, not a choice: the player never picks
-                // it, so a label would be text nobody ever reads.
+                // it, so a label would be text nobody ever reads. Out of an instruction or a
+                // jump it is passed through automatically.
                 let from_condition = edge.is_some_and(|edge| self.doc.is_condition(edge.from));
+                let is_choice = edge.is_some_and(|edge| self.doc.pauses_play(edge.from));
                 div()
                     .flex()
                     .flex_col()
@@ -7071,11 +7107,25 @@ impl Editor {
                     .child(inspector_header(
                         "→",
                         theme::edge(),
-                        if from_condition { "Branch" } else { "Choice" },
+                        if from_condition {
+                            "Branch"
+                        } else if is_choice {
+                            "Choice"
+                        } else {
+                            "Link"
+                        },
                         ends,
                     ))
                     .child(if from_condition {
                         section("Branch", self.branch_toggle(index, cx)).into_any_element()
+                    } else if !is_choice {
+                        section(
+                            "Choice",
+                            div().type_hint().child(
+                                "None — the walk passes straight through, so the player is offered nothing here.",
+                            ),
+                        )
+                        .into_any_element()
                     } else {
                         section(
                             "Text",
@@ -7091,14 +7141,7 @@ impl Editor {
                                 .children(edge.and_then(|edge| {
                                     self.placeholder_row(Line::Edge(edge.from, edge.to), cx)
                                 }))
-                                // Only where the player is the one choosing. Out of an
-                                // instruction or a jump the walk has to take the edge it
-                                // finds, so a once-only flag there would be a promise
-                                // nothing keeps.
-                                .when(
-                                    edge.is_some_and(|edge| self.doc.pauses_play(edge.from)),
-                                    |this| this.child(self.once_toggle(index, cx)),
-                                ),
+                                .child(self.once_toggle(index, cx)),
                         )
                         .into_any_element()
                     })

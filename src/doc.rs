@@ -2776,9 +2776,13 @@ impl Doc {
     }
 
     /// Whether [`Doc::split_edge`] would put a `kind` node into edge `index`: the edge exists
-    /// and the kind takes edges, which a note does not. The pre-checkpoint check.
+    /// with both ends live and the kind takes edges, which a note does not. The pre-checkpoint check.
     pub fn can_split_edge(&self, index: usize, kind: NodeKind) -> bool {
-        kind != NodeKind::Note && index < self.edges.len()
+        kind != NodeKind::Note
+            && self
+                .edges
+                .get(index)
+                .is_some_and(|e| self.node(e.from).is_some() && self.node(e.to).is_some())
     }
 
     /// Puts a new `kind` node into edge `index`, so `A → B` becomes `A → new → B`, and
@@ -3009,12 +3013,12 @@ impl Doc {
     /// else for a reference to hide. Any new field that ever stores a variable name has to
     /// join this, [`Doc::remove_variable`], [`Doc::retype_variable`] and [`Doc::rename_set`].
     ///
-    /// Returns 0 without touching anything when nothing is called `from`. The view checks
-    /// [`Doc::variable_name_free`] for `to` before it checkpoints, the same way the add
-    /// does, so a refused rename leaves no empty undo step.
+    /// Returns 0 without touching anything when nothing is called `from`, or when `to` is
+    /// not [`Doc::variable_name_free`] — blank or taken. The view asks that before it
+    /// checkpoints, the same way the add does, so a refused rename leaves no empty undo step.
     pub fn rename_variable(&mut self, from: &str, to: &str) -> usize {
         let to = to.trim();
-        if self.is_outside_variable(from) {
+        if self.is_outside_variable(from) || !self.variable_name_free(to) {
             return 0;
         }
         let Some(variable) = self.variables.iter_mut().find(|v| v.name == from) else {
@@ -3155,7 +3159,9 @@ impl Doc {
         let mut vars = self.initial_vars();
         let set_by_hand = |vars: &mut VarState, at: usize| {
             for set in sets.iter().filter(|set| set.at == at) {
-                if let Some(slot) = vars.get_mut(&set.var) {
+                if let Some(slot) = vars.get_mut(&set.var)
+                    && slot.same_kind(set.value)
+                {
                     *slot = set.value;
                 }
             }
@@ -3216,9 +3222,10 @@ impl Doc {
     /// Renames the character and every node that says it, returning how many lines moved.
     /// The same find-and-replace deal [`Doc::rename_variable`] makes, and possible for the
     /// same reason: the name *is* the key, so there is nowhere else a reference can hide.
+    /// Refused — `0`, nothing changed — when `to` is not [`Doc::character_name_free`].
     pub fn rename_character(&mut self, from: &str, to: &str) -> usize {
         let to = to.trim();
-        if self.is_outside_character(from) {
+        if self.is_outside_character(from) || !self.character_name_free(to) {
             return 0;
         }
         let Some(character) = self.characters.iter_mut().find(|c| c.name == from) else {
@@ -4048,8 +4055,8 @@ impl Doc {
     /// An edge's label as a choice the player is given, trimmed: empty where the player does
     /// not choose. A label left on an edge when its node became an instruction is hidden
     /// everywhere else, and written into the script it broke the block to list a choice
-    /// nobody is offered.
-    fn choice_label<'a>(&self, edge: &'a Edge) -> &'a str {
+    /// nobody is offered. The canvas's edge labels ask it too.
+    pub fn choice_label<'a>(&self, edge: &'a Edge) -> &'a str {
         match self.pauses_play(edge.from) {
             true => edge.label.trim(),
             false => "",
@@ -10157,5 +10164,49 @@ mod tests {
                 .iter()
                 .all(|p| !matches!(p, Problem::PlaceholderChoice(_)))
         );
+    }
+
+    #[test]
+    fn can_split_edge_refuses_a_dangling_edge() {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let b = doc.add_node(300.0, 0.0);
+        doc.add_edge(a, b);
+        doc.nodes.retain(|n| n.id != b);
+
+        assert!(!doc.can_split_edge(0, NodeKind::Speech));
+        assert_eq!(doc.split_edge(0, NodeKind::Speech), None);
+    }
+
+    #[test]
+    fn vars_with_ignores_a_mismatched_type_override() {
+        let mut doc = Doc::default();
+        doc.add_variable("gold");
+        doc.retype_variable("gold", Value::Int(0));
+        let start = doc.add_node(0.0, 0.0);
+        let sets = vec![Override {
+            at: 1,
+            var: "gold".into(),
+            value: Value::Bool(true),
+        }];
+        assert_eq!(doc.vars_with(&[start], &sets)["gold"], Value::Int(0));
+    }
+
+    #[test]
+    fn renames_refuse_blank_or_taken_names() {
+        let mut doc = Doc::default();
+        doc.add_variable("paid");
+        doc.add_variable("gold");
+        assert_eq!(doc.rename_variable("paid", ""), 0);
+        assert_eq!(doc.rename_variable("paid", "   "), 0);
+        assert_eq!(doc.rename_variable("paid", "gold"), 0);
+        assert!(doc.variable("paid").is_some());
+
+        doc.add_character("Innkeeper", 0xf7c96a);
+        doc.add_character("Player", 0x8ce99a);
+        assert_eq!(doc.rename_character("Innkeeper", ""), 0);
+        assert_eq!(doc.rename_character("Innkeeper", "  "), 0);
+        assert_eq!(doc.rename_character("Innkeeper", "Player"), 0);
+        assert!(doc.character("Innkeeper").is_some());
     }
 }
