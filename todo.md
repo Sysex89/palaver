@@ -8,20 +8,21 @@ own shortcut), the arrow keys walking the graph (the Go menu: nodes along edges,
 Alt, Home for the start), Enter into the selection's field and Tab between the inspector's
 fields, Up / Down / Enter through the find results, Ctrl+L to link the selection to any node
 it can reach, Tab / Ctrl+1–6 to branch or place a node, the clipboard keys, undo, zoom, Fit,
-the overlays, the file commands, and F5 / Escape to start and stop a play-through. Each
-piece below closes one gap in the story, in the order they matter.
+the overlays, the file commands, and F5, 1–9 and Escape to start, play and stop a
+play-through. The piece below closes the last gap in the story.
 
-## 1. Choosing in play
-
-The play panel's choices are click-only, so F5 starts a run that cannot be advanced.
-**1–9** pick from `Doc::offered`, and the panel numbers its rows so the keys are visible.
-
-## 2. Kind, Ending and Once-only as commands
+## 1. Kind, Ending and Once-only as commands
 
 The kind picker and the Ending and once-only toggles are chips with no command behind
 them, so the palette cannot reach them. Each becomes a command by the four-place convention
 (`actions!`, `MENUS`, `.on_action`, `bind_keys`), and so appears in the menus, the F1 sheet
 and Ctrl+K at once.
+
+The F1 sheet has no room left for those rows: at 860px its card is already at the
+`relative(0.92)` cap, and one more row puts the icon credit below the scroll edge. This
+piece has to make the room as well, for instance by grouping the kind commands under one
+row the way the Node menu's six kinds could be, or by giving the sheet a fourth column on
+a window wide enough for one.
 
 ## Not part of the story
 

@@ -20,9 +20,9 @@ use doc::{
     map_hit, node_center, out_port, route, snippet, split_set, with_default_extension,
 };
 use gpui::{
-    AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path,
-    PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle,
+    AnyElement, App, Application, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle,
+    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Path, PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Render, Rgba, ScrollHandle,
     ScrollWheelEvent, SharedString, Subscription, Transformation, Window, WindowAppearance,
     WindowBounds, WindowHandle, WindowOptions, actions, canvas, deferred, div, point, prelude::*,
     px, radians, relative, rgb, size, svg,
@@ -95,6 +95,13 @@ actions!(
         AcceptLine
     ]
 );
+
+/// A number key during a play-through: picks the choice with that number, counted from 1 in
+/// the order the play panel lists them. One action carrying the number rather than nine
+/// unit structs; `no_json` because it is only ever bound in code.
+#[derive(Clone, PartialEq, Debug, gpui::Action)]
+#[action(namespace = palaver, no_json)]
+struct Choose(usize);
 
 /// Height of the menu bar. Mouse positions are window-relative, so this is also the
 /// offset between window coordinates and the canvas pane below the bar.
@@ -2688,6 +2695,26 @@ impl Editor {
         cx.notify();
     }
 
+    /// 1–9 while playing: the choice with that number in the play panel, read from
+    /// `Doc::offered` as the panel is, so a key and a click cannot pick differently. Nothing
+    /// outside a play-through, where the digits have no list to count.
+    fn on_choose(&mut self, &Choose(n): &Choose, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(run) = &self.play else {
+            return;
+        };
+        let pick = self.doc.offered(&run.path).map(|offered| {
+            offered
+                .get(n.wrapping_sub(1))
+                .map(|&(to, _, spent)| (to, spent))
+        });
+        match pick {
+            Some(Some((to, false))) => self.play_advance(to, window, cx),
+            Some(Some((_, true))) => self.set_status("That choice is already taken.".into(), cx),
+            Some(None) => self.set_status(format!("There is no choice {n} here."), cx),
+            None => self.set_status("Nothing to choose here.".into(), cx),
+        }
+    }
+
     /// Sends the condition at `at` in the run the other way, or back the way its check goes.
     fn play_force(&mut self, at: usize, window: &Window, cx: &mut Context<Self>) {
         let Some(mut run) = self.play.take() else {
@@ -3555,6 +3582,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_find_prev))
             .on_action(cx.listener(Self::on_find_run))
             .on_action(cx.listener(Self::on_link_to))
+            .on_action(cx.listener(Self::on_choose))
             .on_action(cx.listener(Self::on_toggle_flow_map))
             .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_new_hub))
@@ -6055,16 +6083,35 @@ impl Editor {
                         // same place the player already diverges from the canvas by walking
                         // through nodes it does not show. No hover and no click, so nothing
                         // about the row offers something it will not do.
+                        // The number key that picks it, where there is one; the tenth on
+                        // keeps the arrow, since there is no key for it to show.
+                        let key = match i {
+                            0..9 => keycap((i + 1).to_string()).into_any_element(),
+                            _ => div().flex_none().child("→").into_any_element(),
+                        };
                         if spent {
                             return div()
                                 .px_1()
-                                .font_family(theme::text_font())
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
                                 .text_color(theme::text_disabled())
-                                .child(format!("→ {label} (already taken)"))
+                                .child(key)
+                                .child(
+                                    div()
+                                        .font_family(theme::text_font())
+                                        .child(format!("{label} (already taken)")),
+                                )
                                 .into_any_element();
                         }
-                        row(("play-choice", i), format!("→ {label}"), theme::text())
-                            .font_family(theme::text_font())
+                        row(("play-choice", i), String::new(), theme::text())
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(key)
+                            .child(div().font_family(theme::text_font()).child(label))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.play_advance(to, window, cx)
                             }))
@@ -6494,18 +6541,7 @@ impl Editor {
                                                     .text_color(theme::text())
                                                     .child(label.trim_end_matches('…')),
                                             )
-                                            .when(!keys.is_empty(), |this| {
-                                                this.child(
-                                                    div()
-                                                        .flex_none()
-                                                        .px_1()
-                                                        .rounded_sm()
-                                                        .bg(theme::canvas())
-                                                        .type_hint()
-                                                        .text_color(theme::text())
-                                                        .child(keys),
-                                                )
-                                            })
+                                            .when(!keys.is_empty(), |this| this.child(keycap(keys)))
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.run_command(action, window, cx)
                                             }))
@@ -6529,6 +6565,7 @@ impl Editor {
             ("Pan", "Middle-drag or Alt-drag"),
             ("Zoom", "Scroll"),
             ("Next or previous field", "Tab / Shift+Tab"),
+            ("Pick a choice while playing", "1–9"),
             ("Back to the canvas", "Esc"),
         ];
         let group = |title: &str, rows: Vec<(String, String)>| {
@@ -6554,18 +6591,7 @@ impl Editor {
                         )
                         // A command with no shortcut draws no keycap, as the palette does: an
                         // empty one reads as a glitch.
-                        .when(!keys.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .bg(theme::canvas())
-                                    .type_hint()
-                                    .text_color(theme::text())
-                                    .child(keys),
-                            )
-                        })
+                        .when(!keys.is_empty(), |this| this.child(keycap(keys)))
                 }))
         };
 
@@ -7938,6 +7964,19 @@ fn inspector_fields(doc: &Doc, selection: &Selection, playing: bool) -> Vec<Fiel
     }
 }
 
+/// A key as the F1 sheet, the palette and the play panel draw it: a small chip one rung down
+/// from the card it sits on.
+fn keycap(keys: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(theme::canvas())
+        .type_hint()
+        .text_color(theme::text())
+        .child(keys.into())
+}
+
 /// A find row's mouse-move listener: pointing at a row selects it rather than hovering it,
 /// the palette's rule. With a hover style as well, a pointer resting over the list lit a
 /// second row while the arrow keys moved the first.
@@ -8709,6 +8748,16 @@ fn main() {
             // fields. `"Inspector"` is the sidebar, so the find, palette and variable fields
             // keep Tab to themselves — and on the canvas Tab is still Branch.
             KeyBinding::new("enter", EditSelection, Some("Canvas")),
+            // A digit is a digit in a field, so the play panel's numbers are the canvas's.
+            KeyBinding::new("1", Choose(1), Some("Canvas")),
+            KeyBinding::new("2", Choose(2), Some("Canvas")),
+            KeyBinding::new("3", Choose(3), Some("Canvas")),
+            KeyBinding::new("4", Choose(4), Some("Canvas")),
+            KeyBinding::new("5", Choose(5), Some("Canvas")),
+            KeyBinding::new("6", Choose(6), Some("Canvas")),
+            KeyBinding::new("7", Choose(7), Some("Canvas")),
+            KeyBinding::new("8", Choose(8), Some("Canvas")),
+            KeyBinding::new("9", Choose(9), Some("Canvas")),
             KeyBinding::new("tab", NextField, Some("Inspector")),
             KeyBinding::new("shift-tab", PrevField, Some("Inspector")),
             // A field binds neither, so these work while the Choice field has the focus too.
