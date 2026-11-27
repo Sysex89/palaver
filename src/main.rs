@@ -86,6 +86,9 @@ actions!(
         PaletteNext,
         PalettePrev,
         PaletteRun,
+        FindNext,
+        FindPrev,
+        FindRun,
         FillLine,
         RerollLine,
         AcceptLine
@@ -106,6 +109,9 @@ const ROOT_R: f32 = 5.0;
 /// How far above and below a wire's label point a keyboard move keeps in view, in document
 /// units: a two-line label pill with room to spare.
 const LABEL_REACH: f32 = 24.0;
+/// The most rows the find card lists. Beyond this a list stops being scannable, even
+/// scrolled; the rest are counted ("…and 12 more") and the keys stop at the last one shown.
+const FIND_ROWS: usize = 50;
 /// One wire as the paint closure takes it: the corners in pane pixels, its colour, its width.
 type Wire = (Vec<Point<Pixels>>, Rgba, f32);
 
@@ -518,6 +524,12 @@ struct Editor {
     palette_seen: String,
     /// Scrolls the list to the selected row when the arrow keys walk past the edge of it.
     palette_scroll: ScrollHandle,
+    /// Which find row Enter goes to: the palette's `palette_sel`, for the find card.
+    find_sel: usize,
+    /// The query `find_sel` was last reset for, as `palette_seen` is.
+    find_seen: String,
+    /// Keeps the highlighted find row in view as the arrow keys walk the list.
+    find_scroll: ScrollHandle,
     /// Last title pushed to the platform, so `render` only sets it on change.
     title: String,
     /// Name of the menu whose dropdown is open.
@@ -735,9 +747,20 @@ impl Editor {
         let search_input = cx.new(|cx| TextInput::new("Find — or #tag speaker: is:end", cx));
         let var_input = cx.new(|cx| TextInput::new(declare_hint(SidePane::default()), cx));
         let value_input = cx.new(|cx| TextInput::new("0", cx));
-        for input in [&search_input, &var_input, &value_input] {
+        for input in [&var_input, &value_input] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
         }
+        // Back to the first hit when the query changes, and only then: the field notifies on
+        // a cursor move too. The palette's observer below does the same.
+        cx.observe(&search_input, |this, input, cx| {
+            let query = input.read(cx).content().to_string();
+            if query != this.find_seen {
+                this.find_seen = query;
+                this.find_sel = 0;
+            }
+            cx.notify();
+        })
+        .detach();
         let palette_input = cx.new(|cx| TextInput::new("Type a command", cx));
         cx.observe(&palette_input, |this, input, cx| {
             let query = input.read(cx).content().to_string();
@@ -814,6 +837,9 @@ impl Editor {
             palette_sel: 0,
             palette_seen: String::new(),
             palette_scroll: ScrollHandle::new(),
+            find_sel: 0,
+            find_seen: String::new(),
+            find_scroll: ScrollHandle::new(),
             title: String::new(),
             open_menu: None,
             closing: false,
@@ -2323,6 +2349,57 @@ impl Editor {
         }
     }
 
+    fn on_find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.find_step(1, cx);
+    }
+
+    fn on_find_prev(&mut self, _: &FindPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.find_step(-1, cx);
+    }
+
+    /// Moves the highlighted find row, wrapping at both ends as the palette's does.
+    fn find_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let rows = self.find_rows(cx).0.len().min(FIND_ROWS);
+        if rows == 0 {
+            return;
+        }
+        let from = self.find_sel.min(rows - 1) as isize;
+        self.find_sel = (from + delta).rem_euclid(rows as isize) as usize;
+        // The list holds a line or two above its rows — the hint and the Bookmarks heading
+        // when idle, the match count once a query is typed — and the handle counts children.
+        let above = if self.find_rows(cx).1 { 1 } else { 2 };
+        self.find_scroll.scroll_to_item(self.find_sel + above);
+        cx.notify();
+    }
+
+    /// Enter in find: goes to the highlighted row, as a click on it does. The card stays up
+    /// with the cursor in it, since find is walked through — Down and Enter again for the
+    /// next — and Escape is the way back to the canvas, where Enter edits what was found.
+    fn on_find_run(&mut self, _: &FindRun, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.find_rows(cx).0;
+        let shown = rows.len().min(FIND_ROWS);
+        if let Some(&id) = rows.get(self.find_sel.min(shown.saturating_sub(1))) {
+            self.jump_to(id, window, cx);
+        }
+    }
+
+    /// The rows the find card lists, in order, and whether a query is typed: the hits once
+    /// one is, the bookmarks while it is blank. The one list the card draws and the keys
+    /// walk, so the highlight and Enter cannot point at different rows.
+    fn find_rows(&self, cx: &App) -> (Vec<NodeId>, bool) {
+        let query = self.search_input.read(cx).content();
+        let typed = !query.trim().is_empty();
+        // ponytail: rescans every node per call, and a frame or a key makes one or two — but
+        // only while the card is open with a query typed, which is never while dragging.
+        // Cache it if searching a huge graph ever stutters.
+        let rows = if typed {
+            self.doc.query(query)
+        } else {
+            self.doc.bookmarks()
+        };
+        (rows, typed)
+    }
+
     /// Runs a command picked from the palette. The palette closes and the canvas takes the
     /// focus *first*, so a command that wants somewhere else — Find focuses its own field —
     /// can have it, and one that closes overlays (Stop) finds none left to close and does
@@ -3389,6 +3466,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_run))
+            .on_action(cx.listener(Self::on_find_next))
+            .on_action(cx.listener(Self::on_find_prev))
+            .on_action(cx.listener(Self::on_find_run))
             .on_action(cx.listener(Self::on_toggle_flow_map))
             .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_new_hub))
@@ -3769,29 +3849,28 @@ impl Editor {
     /// It stays open while you click through results, so a run of hits can be walked; the
     /// canvas is still live underneath it for the same reason.
     fn search_overlay(&self, canvas_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        /// Beyond this the list stops being scannable, even scrolled.
-        const MAX_ROWS: usize = 50;
         const CARD_W: f32 = 420.0;
 
-        let query = self.search_input.read(cx).content().to_string();
-        // ponytail: rescans every node each frame, but only while the overlay is open and a
-        // query is typed — which is never while dragging. Cache it if searching a huge graph
-        // ever stutters.
-        let hits = self.doc.query(&query);
-        let typed = !query.trim().is_empty();
-        let more = hits.len().saturating_sub(MAX_ROWS);
-
-        // An idle search box lists the bookmarks too: every aliased node, the author's own
+        // An idle search box lists the bookmarks: every aliased node, the author's own
         // landmarks. Under the field rather than in a panel of their own, since "take me
         // somewhere" is the question both answer.
-        let bookmarks = match typed {
-            true => Vec::new(),
-            false => self.doc.bookmarks(),
+        let (rows, typed) = self.find_rows(cx);
+        let (hits, bookmarks) = match typed {
+            true => (rows, Vec::new()),
+            false => (Vec::new(), rows),
         };
-        let more_marks = bookmarks.len().saturating_sub(MAX_ROWS);
+        let more = hits.len().saturating_sub(FIND_ROWS);
+        let more_marks = bookmarks.len().saturating_sub(FIND_ROWS);
+        let selected = self.find_sel.min(
+            hits.len()
+                .max(bookmarks.len())
+                .min(FIND_ROWS)
+                .saturating_sub(1),
+        );
 
         deferred(
             div()
+                .key_context("Find")
                 .absolute()
                 .top(px(MENU_H + 12.0))
                 .left(px(VARS_W + ((canvas_w - CARD_W) / 2.0).max(8.0)))
@@ -3818,6 +3897,7 @@ impl Editor {
                         .flex_col()
                         .max_h(px(280.0))
                         .overflow_y_scroll()
+                        .track_scroll(&self.find_scroll)
                         .when(!typed, |this| {
                             this.child(div().px_1().type_hint().child(
                                 "Search speakers, lines and aliases, or filter: speaker: kind: \
@@ -3826,39 +3906,46 @@ impl Editor {
                         })
                         .when(!bookmarks.is_empty(), |this| {
                             this.child(div().px_1().pt_2().type_section().child("Bookmarks"))
-                                .children(bookmarks.iter().take(MAX_ROWS).filter_map(|&id| {
-                                    let node = self.doc.node(id)?;
-                                    Some(
-                                        div()
-                                            .id(("bookmark", id))
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(theme::hover()))
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .text_color(theme::text())
-                                                    .child(node.alias.trim().to_string()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .one_line()
-                                                    .text_color(theme::text_faint())
-                                                    .child(node_label(&self.doc, node)),
-                                            )
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.jump_to(id, window, cx)
-                                            })),
-                                    )
-                                }))
+                                .children(bookmarks.iter().take(FIND_ROWS).enumerate().filter_map(
+                                    |(row, &id)| {
+                                        let node = self.doc.node(id)?;
+                                        Some(
+                                            div()
+                                                .id(("bookmark", id))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .cursor_pointer()
+                                                .when(row == selected, |this| {
+                                                    this.bg(theme::pressed())
+                                                })
+                                                .on_mouse_move(pick_find_row(row, cx))
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_color(theme::text())
+                                                        .child(node.alias.trim().to_string()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .one_line()
+                                                        .text_color(theme::text_faint())
+                                                        .child(node_label(&self.doc, node)),
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.jump_to(id, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                    },
+                                ))
                                 .when(more_marks > 0, |this| {
                                     this.child(
                                         div()
@@ -3877,35 +3964,40 @@ impl Editor {
                                 n => format!("{n} matches"),
                             }))
                         })
-                        .children(hits.iter().take(MAX_ROWS).filter_map(|&id| {
-                            let node = self.doc.node(id)?;
-                            let (glyph, _, color) = kind_style(node.kind);
-                            Some(
-                                div()
-                                    .id(("search-result", id))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::hover()))
-                                    .child(div().flex_none().w_4().child(icon(glyph, 12.0, color)))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .one_line()
-                                            .text_color(theme::text())
-                                            .child(ref_label(&self.doc, node)),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.jump_to(id, window, cx)
-                                    })),
-                            )
-                        }))
+                        .children(hits.iter().take(FIND_ROWS).enumerate().filter_map(
+                            |(row, &id)| {
+                                let node = self.doc.node(id)?;
+                                let (glyph, _, color) = kind_style(node.kind);
+                                Some(
+                                    div()
+                                        .id(("search-result", id))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .when(row == selected, |this| this.bg(theme::pressed()))
+                                        .on_mouse_move(pick_find_row(row, cx))
+                                        .child(
+                                            div().flex_none().w_4().child(icon(glyph, 12.0, color)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .one_line()
+                                                .text_color(theme::text())
+                                                .child(ref_label(&self.doc, node)),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.jump_to(id, window, cx)
+                                        })),
+                                )
+                            },
+                        ))
                         .when(more > 0, |this| {
                             this.child(
                                 div()
@@ -7733,6 +7825,21 @@ fn inspector_fields(doc: &Doc, selection: &Selection, playing: bool) -> Vec<Fiel
     }
 }
 
+/// A find row's mouse-move listener: pointing at a row selects it rather than hovering it,
+/// the palette's rule. With a hover style as well, a pointer resting over the list lit a
+/// second row while the arrow keys moved the first.
+fn pick_find_row(
+    row: usize,
+    cx: &mut Context<Editor>,
+) -> impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static {
+    cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+        if this.find_sel != row {
+            this.find_sel = row;
+            cx.notify();
+        }
+    })
+}
+
 /// The field Enter goes into: what the selection says rather than what it is called — the
 /// line, or the choice — and the alias only where there is nothing else to write.
 fn enter_field(fields: &[Field]) -> Option<Field> {
@@ -8513,6 +8620,10 @@ fn main() {
             KeyBinding::new("down", PaletteNext, Some("Palette")),
             KeyBinding::new("up", PalettePrev, Some("Palette")),
             KeyBinding::new("enter", PaletteRun, Some("Palette")),
+            // The same three on the find card, an ancestor of its field, for the same reason.
+            KeyBinding::new("down", FindNext, Some("Find")),
+            KeyBinding::new("up", FindPrev, Some("Find")),
+            KeyBinding::new("enter", FindRun, Some("Find")),
             KeyBinding::new("ctrl-m", ToggleFlowMap, Some("Editor")),
             // Ctrl+1 duplicates Tab so the number row is whole; the menu advertises Tab,
             // which is the older and better key for the kind you reach for most.

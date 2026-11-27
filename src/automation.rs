@@ -32,7 +32,8 @@ use gpui::{Context, Focusable, Window, px, size};
 use crate::doc::{Doc, NodeKind, Value};
 use crate::settings::{TextFont, ThemePref, UiFont};
 use crate::{
-    Editor, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection, SidePane, node_number,
+    Editor, FindNext, FindPrev, FindRun, MENUS, PaletteNext, PalettePrev, PaletteRun, Selection,
+    SidePane, node_number,
 };
 
 /// How often the foreground looks for a command. Plenty for a script that sleeps between
@@ -248,6 +249,19 @@ fn run(
                 "next" => editor.on_palette_next(&PaletteNext, window, cx),
                 "prev" => editor.on_palette_prev(&PalettePrev, window, cx),
                 "run" => editor.on_palette_run(&PaletteRun, window, cx),
+                _ => return Err(format!("expected next, prev or run, not {rest:?}")),
+            }
+            Ok(String::new())
+        }
+
+        "find" => {
+            if !editor.searching {
+                return Err("find is not open".into());
+            }
+            match rest {
+                "next" => editor.on_find_next(&FindNext, window, cx),
+                "prev" => editor.on_find_prev(&FindPrev, window, cx),
+                "run" => editor.on_find_run(&FindRun, window, cx),
                 _ => return Err(format!("expected next, prev or run, not {rest:?}")),
             }
             Ok(String::new())

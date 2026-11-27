@@ -6,29 +6,24 @@ taking my hands off the keyboard.*
 What reaches the keyboard today: every `MENUS` command (through the Ctrl+K palette and its
 own shortcut), the arrow keys walking the graph (the Go menu: nodes along edges, wires with
 Alt, Home for the start), Enter into the selection's field and Tab between the inspector's
-fields, Tab / Ctrl+1–6 to branch or place a node, the clipboard keys, undo, zoom, Fit, the
-overlays, the file commands, and F5 / Escape to start and stop a play-through. Each piece
-below closes one gap in the story, in the order they matter.
+fields, Up / Down / Enter through the find results, Tab / Ctrl+1–6 to branch or place a
+node, the clipboard keys, undo, zoom, Fit, the overlays, the file commands, and F5 / Escape
+to start and stop a play-through. Each piece below closes one gap in the story, in the
+order they matter.
 
-## 1. Keys in the find overlay
-
-Find filters, but a hit can only be clicked. **Up / Down** move a highlighted hit and
-**Enter** jumps to it, on the command palette's pattern (a key context on the card, an
-ancestor of its field).
-
-## 2. Link to an existing node
+## 1. Link to an existing node
 
 The only way to connect to an existing node is to drag from the out-port, so merges, loops
 and a jump's target cannot be made from the keyboard. **Link to…** is a command that reuses
 the find list as a picker and calls `Doc::link`, guarded by `Doc::can_link` before its
 checkpoint.
 
-## 3. Choosing in play
+## 2. Choosing in play
 
 The play panel's choices are click-only, so F5 starts a run that cannot be advanced.
 **1–9** pick from `Doc::offered`, and the panel numbers its rows so the keys are visible.
 
-## 4. Kind, Ending and Once-only as commands
+## 3. Kind, Ending and Once-only as commands
 
 The kind picker and the Ending and once-only toggles are chips with no command behind
 them, so the palette cannot reach them. Each becomes a command by the four-place convention
