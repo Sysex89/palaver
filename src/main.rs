@@ -13,11 +13,11 @@ mod text_input;
 mod theme;
 
 use doc::{
-    Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Line,
+    Backup, Character, Cmp, Declarations, Doc, FILE_EXT, FIT_MARGIN, FTL_EXT, Fragment, Go, Line,
     MAP_H, MAP_W, Mention, NODE_H, NODE_W, Node, NodeId, NodeKind, OPEN_FIT_MIN_ZOOM, Orphan,
-    PORT_R, Problem, RECORDING_EXT, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step, Use,
-    Value, VarState, View, WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell, map_hit,
-    node_center, out_port, route, snippet, split_set, with_default_extension,
+    PORT_R, Place, Problem, RECORDING_EXT, Ref, Replay, Run, SCRIPT_EXT, SetOp, Severity, Step,
+    Use, Value, VarState, View, WIRE_STUB, box_exit, clean_tag, in_port, join_set, map_cell,
+    map_hit, node_center, out_port, route, snippet, split_set, with_default_extension,
 };
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
@@ -56,6 +56,13 @@ actions!(
         NewInstruction,
         NewCondition,
         NewNote,
+        GoOut,
+        GoBack,
+        GoEarlier,
+        GoLater,
+        GoWireOut,
+        GoWireBack,
+        GoStart,
         FocusCanvas,
         New,
         Save,
@@ -93,6 +100,9 @@ const STATUS_H: f32 = 26.0;
 /// Radius of the ring marking a node nothing links to. Smaller than `PORT_R`, so the handle
 /// you drag from stays the larger and the only interactive-looking one.
 const ROOT_R: f32 = 5.0;
+/// How far above and below a wire's label point a keyboard move keeps in view, in document
+/// units: a two-line label pill with room to spare.
+const LABEL_REACH: f32 = 24.0;
 /// One wire as the paint closure takes it: the corners in pane pixels, its colour, its width.
 type Wire = (Vec<Point<Pixels>>, Rgba, f32);
 
@@ -265,6 +275,33 @@ const MENUS: &[MenuSpec] = &[
             ("Note", "Ctrl+6", |e, w, cx| e.on_new_note(&NewNote, w, cx)),
         ],
     ),
+    // The arrow keys walk the graph rather than the screen — see `Doc::navigate`. Listed so
+    // the F1 sheet and the palette teach them; a keyboard user has no other way to learn
+    // that Alt+Right is how a choice is reached.
+    (
+        "Go",
+        &[
+            ("Into first choice", "Right", |e, w, cx| {
+                e.on_go_out(&GoOut, w, cx)
+            }),
+            ("Back", "Left", |e, w, cx| e.on_go_back(&GoBack, w, cx)),
+            ("Previous choice", "Up", |e, w, cx| {
+                e.on_go_earlier(&GoEarlier, w, cx)
+            }),
+            ("Next choice", "Down", |e, w, cx| {
+                e.on_go_later(&GoLater, w, cx)
+            }),
+            ("Wire forward", "Alt+Right", |e, w, cx| {
+                e.on_go_wire_out(&GoWireOut, w, cx)
+            }),
+            ("Wire back", "Alt+Left", |e, w, cx| {
+                e.on_go_wire_back(&GoWireBack, w, cx)
+            }),
+            ("Start of conversation", "Home", |e, w, cx| {
+                e.on_go_start(&GoStart, w, cx)
+            }),
+        ],
+    ),
     (
         "View",
         &[
@@ -394,6 +431,10 @@ struct Editor {
     /// Where the canvas is looking. Applied to everything drawn.
     view: View,
     selection: Selection,
+    /// The nodes the arrow keys walked through to the selection, which is what makes Left
+    /// retrace them. Never cleared: [`Doc::navigate`] ignores a trail that no longer ends
+    /// where the selection stands, so a click, a search or an undo stales it for nothing.
+    trail: Vec<NodeId>,
     drag: Option<Drag>,
     focus_handle: FocusHandle,
     speaker_input: Entity<TextInput>,
@@ -733,6 +774,7 @@ impl Editor {
             doc: Doc::sample(),
             view: View::default(),
             selection: Selection::None,
+            trail: Vec::new(),
             drag: None,
             focus_handle,
             speaker_input,
@@ -2609,6 +2651,138 @@ impl Editor {
         cx.notify();
     }
 
+    fn on_go_out(&mut self, _: &GoOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::Out, window, cx);
+    }
+
+    fn on_go_back(&mut self, _: &GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::Back, window, cx);
+    }
+
+    fn on_go_earlier(&mut self, _: &GoEarlier, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::Earlier, window, cx);
+    }
+
+    fn on_go_later(&mut self, _: &GoLater, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::Later, window, cx);
+    }
+
+    fn on_go_wire_out(&mut self, _: &GoWireOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::WireOut, window, cx);
+    }
+
+    fn on_go_wire_back(&mut self, _: &GoWireBack, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::WireBack, window, cx);
+    }
+
+    fn on_go_start(&mut self, _: &GoStart, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Go::Start, window, cx);
+    }
+
+    /// The arrow keys, Home and the Go menu: one move from the selection through
+    /// [`Doc::navigate`], which owns the table, brought into view. With nothing selected the
+    /// first press only lands on the node nearest the middle of the view — whatever the
+    /// author is looking at — so the keyboard has somewhere to start.
+    fn navigate(&mut self, go: Go, window: &Window, cx: &mut Context<Self>) {
+        // Nothing on the canvas is drawn under the map, and a modal's scrim hides it, while
+        // the help sheet leaves the focus on the canvas: a move there would select unseen.
+        // A drag is the mouse already moving the selection.
+        if self.flow_map
+            || self.drag.is_some()
+            || self.help_open
+            || self.prefs_open
+            || self.palette_open
+        {
+            return;
+        }
+        let at = match self.selection {
+            Selection::None => {
+                let middle = self.view.to_doc(Self::pane_center(window));
+                let Some(id) = self.doc.nearest(&self.flow, middle) else {
+                    return self.set_status("Nothing on this canvas to go to.".into(), cx);
+                };
+                self.trail = vec![id];
+                return self.land(Place::Node(id), window, cx);
+            }
+            Selection::Edge(index) => Place::Edge(index),
+            Selection::Nodes(_) => match self.selection.only_node() {
+                Some(id) => Place::Node(id),
+                None => return self.set_status("Select one node to go from it.".into(), cx),
+            },
+        };
+        match self.doc.navigate(&self.flow, at, &self.trail, go) {
+            Some(nav) => {
+                self.trail = nav.trail;
+                self.land(nav.at, window, cx);
+            }
+            None => {
+                let why = self.nowhere(go, at);
+                self.set_status(why.into(), cx);
+            }
+        }
+    }
+
+    /// Why a move went nowhere, for the status line. Worded here and not in `doc.rs`, as
+    /// `problem_text` is: the model says only that nothing is that way.
+    fn nowhere(&self, go: Go, at: Place) -> &'static str {
+        match go {
+            Go::Out => "Nothing follows this.",
+            Go::Back => "Nothing leads here — a start.",
+            Go::Earlier => "Already the first.",
+            Go::Later => "Already the last.",
+            Go::WireOut => {
+                let from = match at {
+                    Place::Node(id) => Some(id),
+                    Place::Edge(index) => self.doc.edges.get(index).map(|e| e.to),
+                };
+                if from.is_some_and(|id| self.doc.is_jump(id)) {
+                    "A jump names its target on its box — Right follows it."
+                } else {
+                    "No wire leaves this node."
+                }
+            }
+            Go::WireBack => "No wire leads here on this canvas.",
+            Go::Start => "Nothing here to start from.",
+        }
+    }
+
+    /// Selects where a keyboard move landed and brings it into view: across to its canvas
+    /// through [`Editor::show`] when it is on another, as [`Editor::jump_to`] does, and
+    /// otherwise panned only as far as it takes ([`View::reveal`]), so a walk down a
+    /// conversation does not swing the canvas on every key.
+    fn land(&mut self, at: Place, window: &Window, cx: &mut Context<Self>) {
+        let pane = Self::pane_size(window);
+        match at {
+            Place::Node(id) => {
+                let Some(node) = self.doc.node(id) else {
+                    return;
+                };
+                if node.flow != self.flow {
+                    self.show(id, window, cx);
+                } else {
+                    let rect = ((node.x, node.y), (node.x + NODE_W, node.y + NODE_H));
+                    self.view.reveal(rect, pane, FIT_MARGIN);
+                }
+                self.select(Selection::Nodes(vec![id]), cx);
+            }
+            Place::Edge(index) => {
+                // Round the label, where the wire's selection shows and its text is read.
+                let label = self.doc.edges.get(index).and_then(|edge| {
+                    let (from, to) = self.doc.wire_ends(&self.flow, edge)?;
+                    let wire = route(out_port(from), in_port(to));
+                    let (x, y) = wire.label;
+                    let half = (wire.room / 2.0).max(PORT_R);
+                    Some(((x - half, y - LABEL_REACH), (x + half, y + LABEL_REACH)))
+                });
+                if let Some(rect) = label {
+                    self.view.reveal(rect, pane, FIT_MARGIN);
+                }
+                self.select(Selection::Edge(index), cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn on_toggle_flow_map(&mut self, _: &ToggleFlowMap, _: &mut Window, cx: &mut Context<Self>) {
         self.flow_map = !self.flow_map;
         self.drag = None;
@@ -3131,6 +3305,13 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_new_instruction))
             .on_action(cx.listener(Self::on_new_condition))
             .on_action(cx.listener(Self::on_new_note))
+            .on_action(cx.listener(Self::on_go_out))
+            .on_action(cx.listener(Self::on_go_back))
+            .on_action(cx.listener(Self::on_go_earlier))
+            .on_action(cx.listener(Self::on_go_later))
+            .on_action(cx.listener(Self::on_go_wire_out))
+            .on_action(cx.listener(Self::on_go_wire_back))
+            .on_action(cx.listener(Self::on_go_start))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
@@ -6147,9 +6328,11 @@ impl Editor {
                                 // Three groups across: in two, the Edit and View columns
                                 // stacked past the bottom of a laptop-sized window.
                                 .w(px(800.0))
-                                .children(
-                                    MENUS.iter().filter(|(name, _)| self.menu_shown(name)).map(
-                                        |(name, items)| {
+                                .children({
+                                    let mut groups: Vec<AnyElement> = MENUS
+                                        .iter()
+                                        .filter(|(name, _)| self.menu_shown(name))
+                                        .map(|(name, items)| {
                                             group(
                                                 name,
                                                 items
@@ -6159,16 +6342,32 @@ impl Editor {
                                                     })
                                                     .collect(),
                                             )
-                                        },
-                                    ),
-                                )
-                                .child(group(
-                                    "Mouse",
-                                    MOUSE
-                                        .iter()
-                                        .map(|(what, how)| (what.to_string(), how.to_string()))
-                                        .collect(),
-                                )),
+                                            .into_any_element()
+                                        })
+                                        .collect();
+                                    let mouse = group(
+                                        "Mouse",
+                                        MOUSE
+                                            .iter()
+                                            .map(|(what, how)| (what.to_string(), how.to_string()))
+                                            .collect(),
+                                    );
+                                    // Under the last menu, in its column, rather than a row
+                                    // of its own: Go made seven groups, and a third row put
+                                    // the credit below the scroll edge of an 860px window.
+                                    // Play, the usual last, is three rows long.
+                                    let last = groups.pop();
+                                    groups.push(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_y_4()
+                                            .children(last)
+                                            .child(mouse)
+                                            .into_any_element(),
+                                    );
+                                    groups
+                                }),
                         )
                         // CC BY asks for the credit where the work is used, and this sheet is
                         // the one place in the editor that lists what it is made of.
@@ -8126,6 +8325,16 @@ fn main() {
             KeyBinding::new("ctrl-x", CutNodes, Some("Canvas")),
             KeyBinding::new("ctrl-v", PasteNodes, Some("Canvas")),
             KeyBinding::new("ctrl-d", DuplicateNodes, Some("Canvas")),
+            // The arrows and Home move the cursor in a field, so they walk the graph only
+            // from the canvas. The find and palette fields sit in overlays on the root, not
+            // inside the canvas, so these never reach them either.
+            KeyBinding::new("right", GoOut, Some("Canvas")),
+            KeyBinding::new("left", GoBack, Some("Canvas")),
+            KeyBinding::new("up", GoEarlier, Some("Canvas")),
+            KeyBinding::new("down", GoLater, Some("Canvas")),
+            KeyBinding::new("alt-right", GoWireOut, Some("Canvas")),
+            KeyBinding::new("alt-left", GoWireBack, Some("Canvas")),
+            KeyBinding::new("home", GoStart, Some("Canvas")),
             // A field binds neither, so these work while the Choice field has the focus too.
             KeyBinding::new("alt-up", MoveChoiceUp, Some("Editor")),
             KeyBinding::new("alt-down", MoveChoiceDown, Some("Editor")),

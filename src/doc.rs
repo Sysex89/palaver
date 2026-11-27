@@ -368,6 +368,27 @@ fn distance_to_polyline(p: (f32, f32), points: &[(f32, f32)]) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
+/// A trail after stepping back to `parent`: one node shorter when that is where it came
+/// from, or a fresh trail at `parent` when the step went a way the trail does not record.
+fn back_to(mut trail: Vec<NodeId>, parent: NodeId) -> Vec<NodeId> {
+    if trail.len() >= 2 && trail[trail.len() - 2] == parent {
+        trail.pop();
+        trail
+    } else {
+        vec![parent]
+    }
+}
+
+/// The item one place `step` from `item` in `list`, or `None` at either end or when `item`
+/// is not in it. No wrapping: a list that wraps gives no sign it has been gone round.
+fn beside<T: Copy + PartialEq>(list: &[T], item: T, step: Step) -> Option<T> {
+    let at = list.iter().position(|&x| x == item)?;
+    match step {
+        Step::Earlier => at.checked_sub(1).map(|i| list[i]),
+        Step::Later => list.get(at + 1).copied(),
+    }
+}
+
 /// Middle of a node, which is what the canvas centres on when jumping to one.
 pub fn node_center(node: &Node) -> (f32, f32) {
     (node.x + NODE_W / 2.0, node.y + NODE_H / 2.0)
@@ -531,6 +552,27 @@ impl View {
             ),
             zoom,
         }
+    }
+
+    /// Pans by as little as brings `rect` (a document-space box, min corner then max) inside
+    /// a pane of size `pane` with `margin` screen pixels to spare, leaving zoom alone. A box
+    /// already in view moves nothing, so stepping along a conversation from the keyboard
+    /// does not swing the canvas on every key the way centring on each node would. A box
+    /// bigger than the pane goes to its top-left margin, for the reason [`View::fit`]
+    /// anchors there.
+    pub fn reveal(&mut self, rect: ((f32, f32), (f32, f32)), pane: (f32, f32), margin: f32) {
+        let (lo, hi) = (self.to_screen(rect.0), self.to_screen(rect.1));
+        let shift = |lo: f32, hi: f32, pane: f32| {
+            if hi - lo > pane - 2.0 * margin || lo < margin {
+                margin - lo
+            } else if hi > pane - margin {
+                pane - margin - hi
+            } else {
+                0.0
+            }
+        };
+        self.pan.0 += shift(lo.0, hi.0, pane.0);
+        self.pan.1 += shift(lo.1, hi.1, pane.1);
     }
 
     /// Zooms by `factor`, keeping whatever sits under `anchor` (in screen coordinates)
@@ -1339,6 +1381,46 @@ pub struct Fragment {
 pub enum Step {
     Earlier,
     Later,
+}
+
+/// What the keyboard stands on: one node, or the wire of edge `index`. A selection of one,
+/// without the view's type, so [`Doc::navigate`] can be tested; the view maps its
+/// `Selection` to and from it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Place {
+    Node(NodeId),
+    Edge(usize),
+}
+
+/// A move [`Doc::navigate`] makes: the arrow keys and Home. Right and Left go along the
+/// graph, Up and Down along a list of siblings, and the `Wire` pair go along the graph but
+/// land on the wire rather than the box, which is how a choice is reached to edit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Go {
+    /// Right: into the first choice.
+    Out,
+    /// Left: back where this came from.
+    Back,
+    /// Up: the previous sibling.
+    Earlier,
+    /// Down: the next sibling.
+    Later,
+    /// Alt+Right: onto the first wire out.
+    WireOut,
+    /// Alt+Left: onto the wire in.
+    WireBack,
+    /// Home: the start of the conversation.
+    Start,
+}
+
+/// Where a move lands, and the trail that got there: the nodes walked through, ending at the
+/// node `at` stands on — itself for a node, its source for a wire. The trail is what makes
+/// Left retrace a path rather than take a node's first way in, and Up and Down keep to the
+/// list they were stepping through. It is view state, never stored in the document.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Nav {
+    pub at: Place,
+    pub trail: Vec<NodeId>,
 }
 
 /// The value of [`Fragment`]'s `palaver` field. Versioned so a later build that changes the
@@ -2773,6 +2855,202 @@ impl Doc {
         let other = self.choice_step(index, step)?;
         self.edges.swap(index, other);
         Some(other)
+    }
+
+    /// The one table of keyboard moves: from `at`, on the canvas for `flow`, having walked
+    /// `trail`, where `go` lands — or `None` when nothing is that way, worded by the view.
+    ///
+    /// The keys walk the graph, not the screen. Right is the first choice, in the order of
+    /// `edges` the Choices list and the play panel show, and follows a jump to its target on
+    /// any canvas; Left is the node this was reached from; Up and Down step through the
+    /// choices of that node — or, at the top of a conversation, through the canvas's
+    /// starting nodes in screen order, since separate conversations have no authored order.
+    /// From a wire, Right and Left are its two ends and Up and Down its siblings, so Alt+Up
+    /// moves the choice landed on. A wire move lands only on a wire this canvas draws
+    /// ([`Doc::wire_ends`]): a jump's edge is never drawn, and a selected one is a target
+    /// Delete takes unseen.
+    ///
+    /// `trail` is checked here, when it is read, rather than cleared by every click, undo
+    /// or swap that could stale it: it counts only while it ends where `at` stands, and is
+    /// `[standing]` otherwise.
+    pub fn navigate(&self, flow: &str, at: Place, trail: &[NodeId], go: Go) -> Option<Nav> {
+        let standing = self.standing(at)?;
+        let mut trail = match trail.last() {
+            Some(&last) if last == standing => trail.to_vec(),
+            _ => vec![standing],
+        };
+        let node = |id: NodeId, trail: Vec<NodeId>| Nav {
+            at: Place::Node(id),
+            trail,
+        };
+        let wire = |index: usize, trail: Vec<NodeId>| Nav {
+            at: Place::Edge(index),
+            trail,
+        };
+        match (go, at) {
+            (Go::Start, _) => {
+                let start = self.start_of(standing);
+                Some(node(start, vec![start]))
+            }
+            (Go::Out, Place::Node(n)) => {
+                let (to, _) = self.choices(n).into_iter().find(|&(to, _)| to != n)?;
+                trail.push(to);
+                Some(node(to, trail))
+            }
+            (Go::Out, Place::Edge(index)) => {
+                let to = self.edges[index].to;
+                self.node(to)?;
+                trail.push(to);
+                Some(node(to, trail))
+            }
+            (Go::Back, Place::Node(n)) => {
+                let parent = self.parent(n, &trail)?;
+                Some(node(parent, back_to(trail, parent)))
+            }
+            (Go::Back, Place::Edge(_)) => Some(node(standing, trail)),
+            (Go::Earlier | Go::Later, Place::Node(n)) => {
+                let step = if go == Go::Earlier {
+                    Step::Earlier
+                } else {
+                    Step::Later
+                };
+                match self.parent(n, &trail) {
+                    Some(parent) => {
+                        let next = beside(&self.siblings(parent), n, step)?;
+                        let mut trail = back_to(trail, parent);
+                        trail.push(next);
+                        Some(node(next, trail))
+                    }
+                    None => {
+                        let next = beside(&self.tops(flow), n, step)?;
+                        Some(node(next, vec![next]))
+                    }
+                }
+            }
+            (Go::Earlier | Go::Later, Place::Edge(index)) => {
+                let step = if go == Go::Earlier {
+                    Step::Earlier
+                } else {
+                    Step::Later
+                };
+                let next = beside(&self.wires_from(flow, standing), index, step)?;
+                Some(wire(next, trail))
+            }
+            (Go::WireOut, Place::Node(n)) => {
+                let first = *self.wires_from(flow, n).first()?;
+                Some(wire(first, trail))
+            }
+            (Go::WireOut, Place::Edge(index)) => {
+                let to = self.edges[index].to;
+                let first = *self.wires_from(flow, to).first()?;
+                trail.push(to);
+                Some(wire(first, trail))
+            }
+            (Go::WireBack, Place::Node(n)) => {
+                let index = self.wire_into(flow, n, &trail)?;
+                let parent = self.edges[index].from;
+                Some(wire(index, back_to(trail, parent)))
+            }
+            (Go::WireBack, Place::Edge(_)) => {
+                self.navigate(flow, Place::Node(standing), &trail, Go::WireBack)
+            }
+        }
+    }
+
+    /// The node a place stands on — itself, or a wire's source — while it still exists.
+    fn standing(&self, at: Place) -> Option<NodeId> {
+        let id = match at {
+            Place::Node(id) => id,
+            Place::Edge(index) => {
+                let edge = self.edges.get(index)?;
+                self.node(edge.to)?;
+                edge.from
+            }
+        };
+        self.node(id).map(|node| node.id)
+    }
+
+    /// Where Left goes from `n`: the node the trail came from while an edge from it still
+    /// leads here, or else the first-drawn way in — the rule [`Doc::context`] reads, and
+    /// what a node reached by a click or a search falls back on. Never `n` itself, so a
+    /// self-loop left by a hand-edit is not a way back.
+    fn parent(&self, n: NodeId, trail: &[NodeId]) -> Option<NodeId> {
+        if let [.., came, last] = trail
+            && *last == n
+            && *came != n
+            && self.node(*came).is_some()
+            && self.has_edge(*came, n)
+        {
+            return Some(*came);
+        }
+        self.edges
+            .iter()
+            .find(|e| e.to == n && e.from != n && self.node(e.from).is_some())
+            .map(|e| e.from)
+    }
+
+    /// Where `parent`'s choices lead, in the order of `edges`, each once: the list Up and
+    /// Down step through below a node.
+    fn siblings(&self, parent: NodeId) -> Vec<NodeId> {
+        let mut seen = HashSet::new();
+        self.choices(parent)
+            .into_iter()
+            .map(|(to, _)| to)
+            .filter(|&to| to != parent && seen.insert(to))
+            .collect()
+    }
+
+    /// The nodes on `flow` nothing leads to, notes included, top to bottom and then left to
+    /// right: the list Up and Down step through where there is no parent to list choices.
+    /// Not [`Doc::roots`], which is document-wide and leaves notes out because a note is no
+    /// conversation — but a keyboard has to be able to reach one.
+    fn tops(&self, flow: &str) -> Vec<NodeId> {
+        let mut tops: Vec<&Node> = self
+            .nodes_in(flow)
+            .filter(|n| {
+                !self
+                    .edges
+                    .iter()
+                    .any(|e| e.to == n.id && e.from != n.id && self.node(e.from).is_some())
+            })
+            .collect();
+        tops.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        tops.into_iter().map(|n| n.id).collect()
+    }
+
+    /// The edges out of `from` that the canvas for `flow` draws as wires, in order.
+    fn wires_from(&self, flow: &str, from: NodeId) -> Vec<usize> {
+        self.edges_from(from)
+            .into_iter()
+            .filter(|&index| self.wire_ends(flow, &self.edges[index]).is_some())
+            .collect()
+    }
+
+    /// The wire into `n` that Alt+Left lands on: the one from the node the trail came from
+    /// when that one is drawn, or else the first drawn wire in. Asked of drawn wires
+    /// directly, not through [`Doc::parent`], since the parent may be a jump on another
+    /// canvas whose edge no wire shows.
+    fn wire_into(&self, flow: &str, n: NodeId, trail: &[NodeId]) -> Option<usize> {
+        let drawn = |e: &Edge| e.to == n && e.from != n && self.wire_ends(flow, e).is_some();
+        if let [.., came, last] = trail
+            && *last == n
+            && let Some(index) = self.edges.iter().position(|e| e.from == *came && drawn(e))
+        {
+            return Some(index);
+        }
+        self.edges.iter().position(drawn)
+    }
+
+    /// The node on `flow` whose middle is nearest `point`: where the keyboard starts when
+    /// nothing is selected, which is whatever the author is looking at.
+    pub fn nearest(&self, flow: &str, point: (f32, f32)) -> Option<NodeId> {
+        let distance = |node: &Node| {
+            let (x, y) = node_center(node);
+            (x - point.0).powi(2) + (y - point.1).powi(2)
+        };
+        self.nodes_in(flow)
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            .map(|node| node.id)
     }
 
     /// Whether [`Doc::split_edge`] would put a `kind` node into edge `index`: the edge exists
@@ -10208,5 +10486,382 @@ mod tests {
         assert_eq!(doc.rename_character("Innkeeper", "  "), 0);
         assert_eq!(doc.rename_character("Innkeeper", "Player"), 0);
         assert!(doc.character("Innkeeper").is_some());
+    }
+
+    /// A small conversation for the keyboard: `a` leads to hub `h`, whose three answers are
+    /// `x`, `y` and `z`; `y` has a second way in, from `q`, drawn *first* so it is the one a
+    /// trail-less Left falls back on, and leads on to `end`. `n` is a note, `j` a jump to
+    /// `t` on the `road` flow, and `z` also has an ordinary edge across to `t`, which no
+    /// canvas draws.
+    fn nav_graph() -> (Doc, [NodeId; 10]) {
+        let mut doc = Doc::default();
+        let a = doc.add_node(0.0, 0.0);
+        let h = doc.add_node(400.0, 0.0);
+        let x = doc.add_node(800.0, 0.0);
+        let y = doc.add_node(800.0, 120.0);
+        let z = doc.add_node(800.0, 240.0);
+        let q = doc.add_node(400.0, 300.0);
+        let end = doc.add_node(1200.0, 120.0);
+        let n = doc.add_node(0.0, 500.0);
+        let j = doc.add_node(0.0, 700.0);
+        let t = doc.add_node_on("road", 0.0, 0.0);
+        doc.node_mut(h).unwrap().kind = NodeKind::Hub;
+        doc.node_mut(n).unwrap().kind = NodeKind::Note;
+        doc.node_mut(j).unwrap().kind = NodeKind::Jump;
+        for (from, to) in [
+            (q, y),
+            (a, h),
+            (h, x),
+            (h, y),
+            (h, z),
+            (y, end),
+            (j, t),
+            (z, t),
+        ] {
+            assert!(doc.add_edge(from, to));
+        }
+        (doc, [a, h, x, y, z, q, end, n, j, t])
+    }
+
+    fn edge_index(doc: &Doc, from: NodeId, to: NodeId) -> usize {
+        doc.edges
+            .iter()
+            .position(|e| e.from == from && e.to == to)
+            .unwrap()
+    }
+
+    #[test]
+    fn right_goes_to_the_first_choice() {
+        let (doc, [a, h, x, _, _, _, end, n, ..]) = nav_graph();
+        let nav = doc.navigate("", Place::Node(a), &[], Go::Out).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(h),
+                trail: vec![a, h]
+            }
+        );
+        let nav = doc.navigate("", nav.at, &nav.trail, Go::Out).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(x),
+                trail: vec![a, h, x]
+            }
+        );
+        assert_eq!(doc.navigate("", Place::Node(end), &[], Go::Out), None);
+        assert_eq!(doc.navigate("", Place::Node(n), &[], Go::Out), None);
+    }
+
+    #[test]
+    fn right_from_a_jump_crosses_to_its_target() {
+        let (doc, [.., j, t]) = nav_graph();
+        let nav = doc.navigate("", Place::Node(j), &[], Go::Out).unwrap();
+        assert_eq!(nav.at, Place::Node(t));
+        assert_eq!(doc.node(t).unwrap().flow, "road");
+    }
+
+    #[test]
+    fn right_skips_a_self_loop() {
+        let (mut doc, [a, h, ..]) = nav_graph();
+        // `add_edge` refuses one; a hand-edit or a merge does not.
+        let index = doc.edges.len();
+        doc.edges.push(doc.edges[edge_index(&doc, a, h)].clone());
+        doc.edges[index].to = a;
+        doc.edges.swap(0, index);
+        let nav = doc.navigate("", Place::Node(a), &[], Go::Out).unwrap();
+        assert_eq!(nav.at, Place::Node(h));
+        // Nor is it a way back.
+        assert_eq!(doc.navigate("", Place::Node(a), &[], Go::Back), None);
+    }
+
+    #[test]
+    fn left_retraces_the_trail_and_falls_back_on_the_first_way_in() {
+        let (doc, [a, h, _, y, _, q, ..]) = nav_graph();
+        // Reached through the hub, Left goes back to the hub ...
+        let nav = doc
+            .navigate("", Place::Node(y), &[a, h, y], Go::Back)
+            .unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(h),
+                trail: vec![a, h]
+            }
+        );
+        // ... and reached any other way, by the first-drawn edge in, which is `q`'s.
+        let nav = doc.navigate("", Place::Node(y), &[], Go::Back).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(q),
+                trail: vec![q]
+            }
+        );
+        // A trail ending somewhere else is stale, and counts for nothing.
+        let nav = doc.navigate("", Place::Node(y), &[a, h], Go::Back).unwrap();
+        assert_eq!(nav.at, Place::Node(q));
+        assert_eq!(doc.navigate("", Place::Node(a), &[], Go::Back), None);
+    }
+
+    #[test]
+    fn right_then_left_comes_back_the_same_way() {
+        let (doc, [a, ..]) = nav_graph();
+        let mut nav = Nav {
+            at: Place::Node(a),
+            trail: vec![a],
+        };
+        let mut lengths = Vec::new();
+        for go in [
+            Go::Out,
+            Go::Out,
+            Go::Later,
+            Go::Out,
+            Go::Back,
+            Go::Back,
+            Go::Back,
+        ] {
+            nav = doc.navigate("", nav.at, &nav.trail, go).unwrap();
+            lengths.push(nav.trail.len());
+        }
+        assert_eq!(nav.at, Place::Node(a));
+        assert_eq!(lengths, [2, 3, 3, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn up_and_down_keep_to_the_list_they_are_in() {
+        let (doc, [_, h, x, y, z, ..]) = nav_graph();
+        // From `x`, reached by a click: its only parent is the hub.
+        let nav = doc.navigate("", Place::Node(x), &[], Go::Later).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(y),
+                trail: vec![h, y]
+            }
+        );
+        // `y`'s first way in is `q`, but the trail says the list is the hub's.
+        let nav = doc.navigate("", nav.at, &nav.trail, Go::Later).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(z),
+                trail: vec![h, z]
+            }
+        );
+        // No wrapping round at either end.
+        assert_eq!(doc.navigate("", nav.at, &nav.trail, Go::Later), None);
+        assert_eq!(doc.navigate("", Place::Node(x), &[], Go::Earlier), None);
+    }
+
+    #[test]
+    fn up_and_down_at_the_top_go_in_screen_order() {
+        let (doc, [a, _, _, _, _, q, _, n, j, _]) = nav_graph();
+        let mut at = Place::Node(a);
+        let mut seen = vec![a];
+        while let Some(nav) = doc.navigate("", at, &[], Go::Later) {
+            assert_eq!(nav.trail.len(), 1);
+            at = nav.at;
+            let Place::Node(id) = at else { unreachable!() };
+            seen.push(id);
+        }
+        // Top to bottom, and the note among them: the keyboard has to reach one.
+        assert_eq!(seen, [a, q, n, j]);
+        assert_eq!(doc.navigate("", Place::Node(a), &[], Go::Earlier), None);
+    }
+
+    #[test]
+    fn a_wire_move_lands_only_on_a_drawn_wire() {
+        let (doc, [a, h, x, _, z, .., j, t]) = nav_graph();
+        let nav = doc.navigate("", Place::Node(a), &[], Go::WireOut).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Edge(edge_index(&doc, a, h)),
+                trail: vec![a]
+            }
+        );
+        // Onwards from a wire is the first wire out of its target.
+        let nav = doc.navigate("", nav.at, &nav.trail, Go::WireOut).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Edge(edge_index(&doc, h, x)),
+                trail: vec![a, h]
+            }
+        );
+        // A jump's edge is never drawn, nor is one that crosses to another canvas.
+        assert_eq!(doc.navigate("", Place::Node(j), &[], Go::WireOut), None);
+        assert_eq!(doc.navigate("", Place::Node(z), &[], Go::WireOut), None);
+        // The crossing edge is still a way to go by node, as a jump's is.
+        let nav = doc.navigate("", Place::Node(z), &[], Go::Out).unwrap();
+        assert_eq!(nav.at, Place::Node(t));
+    }
+
+    #[test]
+    fn up_and_down_on_a_wire_step_through_its_siblings() {
+        let (doc, [a, h, x, y, z, ..]) = nav_graph();
+        let first = Place::Edge(edge_index(&doc, h, x));
+        let trail = [a, h];
+        let nav = doc.navigate("", first, &trail, Go::Later).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Edge(edge_index(&doc, h, y)),
+                trail: vec![a, h]
+            }
+        );
+        let nav = doc.navigate("", nav.at, &nav.trail, Go::Later).unwrap();
+        assert_eq!(nav.at, Place::Edge(edge_index(&doc, h, z)));
+        assert_eq!(doc.navigate("", nav.at, &nav.trail, Go::Later), None);
+        assert_eq!(doc.navigate("", first, &trail, Go::Earlier), None);
+        // Right and Left are the wire's two ends.
+        let on_y = Place::Edge(edge_index(&doc, h, y));
+        let nav = doc.navigate("", on_y, &trail, Go::Out).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(y),
+                trail: vec![a, h, y]
+            }
+        );
+        let nav = doc.navigate("", on_y, &trail, Go::Back).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(h),
+                trail: vec![a, h]
+            }
+        );
+    }
+
+    #[test]
+    fn a_wire_back_prefers_the_way_the_trail_came() {
+        let (doc, [a, h, _, y, _, q, ..]) = nav_graph();
+        let nav = doc
+            .navigate("", Place::Node(y), &[a, h, y], Go::WireBack)
+            .unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Edge(edge_index(&doc, h, y)),
+                trail: vec![a, h]
+            }
+        );
+        let nav = doc.navigate("", Place::Node(y), &[], Go::WireBack).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Edge(edge_index(&doc, q, y)),
+                trail: vec![q]
+            }
+        );
+        // From a wire, the wire into its source.
+        let on_hy = Place::Edge(edge_index(&doc, h, y));
+        let nav = doc.navigate("", on_hy, &[a, h], Go::WireBack).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Edge(edge_index(&doc, a, h)),
+                trail: vec![a]
+            }
+        );
+        assert_eq!(doc.navigate("", Place::Node(a), &[], Go::WireBack), None);
+    }
+
+    #[test]
+    fn home_goes_to_the_start_of_the_conversation() {
+        let (doc, [a, h, x, y, ..]) = nav_graph();
+        let nav = doc
+            .navigate("", Place::Node(x), &[a, h, x], Go::Start)
+            .unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(a),
+                trail: vec![a]
+            }
+        );
+        let start = doc.start_of(y);
+        let on_wire = Place::Edge(edge_index(&doc, h, y));
+        let nav = doc.navigate("", on_wire, &[], Go::Start).unwrap();
+        assert_eq!(
+            nav,
+            Nav {
+                at: Place::Node(doc.start_of(h)),
+                trail: vec![a]
+            }
+        );
+        let nav = doc.navigate("", Place::Node(y), &[], Go::Start).unwrap();
+        assert_eq!(nav.at, Place::Node(start));
+    }
+
+    #[test]
+    fn navigating_from_what_is_gone_goes_nowhere() {
+        let (mut doc, [a, h, x, ..]) = nav_graph();
+        let index = edge_index(&doc, h, x);
+        let gone = Place::Edge(doc.edges.len());
+        for go in [
+            Go::Out,
+            Go::Back,
+            Go::Later,
+            Go::WireOut,
+            Go::WireBack,
+            Go::Start,
+        ] {
+            assert_eq!(doc.navigate("", gone, &[], go), None);
+        }
+        // An edge whose target was deleted out from under it by a hand-edit.
+        doc.nodes.retain(|n| n.id != x);
+        for go in [
+            Go::Out,
+            Go::Back,
+            Go::Later,
+            Go::WireOut,
+            Go::WireBack,
+            Go::Start,
+        ] {
+            assert_eq!(doc.navigate("", Place::Edge(index), &[a, h], go), None);
+        }
+        // And a node that is gone.
+        assert_eq!(doc.navigate("", Place::Node(x), &[], Go::Back), None);
+    }
+
+    #[test]
+    fn nearest_looks_only_at_the_canvas_asked_about() {
+        let (doc, [a, .., t]) = nav_graph();
+        // `t` stands at the origin of `road`, exactly where `a` stands on main.
+        assert_eq!(doc.nearest("", (10.0, 10.0)), Some(a));
+        assert_eq!(doc.nearest("road", (900.0, 900.0)), Some(t));
+        assert_eq!(doc.nearest("nowhere", (0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn reveal_pans_only_as_far_as_it_has_to() {
+        let pane = (800.0, 600.0);
+        let view = View {
+            pan: (0.0, 0.0),
+            zoom: 0.5,
+        };
+        // Already in view: nothing moves.
+        let mut v = view;
+        v.reveal(((100.0, 100.0), (300.0, 190.0)), pane, 40.0);
+        assert_eq!(v.pan, (0.0, 0.0));
+        // Off the right and the bottom: just inside the margin there, and no further.
+        let mut v = view;
+        v.reveal(((1600.0, 1200.0), (1800.0, 1290.0)), pane, 40.0);
+        assert_eq!(v.pan, (800.0 - 40.0 - 900.0, 600.0 - 40.0 - 645.0));
+        assert_eq!(v.zoom, 0.5);
+        // Off the left and the top.
+        let mut v = view;
+        v.reveal(((-400.0, -200.0), (-200.0, -110.0)), pane, 40.0);
+        assert_eq!(v.pan, (40.0 + 200.0, 40.0 + 100.0));
+        // Bigger than the pane: its top-left corner goes to the margin.
+        let mut v = View {
+            pan: (0.0, 0.0),
+            zoom: 1.0,
+        };
+        v.reveal(((100.0, 100.0), (2000.0, 150.0)), pane, 40.0);
+        assert_eq!(v.pan, (-60.0, 0.0));
     }
 }
