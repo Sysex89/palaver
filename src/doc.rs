@@ -2670,6 +2670,18 @@ impl Doc {
         }
     }
 
+    /// Whether Link to… offers `to` as a target for `from`: what [`Doc::can_link`] accepts,
+    /// and on `from`'s own canvas unless `from` is a jump. A drag never needed the second
+    /// rule, since it can only drop on a node the canvas draws, but a picker lists every
+    /// canvas — and an ordinary edge to another one is [`Problem::CrossFlowEdge`], while
+    /// crossing canvases is exactly what a jump is for.
+    pub fn link_offers(&self, from: NodeId, to: NodeId) -> bool {
+        let (Some(a), Some(b)) = (self.node(from), self.node(to)) else {
+            return false;
+        };
+        self.can_link(from, to) && (a.kind == NodeKind::Jump || a.flow == b.flow)
+    }
+
     /// Connects two nodes the way a drag from an out-port does: an ordinary node gains a
     /// choice, and a jump that already has a target is pointed at the new one instead, so
     /// the one-target rule holds and the port stays a handle that lands. False, with
@@ -10863,5 +10875,32 @@ mod tests {
         };
         v.reveal(((100.0, 100.0), (2000.0, 150.0)), pane, 40.0);
         assert_eq!(v.pan, (-60.0, 0.0));
+    }
+
+    #[test]
+    fn link_to_offers_only_what_lands_and_stays_on_the_canvas() {
+        let (mut doc, [a, h, x, y, _, q, _, n, j, t]) = nav_graph();
+        // An ordinary node: any node on its canvas that can_link accepts.
+        assert!(doc.link_offers(a, x));
+        assert!(doc.link_offers(q, a));
+        assert!(!doc.link_offers(a, a), "not itself");
+        assert!(!doc.link_offers(a, h), "not an edge it already has");
+        assert!(!doc.link_offers(a, n), "not a note");
+        assert!(!doc.link_offers(n, a), "not from a note");
+        assert!(!doc.link_offers(a, t), "not across to another canvas");
+        // A jump: anywhere, which is retargeting it; but never onto its own target again.
+        assert!(doc.link_offers(j, y));
+        assert!(!doc.link_offers(j, t));
+        // Everything offered on one canvas is exactly what can_link accepts there.
+        for from in [a, h, x, y, q, n, j] {
+            for to in [a, h, x, y, q, n, j] {
+                assert_eq!(doc.link_offers(from, to), doc.can_link(from, to));
+            }
+        }
+        doc.node_mut(t).unwrap().flow = String::new();
+        assert!(
+            doc.link_offers(a, t),
+            "the same node, once on the same canvas"
+        );
     }
 }

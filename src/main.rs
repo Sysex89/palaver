@@ -89,6 +89,7 @@ actions!(
         FindNext,
         FindPrev,
         FindRun,
+        LinkTo,
         FillLine,
         RerollLine,
         AcceptLine
@@ -285,6 +286,9 @@ const MENUS: &[MenuSpec] = &[
                 e.on_new_condition(&NewCondition, w, cx)
             }),
             ("Note", "Ctrl+6", |e, w, cx| e.on_new_note(&NewNote, w, cx)),
+            ("Link to…", "Ctrl+L", |e, w, cx| {
+                e.on_link_to(&LinkTo, w, cx)
+            }),
         ],
     ),
     // The arrow keys walk the graph rather than the screen — see `Doc::navigate`. Listed so
@@ -530,6 +534,10 @@ struct Editor {
     find_seen: String,
     /// Keeps the highlighted find row in view as the arrow keys walk the list.
     find_scroll: ScrollHandle,
+    /// The node Link to… is linking from, while the find card is picking its target: a row
+    /// then links rather than jumps, and the list holds only what `Doc::link_offers`.
+    /// Cleared with the card, and by Ctrl+F, which is plain find again.
+    linking: Option<NodeId>,
     /// Last title pushed to the platform, so `render` only sets it on change.
     title: String,
     /// Name of the menu whose dropdown is open.
@@ -840,6 +848,7 @@ impl Editor {
             find_sel: 0,
             find_seen: String::new(),
             find_scroll: ScrollHandle::new(),
+            linking: None,
             title: String::new(),
             open_menu: None,
             closing: false,
@@ -2244,8 +2253,30 @@ impl Editor {
         // The sheet is modal and has a scrim: find opened under it could not be seen.
         self.help_open = false;
         self.searching = true;
+        self.linking = None;
         window.focus(&self.search_input.read(cx).focus_handle(cx));
         cx.notify();
+    }
+
+    /// Ctrl+L, or Node → Link to…: the find card, picking a node for the selected one to
+    /// link to — the keyboard's drag from the out-port. Merges, loops and a jump's target had
+    /// no other way to be made without the mouse.
+    fn on_link_to(&mut self, _: &LinkTo, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.selection.only_node() else {
+            return self.set_status("Select one node to link from it.".into(), cx);
+        };
+        if self
+            .doc
+            .node(from)
+            .is_some_and(|node| node.kind == NodeKind::Note)
+        {
+            return self.set_status(
+                "A note stands apart: nothing links to or from one.".into(),
+                cx,
+            );
+        }
+        self.on_find(&Find, window, cx);
+        self.linking = Some(from);
     }
 
     fn on_toggle_problems(&mut self, _: &ToggleProblems, _: &mut Window, cx: &mut Context<Self>) {
@@ -2379,8 +2410,57 @@ impl Editor {
         let rows = self.find_rows(cx).0;
         let shown = rows.len().min(FIND_ROWS);
         if let Some(&id) = rows.get(self.find_sel.min(shown.saturating_sub(1))) {
-            self.jump_to(id, window, cx);
+            self.choose_found(id, window, cx);
         }
+    }
+
+    /// What a find row does, by Enter or a click: goes to the node, or, while Link to… is
+    /// picking, links to it.
+    fn choose_found(&mut self, id: NodeId, window: &mut Window, cx: &mut Context<Self>) {
+        match self.linking {
+            Some(from) => self.link_found(from, id, window, cx),
+            None => self.jump_to(id, window, cx),
+        }
+    }
+
+    /// Links `from` to `to` as a drop from its out-port does — one checkpoint, a jump
+    /// retargeted — then closes the card and selects what changed: the new wire, so Enter
+    /// writes its choice next, or the jump itself, whose edge no wire shows.
+    fn link_found(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Asked before the checkpoint, so a refused link leaves no empty undo step. The list
+        // only offers what lands, but the node could have changed under an open card.
+        if !self.doc.link_offers(from, to) {
+            return self.set_status("That node cannot be linked to from here.".into(), cx);
+        }
+        self.checkpoint();
+        self.doc.link(from, to);
+        self.dismiss_overlays(cx);
+        window.focus(&self.focus_handle);
+        let (made, status) = if self.doc.is_jump(from) {
+            (
+                Place::Node(from),
+                format!("The jump now goes to {}.", node_number(&self.doc, to)),
+            )
+        } else {
+            let tail = if self.doc.pauses_play(from) {
+                " Enter writes the choice."
+            } else {
+                ""
+            };
+            (
+                Place::Edge(self.doc.edges.len() - 1),
+                format!("Linked to {}.{tail}", node_number(&self.doc, to)),
+            )
+        };
+        // The source is on the canvas being looked at, so this never crosses.
+        self.land(made, window, cx);
+        self.set_status(status, cx);
     }
 
     /// The rows the find card lists, in order, and whether a query is typed: the hits once
@@ -2392,11 +2472,15 @@ impl Editor {
         // ponytail: rescans every node per call, and a frame or a key makes one or two — but
         // only while the card is open with a query typed, which is never while dragging.
         // Cache it if searching a huge graph ever stutters.
-        let rows = if typed {
+        let mut rows = if typed {
             self.doc.query(query)
         } else {
             self.doc.bookmarks()
         };
+        // Picking a link target lists only what would land, so no row is a dead end.
+        if let Some(from) = self.linking {
+            rows.retain(|&to| self.doc.link_offers(from, to));
+        }
         (rows, typed)
     }
 
@@ -2426,6 +2510,7 @@ impl Editor {
         }
         self.close_palette(cx);
         self.searching = false;
+        self.linking = None;
         self.problems_open = false;
         self.help_open = false;
         self.prefs_open = false;
@@ -3469,6 +3554,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_find_next))
             .on_action(cx.listener(Self::on_find_prev))
             .on_action(cx.listener(Self::on_find_run))
+            .on_action(cx.listener(Self::on_link_to))
             .on_action(cx.listener(Self::on_toggle_flow_map))
             .on_action(cx.listener(Self::on_branch))
             .on_action(cx.listener(Self::on_new_hub))
@@ -3889,6 +3975,20 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(|_, _, _, cx| cx.stop_propagation()),
                 )
+                .children(self.linking.map(|from| {
+                    // Says what the list is for, since the same card is find otherwise.
+                    let name = self
+                        .doc
+                        .node(from)
+                        .map(|node| ref_label(&self.doc, node))
+                        .unwrap_or_default();
+                    div()
+                        .px_1()
+                        .flex()
+                        .flex_col()
+                        .child(div().type_section().child("Link to…"))
+                        .child(div().one_line().type_hint().child(format!("from {name}")))
+                }))
                 .child(self.search_input.clone())
                 .child(
                     div()
@@ -3899,10 +3999,16 @@ impl Editor {
                         .overflow_y_scroll()
                         .track_scroll(&self.find_scroll)
                         .when(!typed, |this| {
-                            this.child(div().px_1().type_hint().child(
-                                "Search speakers, lines and aliases, or filter: speaker: kind: \
-                                 flow: sets: checks: is: has:",
-                            ))
+                            this.child(div().px_1().type_hint().child(match self.linking {
+                                Some(_) => {
+                                    "Find the node to link to. Only nodes it can link \
+                                            to are listed."
+                                }
+                                None => {
+                                    "Search speakers, lines and aliases, or filter: \
+                                         speaker: kind: flow: sets: checks: is: has:"
+                                }
+                            }))
                         })
                         .when(!bookmarks.is_empty(), |this| {
                             this.child(div().px_1().pt_2().type_section().child("Bookmarks"))
@@ -3940,7 +4046,7 @@ impl Editor {
                                                 )
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
-                                                        this.jump_to(id, window, cx)
+                                                        this.choose_found(id, window, cx)
                                                     },
                                                 )),
                                         )
@@ -3958,11 +4064,18 @@ impl Editor {
                         })
                         // A filter can catch a lot more than a word does, so say how much.
                         .when(typed, |this| {
-                            this.child(div().px_1().type_hint().child(match hits.len() {
-                                0 => "No matches.".to_string(),
-                                1 => "1 match".to_string(),
-                                n => format!("{n} matches"),
-                            }))
+                            this.child(
+                                div().px_1().type_hint().child(match hits.len() {
+                                    0 if self.linking.is_some() => {
+                                        "Nothing it can link to matches. An ordinary node links \
+                                     only on its own canvas; a jump crosses."
+                                            .to_string()
+                                    }
+                                    0 => "No matches.".to_string(),
+                                    1 => "1 match".to_string(),
+                                    n => format!("{n} matches"),
+                                }),
+                            )
                         })
                         .children(hits.iter().take(FIND_ROWS).enumerate().filter_map(
                             |(row, &id)| {
@@ -3993,7 +4106,7 @@ impl Editor {
                                                 .child(ref_label(&self.doc, node)),
                                         )
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.jump_to(id, window, cx)
+                                            this.choose_found(id, window, cx)
                                         })),
                                 )
                             },
@@ -7404,8 +7517,8 @@ impl Editor {
                         this.child(section(
                             "Target",
                             div().type_hint().child(
-                                "Drag from this node's port to the node it should jump to. \
-                                 The box names it.",
+                                "Drag from this node's port to the node it should jump to, \
+                                 or pick it with Ctrl+L. The box names it.",
                             ),
                         ))
                     })
@@ -8610,6 +8723,7 @@ fn main() {
             KeyBinding::new("ctrl--", ZoomOut, Some("Editor")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Editor")),
             KeyBinding::new("ctrl-f", Find, Some("Editor")),
+            KeyBinding::new("ctrl-l", LinkTo, Some("Editor")),
             KeyBinding::new("ctrl-shift-m", ToggleProblems, Some("Editor")),
             KeyBinding::new("f1", ShowHelp, Some("Editor")),
             KeyBinding::new("ctrl-k", ShowPalette, Some("Editor")),
